@@ -1,8 +1,10 @@
 # Kiro-Go + PostgreSQL 一键部署
 #
 # 使用步骤:
-#   1) 修改下方 POSTGRES_PASSWORD 与 ADMIN_PASSWORD(务必改掉默认值!),
+#   1) 修改下方 POSTGRES_PASSWORD 与 ADMIN_PASSWORD(务必改掉占位值!),
 #      DATABASE_URL 里的密码要与 POSTGRES_PASSWORD 保持一致。
+#      ⚠️ ADMIN_PASSWORD 必须设成一个强密码:留空或仍为 "changeme" 时服务会
+#         直接拒绝启动(fail closed),配合 restart 策略会陷入崩溃重启循环。
 #   2) docker compose up -d --build
 #   3) 访问管理面板 http://localhost:8080/admin (密码 = ADMIN_PASSWORD)
 #
@@ -39,7 +41,8 @@ services:
       # 设置了 DATABASE_URL 即启用 PG 持久化;不设则回退到本地 JSON 文件。
       # 密码需与上面 POSTGRES_PASSWORD 一致;host 用服务名 postgres。
       DATABASE_URL: postgres://kiro:kiro_secret_change_me@postgres:5432/kiro?sslmode=disable
-      ADMIN_PASSWORD: changeme
+      # ⚠️ 必须改成你自己的强密码。留空或保持 "changeme" 会被服务拒绝启动。
+      ADMIN_PASSWORD: CHANGE_ME_STRONG_PASSWORD
       CONFIG_PATH: /app/data/config.json
     volumes:
       - ./data:/app/data
