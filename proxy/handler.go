@@ -280,6 +280,7 @@ func (h *Handler) backgroundRefresh() {
 			h.refreshModelsCache()
 			h.refreshAllAccounts()
 			pruneUsageRecordsRetention()
+			sweepLowBalanceGates(time.Hour)
 		case <-h.stopRefresh:
 			return
 		}
@@ -929,6 +930,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
 		return
+	}
+
+	// 低余额串行化闸门(保守透支缓解:余额将尽的卡强制并发=1,见 low_balance.go)。
+	releaseLowBalance, ok := gateLowBalance(r)
+	if !ok {
+		h.sendClaudeError(w, 429, "rate_limit_error", lowBalanceRejectMessage)
+		return
+	}
+	if releaseLowBalance != nil {
+		defer releaseLowBalance()
 	}
 
 	// 读取请求
@@ -1853,6 +1864,16 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
 		return
+	}
+
+	// 低余额串行化闸门(保守透支缓解,见 low_balance.go)。
+	releaseLowBalance, ok := gateLowBalance(r)
+	if !ok {
+		h.sendOpenAIError(w, 429, "rate_limit_error", lowBalanceRejectMessage)
+		return
+	}
+	if releaseLowBalance != nil {
+		defer releaseLowBalance()
 	}
 
 	body, err := io.ReadAll(r.Body)

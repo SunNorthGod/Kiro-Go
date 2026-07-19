@@ -87,6 +87,28 @@ RETURNING id`,
 	return rec, nil
 }
 
+// InsertAPIKeyWithOpeningGrant creates the key row (its opening grant already in
+// credits_granted) and appends the matching opening-recharge audit row, in one
+// transaction. Used by the atomic sub-card creation path so a half-created child
+// (row present, grant missing) can never be observed by concurrent pool checks.
+func InsertAPIKeyWithOpeningGrant(ctx context.Context, pool *pgxpool.Pool, k APIKey, operator, note string) error {
+	return WithTx(ctx, pool, func(tx pgx.Tx) error {
+		if err := UpsertAPIKey(ctx, tx, k); err != nil {
+			return err
+		}
+		if k.CreditsGranted <= 0 {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+INSERT INTO recharge_records (api_key_id, amount, operator, note, balance_after, created_at)
+VALUES ($1, $2, $3, $4, $5, $6)`,
+			k.ID, k.CreditsGranted, operator, note, k.CreditsGranted, time.Now().Unix()); err != nil {
+			return fmt.Errorf("db: insert opening recharge record: %w", err)
+		}
+		return nil
+	})
+}
+
 // ListRechargeRecords returns a page of recharge rows for a key (newest first)
 // plus the total row count for that key, for building paginated admin views. It
 // mirrors ListUsageRecords: page is 1-based and page/pageSize < 1 are clamped to

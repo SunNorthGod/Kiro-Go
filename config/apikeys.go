@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"kiro-go/logger"
 )
 
 // ListApiKeys returns a snapshot of all configured API key entries.
@@ -56,6 +58,14 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 		}
 		if entry.Name != "" && strings.EqualFold(strings.TrimSpace(existing.Name), entry.Name) {
 			return ApiKeyEntry{}, errors.New("api key name already exists")
+		}
+	}
+	// Sub-card pool invariant, enforced inside the same critical section that
+	// appends the key so concurrent creations cannot over-commit the parent's
+	// shared pool (the proxy layer's pre-check is advisory only).
+	if pid := strings.TrimSpace(entry.ParentKeyID); pid != "" {
+		if msg := childGrantErrorLocked(pid, "", entry.CreditsGranted); msg != "" {
+			return ApiKeyEntry{}, errors.New(msg)
 		}
 	}
 	if entry.ID == "" {
@@ -133,6 +143,13 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 
 // DeleteApiKey removes the API key entry with the given ID. Returns nil even if
 // the ID is unknown (idempotent), matching the existing DeleteAccount style.
+//
+// Sub-card settlement: when the deleted key is a child with real consumption,
+// its CreditsUsed is folded into the parent's CreditsUsed (atomically with the
+// delete — one transaction in DB mode, one JSON save otherwise). The spend
+// already happened upstream, so only the UNUSED remainder of the child's grant
+// may flow back to the shared pool. Without this, deleting a fully-consumed
+// child "refunded" its whole grant and the pool could be re-sold (double-spend).
 func DeleteApiKey(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -140,10 +157,50 @@ func DeleteApiKey(id string) error {
 		return errors.New("config not initialized")
 	}
 	for i, e := range cfg.ApiKeys {
-		if e.ID == id {
-			cfg.ApiKeys = append(cfg.ApiKeys[:i], cfg.ApiKeys[i+1:]...)
-			return persistApiKeyDeleteLocked(id)
+		if e.ID != id {
+			continue
 		}
+		settleParentID := ""
+		settleCredits := 0.0
+		if pid := strings.TrimSpace(e.ParentKeyID); pid != "" && e.CreditsUsed > 0 {
+			settleParentID = pid
+			settleCredits = e.CreditsUsed
+		}
+		removed := e
+		cfg.ApiKeys = append(cfg.ApiKeys[:i], cfg.ApiKeys[i+1:]...)
+
+		// Locate the parent AFTER the removal (indices shifted).
+		var parent *ApiKeyEntry
+		if settleParentID != "" {
+			for j := range cfg.ApiKeys {
+				if cfg.ApiKeys[j].ID == settleParentID {
+					parent = &cfg.ApiKeys[j]
+					break
+				}
+			}
+		}
+		if parent == nil {
+			if err := persistApiKeyDeleteLocked(id); err != nil {
+				cfg.ApiKeys = append(cfg.ApiKeys, removed)
+				return err
+			}
+			return nil
+		}
+
+		parent.CreditsUsed += settleCredits
+		var err error
+		if dbEnabled {
+			err = dbDeleteApiKeyWithSettlement(id, parent.ID, settleCredits)
+		} else {
+			err = saveLocked()
+		}
+		if err != nil {
+			// Restore the in-memory state so it doesn't drift from the store.
+			parent.CreditsUsed -= settleCredits
+			cfg.ApiKeys = append(cfg.ApiKeys, removed)
+			return err
+		}
+		return nil
 	}
 	return nil
 }
@@ -229,7 +286,17 @@ func recordApiKeyUsage(id, model string, inputTokens, outputTokens, cacheReadTok
 				cfg.ApiKeys[i].TokensUsed += totalTokens
 			}
 			if credits > 0 {
+				usedBefore := cfg.ApiKeys[i].CreditsUsed
 				cfg.ApiKeys[i].CreditsUsed += credits
+				// Overdraft alert: the balance check happens before the request
+				// while the real cost lands here at stream end, so concurrent
+				// requests can push a card past its grant. Log the crossing once
+				// (no clawback — accepted conservative behavior; the low-balance
+				// serialization gate in the proxy layer bounds the exposure).
+				if g := cfg.ApiKeys[i].CreditsGranted; g > 0 && usedBefore <= g && cfg.ApiKeys[i].CreditsUsed > g {
+					logger.Warnf("[Billing] api key %s (%s) overdrafted: used %.2f > granted %.2f (overdraft %.2f credits)",
+						cfg.ApiKeys[i].ID, cfg.ApiKeys[i].Name, cfg.ApiKeys[i].CreditsUsed, g, cfg.ApiKeys[i].CreditsUsed-g)
+				}
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
@@ -264,6 +331,14 @@ func RechargeApiKey(id string, amount float64, operator, note string) error {
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
+			// A sub-card's top-up draws from its parent's shared pool: the new
+			// grant total must fit the allocatable remainder. Checked in the
+			// same critical section as the write (no check-then-act window).
+			if pid := strings.TrimSpace(cfg.ApiKeys[i].ParentKeyID); pid != "" {
+				if msg := childGrantErrorLocked(pid, id, cfg.ApiKeys[i].CreditsGranted+amount); msg != "" {
+					return errors.New(msg)
+				}
+			}
 			if dbEnabled {
 				balanceAfter, err := dbRechargeApiKey(id, amount, operator, note)
 				if err != nil {

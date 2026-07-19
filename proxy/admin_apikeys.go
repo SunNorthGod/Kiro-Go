@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"fmt"
 	"kiro-go/config"
 	"net/http"
 	"strings"
@@ -104,7 +103,7 @@ type apiKeyCreateRequest struct {
 
 // allocEpsilon absorbs float rounding so a grant that exactly equals the
 // allocatable pool is accepted rather than tripping a > comparison.
-const allocEpsilon = 1e-6
+const allocEpsilon = config.AllocEpsilon
 
 // canManageSubKeys reports whether a card may open/manage sub-cards. Mirrors the
 // Rust reseller rule (credit_limit set && parent_key_id none): the card must be a
@@ -114,80 +113,23 @@ func canManageSubKeys(e *config.ApiKeyEntry) bool {
 	return e != nil && e.CreditsGranted > 0 && strings.TrimSpace(e.ParentKeyID) == ""
 }
 
-// allocatableCredits reports how much of a parent card's budget can still be
-// handed to sub-cards under the shared-pool model:
-//
-//	CreditsGranted (budget) − parent's own CreditsUsed − Σ(live children grants)
-//
-// The parent's own consumption and every child's allocation draw from the same
-// budget, so no allocation may push total commitments past the budget.
-// excludeChildID is skipped from the children sum (used when resizing an existing
-// child). Returns 0 for an unknown parent or one without a positive budget.
+// allocatableCredits / childGrantError / parentGrantError delegate to the config
+// package, which owns the shared-pool math (live children commit
+// max(grant, spend); deleted children's spend is settled into the parent). These
+// proxy-layer calls are advisory (display + friendly pre-check messages); the
+// authoritative checks re-run atomically inside the config mutations
+// (AddApiKey / CreateChildApiKey / SetApiKeyGrantChecked / RechargeApiKey).
+
 func allocatableCredits(parentID, excludeChildID string) float64 {
-	parent := config.GetApiKeyEntry(parentID)
-	if parent == nil || parent.CreditsGranted <= 0 {
-		return 0
-	}
-	allocated := 0.0
-	for _, e := range config.ListApiKeys() {
-		if e.ID != excludeChildID && e.ParentKeyID == parentID {
-			allocated += e.CreditsGranted
-		}
-	}
-	free := parent.CreditsGranted - parent.CreditsUsed - allocated
-	if free < 0 {
-		free = 0
-	}
-	return free
+	return config.AllocatableChildCredits(parentID, excludeChildID)
 }
 
-// childGrantError validates a sub-card's credit grant against its parent's pool.
-// The parent must exist, nesting is limited to one level, and the proposed grant
-// must fit within the parent's allocatable budget (see allocatableCredits) so a
-// shared team pool can never be over-committed. selfID is "" on create (no key to
-// exclude yet). Returns "" when valid, or a human-readable reason to reject.
 func childGrantError(parentID, selfID string, grant float64) string {
-	parent := config.GetApiKeyEntry(parentID)
-	if parent == nil {
-		return "parent key not found"
-	}
-	if strings.TrimSpace(parent.ParentKeyID) != "" {
-		return "cannot nest sub-cards more than one level"
-	}
-	if grant > 0 && parent.CreditsGranted > 0 {
-		free := allocatableCredits(parentID, selfID)
-		if grant > free+allocEpsilon {
-			return fmt.Sprintf(
-				"sub-card grant exceeds parent pool: %.2f allocatable, requested %.2f",
-				free, grant)
-		}
-	}
-	return ""
+	return config.ChildGrantError(parentID, selfID, grant)
 }
 
-// parentGrantError guards the reverse sub-card invariant: a parent key's grant
-// may not be lowered below what is already committed against it — the parent's
-// own usage plus everything handed to its children — which would over-commit the
-// shared pool. selfID is the parent being edited. Returns "" when valid
-// (including when the key has no children).
 func parentGrantError(selfID string, grant float64) string {
-	allocated := 0.0
-	for _, e := range config.ListApiKeys() {
-		if e.ParentKeyID == selfID {
-			allocated += e.CreditsGranted
-		}
-	}
-	if allocated <= 0 {
-		return ""
-	}
-	committed := allocated
-	if self := config.GetApiKeyEntry(selfID); self != nil {
-		committed += self.CreditsUsed
-	}
-	if grant+allocEpsilon < committed {
-		return fmt.Sprintf("quota %.2f is below the %.2f already committed (own usage + sub-card allocations)", grant, committed)
-	}
-	return ""
+	return config.ParentGrantError(selfID, grant)
 }
 
 func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
@@ -343,9 +285,11 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	// Apply the absolute quota after the metadata patch so the displayed balance
 	// and enforcement track the "额度" field. Recharges (RechargeApiKey) still add
 	// on top of this base; a subsequent edit re-sets the base to the shown value.
+	// SetApiKeyGrantChecked re-validates the shared-pool invariants atomically
+	// (the pre-checks above are advisory only).
 	if req.CreditsGranted != nil {
-		if err := config.SetApiKeyGrant(id, *req.CreditsGranted); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+		if err := config.SetApiKeyGrantChecked(id, *req.CreditsGranted); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}

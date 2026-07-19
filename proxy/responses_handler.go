@@ -19,6 +19,16 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// 低余额串行化闸门(保守透支缓解,见 low_balance.go)。
+	releaseLowBalance, ok := gateLowBalance(r)
+	if !ok {
+		h.sendOpenAIError(w, 429, "rate_limit_error", lowBalanceRejectMessage)
+		return
+	}
+	if releaseLowBalance != nil {
+		defer releaseLowBalance()
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")

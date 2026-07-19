@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // APIKey is the db-layer DTO for a client-facing API key ("卡密"). It mirrors the
@@ -271,4 +272,25 @@ func DeleteAPIKey(ctx context.Context, q Querier, id string) error {
 		return fmt.Errorf("db: delete api key: %w", err)
 	}
 	return nil
+}
+
+// DeleteAPIKeyWithSettlement deletes a sub-card and, in the same transaction,
+// folds its consumed credits into the parent's credits_used mirror. This keeps
+// the shared-pool invariant across the delete: the child's real spend stays
+// deducted from the parent's budget forever, only its unused grant is freed.
+func DeleteAPIKeyWithSettlement(ctx context.Context, pool *pgxpool.Pool, childID, parentID string, settleCredits float64) error {
+	if settleCredits < 0 {
+		settleCredits = 0
+	}
+	return WithTx(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`UPDATE api_keys SET credits_used = credits_used + $2 WHERE id = $1`,
+			parentID, settleCredits); err != nil {
+			return fmt.Errorf("db: settle child usage into parent: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM api_keys WHERE id = $1`, childID); err != nil {
+			return fmt.Errorf("db: delete api key: %w", err)
+		}
+		return nil
+	})
 }

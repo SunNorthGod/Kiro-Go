@@ -301,6 +301,9 @@ func userCreateChild(w http.ResponseWriter, r *http.Request, parent *config.ApiK
 		writeJSON(w, 400, map[string]string{"error": "子卡密额度必须大于 0"})
 		return
 	}
+	// Advisory pre-check for a friendly localized message; the authoritative pool
+	// validation re-runs atomically inside config.CreateChildApiKey (same lock as
+	// the create, so concurrent creations cannot over-commit the pool).
 	free := allocatableCredits(parent.ID, "")
 	if req.CreditLimit > free+allocEpsilon {
 		writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("超出可分配额度：可分配 %.2f credits，请求 %.2f credits", free, req.CreditLimit)})
@@ -316,7 +319,11 @@ func userCreateChild(w http.ResponseWriter, r *http.Request, parent *config.ApiK
 		}
 		childExpiry = exp
 	}
-	child, err := config.AddApiKey(config.ApiKeyEntry{
+	// Atomic create: pool check + key row + opening grant + recharge audit row in
+	// one critical section (one DB transaction), replacing the old two-step
+	// AddApiKey + RechargeApiKey whose half-created child was invisible to
+	// concurrent pool checks.
+	child, err := config.CreateChildApiKey(config.ApiKeyEntry{
 		Name:            req.Name,
 		Key:             config.GenerateApiKeyValue(),
 		Enabled:         true,
@@ -324,17 +331,9 @@ func userCreateChild(w http.ResponseWriter, r *http.Request, parent *config.ApiK
 		ParentKeyID:     parent.ID,
 		BoundAccountIDs: parent.BoundAccountIDs,
 		ExpiresAt:       childExpiry,
-	})
+	}, req.CreditLimit, "reseller:"+parent.Name, "开卡初始额度")
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
-		return
-	}
-	// Set the opening grant and record a recharge row (source "reseller:<parent>")
-	// in one step, so the sub-card's balance and the audit trail agree. On failure
-	// roll back the orphaned key.
-	if err := config.RechargeApiKey(child.ID, req.CreditLimit, "reseller:"+parent.Name, "开卡初始额度"); err != nil {
-		_ = config.DeleteApiKey(child.ID)
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, 201, map[string]interface{}{"success": true, "child": childView(config.GetApiKeyEntry(child.ID))})
@@ -391,9 +390,11 @@ func userUpdateChild(w http.ResponseWriter, r *http.Request, parent *config.ApiK
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	// SetApiKeyGrantChecked re-validates spend coverage + parent pool atomically
+	// with the write (the pre-checks above are advisory display messages only).
 	if newGrant != nil {
-		if err := config.SetApiKeyGrant(child.ID, *newGrant); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
+		if err := config.SetApiKeyGrantChecked(child.ID, *newGrant); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
 	}

@@ -173,6 +173,22 @@ func dbDeleteApiKey(id string) error {
 	return db.DeleteAPIKey(ctx, dbPool, id)
 }
 
+// dbDeleteApiKeyWithSettlement deletes a sub-card and folds its consumed credits
+// into the parent's credits_used mirror in one transaction. Caller holds cfgLock.
+func dbDeleteApiKeyWithSettlement(childID, parentID string, settleCredits float64) error {
+	ctx, cancel := dbOpCtx()
+	defer cancel()
+	return db.DeleteAPIKeyWithSettlement(ctx, dbPool, childID, parentID, settleCredits)
+}
+
+// dbInsertApiKeyWithOpeningGrant creates a sub-card row (grant included) plus its
+// opening recharge audit row in one transaction. Caller holds cfgLock.
+func dbInsertApiKeyWithOpeningGrant(e ApiKeyEntry, operator, note string) error {
+	ctx, cancel := dbOpCtx()
+	defer cancel()
+	return db.InsertAPIKeyWithOpeningGrant(ctx, dbPool, apiKeyToDB(e), operator, note)
+}
+
 // dbRecordApiKeyUsage folds one request into the authoritative ledger + optional
 // detail log (db.RecordUsageWithDetail writes usage_counters AND usage_records in
 // one transaction) and then bumps the per-key quota mirror (db.TouchAPIKeyUsage).
