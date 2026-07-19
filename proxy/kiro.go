@@ -608,6 +608,9 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
 
+		// Lower bound on totalLength: below 16 there's no room for headers + the
+		// 4-byte trailing CRC. (On a 32-bit int build the top byte could also make
+		// this negative; the < 16 check rejects that too.)
 		if totalLength < 16 {
 			continue
 		}
@@ -634,7 +637,11 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 			return err
 		}
 
-		if headersLength > len(msgBuf)-4 {
+		// headersLength is parsed from untrusted bytes: a negative value (high bit
+		// set on a 32-bit int build, or a corrupt frame) would slip past a bare
+		// upper-bound check and then panic on the msgBuf[0:headersLength] slice.
+		// Guard both ends before slicing.
+		if headersLength < 0 || headersLength > len(msgBuf)-4 {
 			continue
 		}
 

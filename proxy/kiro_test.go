@@ -154,6 +154,25 @@ func TestParseEventStreamIgnoresZeroCacheMetering(t *testing.T) {
 	}
 }
 
+// A frame whose declared headersLength is bogus (here the high bit is set, which
+// is negative on a 32-bit int build and huge on 64-bit) must be skipped without
+// panicking on the msgBuf[0:headersLength] slice.
+func TestParseEventStreamRejectsBogusHeadersLength(t *testing.T) {
+	frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hi"})
+	// Corrupt only the headers_len field (bytes 4:8); leave total_len intact so
+	// the whole frame is still consumed as one message.
+	binary.BigEndian.PutUint32(frame[4:8], 0x80000000)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("parseEventStream panicked on bogus headersLength: %v", r)
+		}
+	}()
+	if err := parseEventStream(context.Background(), bytes.NewReader(frame), &KiroStreamCallback{}); err != nil {
+		t.Fatalf("expected bogus-header frame to be skipped cleanly, got %v", err)
+	}
+}
+
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
 	current := handleToolUseEvent(map[string]interface{}{
