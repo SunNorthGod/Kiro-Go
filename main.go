@@ -63,6 +63,15 @@ func main() {
 		config.SetPassword(envPassword)
 	}
 
+	// Fail closed on an unset or default admin password. The admin panel controls
+	// every account and the whole billing ledger, so a "changeme" password is a
+	// full takeover vector. Operators MUST set a strong password (ADMIN_PASSWORD
+	// env var, or the "password" field in the config file) before the service
+	// will start. This is intentional (see ops doc): production already sets one.
+	if pw := config.GetPassword(); pw == "" || pw == "changeme" {
+		log.Fatalf("refusing to start: admin password is unset or the insecure default %q. Set a strong password via the ADMIN_PASSWORD environment variable (or the \"password\" field in %s) and restart.", "changeme", configPath)
+	}
+
 	// 初始化账号池
 	pool.GetPool()
 

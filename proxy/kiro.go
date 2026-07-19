@@ -38,6 +38,10 @@ type kiroEndpoint struct {
 // unbounded allocation. 16 MiB is far above any real Kiro event.
 const maxEventFrameBytes = 16 << 20
 
+// maxNormalizeOverlapBytes bounds the suffix/prefix overlap search in
+// normalizeChunk so it can't degrade to O(n^2) on very large chunks.
+const maxNormalizeOverlapBytes = 256
+
 var kiroEndpoints = []kiroEndpoint{
 	{
 		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
@@ -879,6 +883,13 @@ func normalizeChunk(chunk string, previous *string) string {
 	maxLen := len(prev)
 	if len(chunk) < maxLen {
 		maxLen = len(chunk)
+	}
+	// Cap the overlap search: it is O(maxLen^2) worst case (each HasSuffix is
+	// O(i)), and streaming deltas that overlap by more than a couple hundred
+	// bytes don't occur in practice. Bounding it keeps a pathologically large
+	// prev/chunk pair from turning this into a hot spot.
+	if maxLen > maxNormalizeOverlapBytes {
+		maxLen = maxNormalizeOverlapBytes
 	}
 	for i := maxLen; i > 0; i-- {
 		if strings.HasSuffix(prev, chunk[:i]) {

@@ -445,6 +445,12 @@ func (h *Handler) handleUserAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, map[string]string{"error": "invalid or missing API key"})
 		return
 	}
+	// An expired card must not access its portal (previously only !Enabled was
+	// checked, so an expired-but-enabled card could still read/manage its data).
+	if config.IsApiKeyExpired(*entry) {
+		writeJSON(w, 403, map[string]string{"error": "API key has expired"})
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/user/api")
 	switch {
 	case path == "/me" && r.Method == "GET":

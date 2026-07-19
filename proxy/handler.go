@@ -11,6 +11,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,8 +59,19 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	// Cold-cache stampede guard: modelsColdMu serializes the expensive
+	// all-accounts refresh so a burst of /v1/models on an empty cache triggers ONE
+	// refresh (others coalesce), and modelsLastColdAttempt is a short negative
+	// cache so a failing refresh isn't retried on every request.
+	modelsColdMu         sync.Mutex
+	modelsLastColdAttempt int64
 	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
+	// tokenRefreshLocks serializes token refreshes PER ACCOUNT (not globally): a
+	// single shared mutex meant a slow refresh for one account blocked every
+	// other account's requests from even checking their own token. Keyed by
+	// account id; entries are created on demand and kept (bounded by account count).
+	tokenRefreshMu    sync.Mutex // guards the tokenRefreshLocks map only
+	tokenRefreshLocks map[string]*sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -67,6 +79,9 @@ type Handler struct {
 	dailyMu      sync.Mutex
 	dailyStats   map[string]*dayBucket // "2006-01-02"(CST) → 当日累计
 	dailySavedAt int64                 // 上次落盘的 unix 秒(节流用)
+	// 统计落盘去抖:记录上次已持久化的计数快照,无变化时跳过 30s 定时写(避免空转重写整份配置文件)。
+	lastSavedStats savedStatsSnapshot
+	lastSavedMu    sync.Mutex
 }
 
 type thinkingStreamSource int
@@ -251,9 +266,10 @@ func NewHandler() *Handler {
 		totalTokens:     int64(totalTokens),
 		totalCredits:    totalCredits,
 		startTime:       time.Now().Unix(),
-		stopRefresh:     make(chan struct{}),
-		stopStatsSaver:  make(chan struct{}),
-		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		stopRefresh:       make(chan struct{}),
+		stopStatsSaver:    make(chan struct{}),
+		promptCache:       newPromptCacheTracker(defaultPromptCacheTTL),
+		tokenRefreshLocks: make(map[string]*sync.Mutex),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -519,6 +535,40 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// modelsColdNegativeCacheSec bounds how often a cold-cache refresh is retried
+// when it keeps failing, so /v1/models falls back cheaply instead of hammering
+// every account on every request.
+const modelsColdNegativeCacheSec = 15
+
+// ensureModelsCache populates the model cache when empty, coalescing concurrent
+// cold-cache callers behind modelsColdMu (only one runs the expensive
+// all-accounts refresh) with a short negative cache on repeated failure.
+func (h *Handler) ensureModelsCache() {
+	h.modelsCacheMu.RLock()
+	have := len(h.cachedModels)
+	h.modelsCacheMu.RUnlock()
+	if have > 0 {
+		return
+	}
+
+	h.modelsColdMu.Lock()
+	defer h.modelsColdMu.Unlock()
+	// Re-check: a coalesced caller may have populated the cache while we waited.
+	h.modelsCacheMu.RLock()
+	have = len(h.cachedModels)
+	h.modelsCacheMu.RUnlock()
+	if have > 0 {
+		return
+	}
+	// Negative cache: skip re-refreshing (fall back) if we just tried and failed.
+	now := time.Now().Unix()
+	if now-h.modelsLastColdAttempt < modelsColdNegativeCacheSec {
+		return
+	}
+	h.modelsLastColdAttempt = now
+	h.refreshModelsCache()
+}
+
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	// 尝试用缓存的真实模型列表
@@ -526,7 +576,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
 	if len(cached) == 0 {
-		h.refreshModelsCache()
+		h.ensureModelsCache()
 		h.modelsCacheMu.RLock()
 		cached = h.cachedModels
 		h.modelsCacheMu.RUnlock()
@@ -1555,14 +1605,48 @@ func (h *Handler) backgroundStatsSaver() {
 	}
 }
 
-// saveStats 保存统计到配置文件
+// savedStatsSnapshot is the set of global counters saveStats persists; it is
+// compared against the last-persisted values to skip no-op writes.
+type savedStatsSnapshot struct {
+	totalRequests   int64
+	successRequests int64
+	failedRequests  int64
+	totalTokens     int64
+	totalCredits    float64
+	valid           bool
+}
+
+// saveStats 保存统计到配置文件。若自上次落盘以来计数没有变化则跳过——空闲时
+// 后台每 30s 一次的定时保存不再无谓重写整份配置文件。
 func (h *Handler) saveStats() {
+	cur := savedStatsSnapshot{
+		totalRequests:   atomic.LoadInt64(&h.totalRequests),
+		successRequests: atomic.LoadInt64(&h.successRequests),
+		failedRequests:  atomic.LoadInt64(&h.failedRequests),
+		totalTokens:     atomic.LoadInt64(&h.totalTokens),
+		totalCredits:    h.getCredits(),
+		valid:           true,
+	}
+	h.lastSavedMu.Lock()
+	prev := h.lastSavedStats
+	if prev.valid &&
+		prev.totalRequests == cur.totalRequests &&
+		prev.successRequests == cur.successRequests &&
+		prev.failedRequests == cur.failedRequests &&
+		prev.totalTokens == cur.totalTokens &&
+		prev.totalCredits == cur.totalCredits {
+		h.lastSavedMu.Unlock()
+		return
+	}
+	h.lastSavedStats = cur
+	h.lastSavedMu.Unlock()
+
 	config.UpdateStats(
-		int(atomic.LoadInt64(&h.totalRequests)),
-		int(atomic.LoadInt64(&h.successRequests)),
-		int(atomic.LoadInt64(&h.failedRequests)),
-		int(atomic.LoadInt64(&h.totalTokens)),
-		h.getCredits(),
+		int(cur.totalRequests),
+		int(cur.successRequests),
+		int(cur.failedRequests),
+		int(cur.totalTokens),
+		cur.totalCredits,
 	)
 }
 
@@ -2503,14 +2587,34 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	})
 }
 
+// accountRefreshLock returns the per-account refresh mutex, creating it on first
+// use. The tiny map guard is held only to fetch/insert the mutex, never across
+// the refresh itself.
+func (h *Handler) accountRefreshLock(id string) *sync.Mutex {
+	h.tokenRefreshMu.Lock()
+	defer h.tokenRefreshMu.Unlock()
+	if h.tokenRefreshLocks == nil {
+		h.tokenRefreshLocks = make(map[string]*sync.Mutex)
+	}
+	mu := h.tokenRefreshLocks[id]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		h.tokenRefreshLocks[id] = mu
+	}
+	return mu
+}
+
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+	// Serialize refreshes for THIS account only, so a slow refresh of one account
+	// never blocks requests to other accounts (the old single global mutex did).
+	mu := h.accountRefreshLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Another concurrent request may have refreshed this account while we waited.
 	if latest := h.pool.GetByID(account.ID); latest != nil {
@@ -2558,11 +2662,26 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Brute-force throttle: block an IP that has failed admin auth too many times.
+	ip := clientIP(r)
+	if ok, retryAfter := adminAuthAllowed(ip); !ok {
+		secs := int(retryAfter.Seconds())
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		w.WriteHeader(429)
+		json.NewEncoder(w).Encode(map[string]string{"error": "too many failed attempts; try again later"})
+		return
+	}
+
 	if stored := config.GetPassword(); stored == "" || subtle.ConstantTimeCompare([]byte(password), []byte(stored)) != 1 {
+		adminAuthRecordFailure(ip)
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
 	}
+	adminAuthRecordSuccess(ip)
 
 	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -3678,15 +3797,17 @@ func (h *Handler) apiImportExternalIdp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
+	// Counters are mutated concurrently by request handlers; read them atomically
+	// (and credits through its mutex) rather than racing on the plain fields.
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
-		"totalRequests":   h.totalRequests,
-		"successRequests": h.successRequests,
-		"failedRequests":  h.failedRequests,
-		"totalTokens":     h.totalTokens,
-		"totalCredits":    h.totalCredits,
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }

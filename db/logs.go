@@ -2,7 +2,10 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RequestLog is one audit row in request_logs: a single proxied request (success
@@ -90,14 +93,26 @@ func ClearRequestLogs(ctx context.Context, q Querier) error {
 
 // PruneRequestLogs keeps only the newest `keep` rows so the trail stays bounded
 // without losing recent history. keep <= 0 is treated as a large default.
+//
+// Implementation: find the id of the keep-th newest row (the watermark) and
+// delete everything below it — a range delete on the primary key. The previous
+// `id NOT IN (SELECT ... LIMIT keep)` built a large in-list and scanned it per
+// candidate row; `id < watermark` uses the pk index directly.
 func PruneRequestLogs(ctx context.Context, q Querier, keep int) error {
 	if keep <= 0 {
 		keep = 100000
 	}
-	_, err := q.Exec(ctx, `
-DELETE FROM request_logs
- WHERE id NOT IN (SELECT id FROM request_logs ORDER BY id DESC LIMIT $1)`, keep)
+	var watermark int64
+	err := q.QueryRow(ctx, `
+SELECT id FROM request_logs ORDER BY id DESC LIMIT 1 OFFSET $1`, keep).Scan(&watermark)
 	if err != nil {
+		// Fewer than `keep` rows exist (no watermark) → nothing to prune.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("db: prune request logs (watermark): %w", err)
+	}
+	if _, err := q.Exec(ctx, `DELETE FROM request_logs WHERE id <= $1`, watermark); err != nil {
 		return fmt.Errorf("db: prune request logs: %w", err)
 	}
 	return nil

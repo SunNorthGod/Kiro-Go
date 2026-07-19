@@ -5,10 +5,15 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"strings"
+	"sync"
 	"time"
 )
 
 const maxAccountRetryAttempts = 3
+
+// overageRefreshInflight dedupes background overage-status refreshes so repeated
+// 402s for the same account spawn at most one in-flight refresh goroutine.
+var overageRefreshInflight sync.Map // accountID -> struct{}
 
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
@@ -70,6 +75,24 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 	h.pool.Reload()
 }
 
+// refreshOverageAsync refreshes an account's upstream overage status off the
+// request path, deduped so concurrent 402s for the same account share one
+// refresh. A value copy is handed to the goroutine so it never races the caller.
+func (h *Handler) refreshOverageAsync(account *config.Account) {
+	if account == nil {
+		return
+	}
+	id := account.ID
+	if _, inflight := overageRefreshInflight.LoadOrStore(id, struct{}{}); inflight {
+		return
+	}
+	acc := *account
+	go func() {
+		defer overageRefreshInflight.Delete(id)
+		h.disableAccountOverage(&acc)
+	}()
+}
+
 func (h *Handler) disableAccountOverage(account *config.Account) {
 	if account == nil {
 		return
@@ -97,8 +120,12 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	errMsg := err.Error()
 	switch {
 	case isOverageErrorMessage(errMsg):
-		h.disableAccountOverage(account)
+		// Cool the account down immediately (fast, in-memory), then refresh the
+		// authoritative upstream overage status in the BACKGROUND. Previously the
+		// blocking getUsageLimits round-trip ran inline in the request's failover
+		// loop, adding upstream latency to every 402.
 		h.pool.ReportOutcome(account.ID, "", pool.OutcomeQuotaExhausted)
+		h.refreshOverageAsync(account)
 	case isSuspensionErrorMessage(errMsg):
 		// Suspension is a definitive upstream ban → disable immediately.
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
