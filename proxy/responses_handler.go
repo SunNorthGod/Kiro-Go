@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -126,17 +127,17 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			cacheProfile, apiKeyID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		cacheProfile, apiKeyID, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -196,7 +197,7 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := callKiroWithSelfHeal(&account, payload, callback)
+		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
 			releaseSlot()
 			lastErr = err
@@ -307,7 +308,7 @@ func buildResponsesObject(
 }
 
 func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -536,7 +537,7 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := callKiroWithSelfHeal(&account, payload, callback)
+		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
 			if !responseStarted {
 				releaseSlot()

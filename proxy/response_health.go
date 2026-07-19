@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"strings"
@@ -73,8 +74,8 @@ func stripSelfHealFields(payload *KiroPayload) bool {
 //
 // 自愈只针对流式开始前的请求校验 400(非 200 → CallKiroAPI 在调用 parseEventStream 之前
 // 就返回错误，callback 尚未触发)，故重试不会造成流内容重复。
-func callKiroWithSelfHeal(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
-	err := CallKiroAPI(account, payload, callback)
+func callKiroWithSelfHeal(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	err := CallKiroAPI(ctx, account, payload, callback)
 	if err == nil || !isSelfHealableKiroError(err) {
 		return err
 	}
@@ -82,7 +83,7 @@ func callKiroWithSelfHeal(account *config.Account, payload *KiroPayload, callbac
 		return err
 	}
 	logger.Warnf("[SelfHeal] upstream rejected request (%v); stripped reasoningContent/additionalModelRequestFields, retrying once on same account", err)
-	return CallKiroAPI(account, payload, callback)
+	return CallKiroAPI(ctx, account, payload, callback)
 }
 
 // ---- 空响应检测 ----

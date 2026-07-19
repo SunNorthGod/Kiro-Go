@@ -4,14 +4,17 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -58,12 +61,32 @@ var kiroRestHttpStore atomic.Pointer[http.Client]
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
+// streamIdleTimeout bounds how long a streaming response may go WITHOUT producing
+// any bytes before the request is aborted. This replaces the old whole-request
+// 5-minute client Timeout, which hard-cut any long stream regardless of progress
+// (a legitimate multi-minute agentic answer would be truncated). A per-read idle
+// deadline instead lets a stream run arbitrarily long as long as it keeps
+// producing, while still killing a genuinely hung upstream. Override via
+// KIRO_STREAM_IDLE_TIMEOUT_SECONDS. Mirrors the Rust v2026.1.42 fix (overall
+// .timeout → connect/read timeouts).
+var streamIdleTimeout = func() time.Duration {
+	if v := os.Getenv("KIRO_STREAM_IDLE_TIMEOUT_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 120 * time.Second
+}()
+
 func init() {
 	InitKiroHttpClient("")
 }
 
-// GetClientForProxy returns an http.Client configured for the given proxy URL.
-// If proxyURL is empty, returns the global kiro HTTP client.
+// GetClientForProxy returns the streaming http.Client for the given proxy URL.
+// The streaming client has NO whole-request timeout — long-stream cutting is
+// avoided; connect/TLS/response-header limits live on the Transport, and a
+// per-read idle deadline (streamIdleTimeout) is applied around the response body
+// in CallKiroAPI. If proxyURL is empty, returns the global kiro HTTP client.
 func GetClientForProxy(proxyURL string) *http.Client {
 	if proxyURL == "" {
 		return kiroHttpStore.Load()
@@ -72,7 +95,6 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -106,14 +128,25 @@ func ResolveAccountProxyURL(account *config.Account) string {
 	return config.GetProxyURL()
 }
 
-// buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
+// buildKiroTransport constructs an HTTP Transport with optional outbound proxy
+// support. Transport-level timeouts bound connection setup and time-to-headers
+// WITHOUT capping total stream duration (unlike a whole-request client Timeout):
+// dial/TLS/response-header limits catch a dead or unresponsive upstream, while a
+// live long stream is only bounded by the per-read idle deadline in CallKiroAPI.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -128,9 +161,13 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 }
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
+//
+// The streaming client has NO whole-request Timeout (long streams must not be
+// hard-cut); it relies on the Transport's connect/TLS/response-header limits plus
+// the per-read idle deadline applied in CallKiroAPI. The REST client keeps its
+// short 30s whole-request timeout — those calls are single short round-trips.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -140,6 +177,43 @@ func InitKiroHttpClient(proxyURL string) {
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroRestHttpStore.Store(restClient)
+}
+
+// idleTimeoutReader wraps a streaming response body with a per-read idle
+// deadline: every Read that returns data renews the timer, and if no bytes
+// arrive within the timeout the onIdle callback (the request-context cancel)
+// fires, aborting the in-flight upstream request so the blocked Read unblocks
+// with an error. This bounds a hung stream without capping a healthy long one.
+type idleTimeoutReader struct {
+	body    io.ReadCloser
+	timer   *time.Timer
+	timeout time.Duration
+	stop    sync.Once
+}
+
+func newIdleTimeoutReader(body io.ReadCloser, timeout time.Duration, onIdle func()) *idleTimeoutReader {
+	return &idleTimeoutReader{
+		body:    body,
+		timeout: timeout,
+		// AfterFunc timer: Reset on an AfterFunc timer needs no channel drain.
+		// A benign race at the exact deadline can call onIdle (cancel) as a Read
+		// completes; cancel is idempotent and aborting a stream that just hit its
+		// idle window is the intended safety behavior.
+		timer: time.AfterFunc(timeout, onIdle),
+	}
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	n, err := r.body.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.timeout)
+	}
+	return n, err
+}
+
+func (r *idleTimeoutReader) Close() error {
+	r.stop.Do(func() { r.timer.Stop() })
+	return r.body.Close()
 }
 
 // ==================== Request Structs ====================
@@ -319,8 +393,17 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return result
 }
 
-// CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
-func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+// CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with
+// automatic fallback. ctx ties the upstream request lifetime to the caller
+// (typically the client's r.Context()): when the client disconnects, ctx is
+// cancelled, the in-flight upstream request is aborted, its slot released and no
+// success is recorded (a cancelled stream returns an error, so the handler's
+// failure path runs and never bills). ctx also carries the per-read idle
+// deadline (see idleTimeoutReader).
+func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -384,60 +467,71 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
-
 		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
-		if err != nil {
-			lastErr = err
-			continue
-		}
 
-		host := ""
-		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
-			host = parsedURL.Host
-		}
-		headerValues := buildStreamingHeaderValues(account, host)
+		// Per-endpoint attempt in a closure so the derived cancel is always
+		// released (defer), whether we fail fast or stream to completion.
+		terminal, err := func() (terminal bool, err error) {
+			reqCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "*/*")
-		if ep.AmzTarget != "" {
-			req.Header.Set("X-Amz-Target", ep.AmzTarget)
-		}
-		applyKiroBaseHeaders(req, account, headerValues)
-		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		req.Header.Set("x-amzn-codewhisperer-optout", "true")
-		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-		if err != nil {
-			lastErr = err
-			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-			continue
-		}
-
-		if resp.StatusCode == 429 {
-			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-			// Authentication errors and payment errors are not retried across endpoints.
-			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
-				return lastErr
+			req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
+			if err != nil {
+				return false, err
 			}
-			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
-			continue
-		}
 
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
-		return err
+			host := ""
+			if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
+				host = parsedURL.Host
+			}
+			headerValues := buildStreamingHeaderValues(account, host)
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "*/*")
+			if ep.AmzTarget != "" {
+				req.Header.Set("X-Amz-Target", ep.AmzTarget)
+			}
+			applyKiroBaseHeaders(req, account, headerValues)
+			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+			req.Header.Set("x-amzn-codewhisperer-optout", "true")
+			req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+			req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+			if err != nil {
+				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+				return false, err
+			}
+
+			if resp.StatusCode == 429 {
+				resp.Body.Close()
+				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+				return false, fmt.Errorf("quota exhausted on %s", ep.Name)
+			}
+
+			if resp.StatusCode != 200 {
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				e := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+				// Authentication and payment errors are not retried across endpoints.
+				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+					return true, e
+				}
+				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
+				return false, e
+			}
+
+			// Success: stream with a per-read idle deadline. On idle, cancel
+			// aborts the upstream request so the blocked Read returns an error.
+			body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, cancel)
+			defer body.Close()
+			return true, parseEventStream(reqCtx, body, callback)
+		}()
+
+		if terminal {
+			return err
+		}
+		lastErr = err
 	}
 
 	if lastErr != nil {
@@ -455,8 +549,14 @@ func accountEmailForLog(account *config.Account) string {
 
 // ==================== Event Stream Parsing ====================
 
-// parseEventStream decodes an AWS binary Event Stream response body.
-func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+// parseEventStream decodes an AWS binary Event Stream response body. ctx lets a
+// read error be reported as a clean cancellation (client disconnect or idle
+// timeout) instead of a raw transport error; either way an error return means
+// the handler's failure path runs and the request is NOT billed.
+func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamCallback) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
@@ -478,6 +578,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			break
 		}
 		if err != nil {
+			// A cancelled context (client disconnect / idle timeout) surfaces as
+			// a read error; report it as the context error so the caller can see
+			// the interruption clearly. Not billed either way (early return skips
+			// OnCredits/OnComplete below).
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
 

@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"kiro-go/config"
 	"net/http"
 	"net/url"
@@ -55,7 +57,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 
 	var toolUses []KiroToolUse
 	var completed bool
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStream(context.Background(), stream, &KiroStreamCallback{
 		OnToolUse: func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
 		},
@@ -93,7 +95,7 @@ func TestParseEventStreamNilCallbackIsNoOp(t *testing.T) {
 		}),
 	}, nil))
 
-	if err := parseEventStream(stream, nil); err != nil {
+	if err := parseEventStream(context.Background(), stream, nil); err != nil {
 		t.Fatalf("expected nil callback to be a no-op, got %v", err)
 	}
 }
@@ -103,7 +105,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 		"content": "hello",
 	}))
 
-	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
+	if err := parseEventStream(context.Background(), stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
 	}
 }
@@ -119,7 +121,7 @@ func TestParseEventStreamSurfacesCacheMetering(t *testing.T) {
 
 	var gotRead, gotCreation int
 	fired := false
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStream(context.Background(), stream, &KiroStreamCallback{
 		OnCacheMetering: func(read, creation int) {
 			gotRead, gotCreation = read, creation
 			fired = true
@@ -142,7 +144,7 @@ func TestParseEventStreamIgnoresZeroCacheMetering(t *testing.T) {
 		"cacheWriteInputTokens": 0,
 	}))
 
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStream(context.Background(), stream, &KiroStreamCallback{
 		OnCacheMetering: func(read, creation int) {
 			t.Fatalf("expected zero metering to be ignored, got %d/%d", read, creation)
 		},
@@ -239,19 +241,94 @@ func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
 	}
 }
 
-func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
+func TestInitKiroHttpClientTimeouts(t *testing.T) {
 	InitKiroHttpClient("")
 	t.Cleanup(func() { InitKiroHttpClient("") })
 
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	// The streaming client must have NO whole-request timeout so long streams
+	// are not hard-cut; it relies on transport-level limits + the per-read idle
+	// deadline applied around the response body in CallKiroAPI.
+	if streamClient.Timeout != 0 {
+		t.Fatalf("expected streaming client to have no whole-request timeout, got %s", streamClient.Timeout)
 	}
+	// The REST client keeps its short whole-request timeout.
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
 	}
+	// Transport-level guards bound connection setup / time-to-headers.
+	tr, ok := streamClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", streamClient.Transport)
+	}
+	if tr.TLSHandshakeTimeout == 0 || tr.ResponseHeaderTimeout == 0 {
+		t.Fatalf("expected transport TLS/response-header timeouts to be set, got tls=%s hdr=%s",
+			tr.TLSHandshakeTimeout, tr.ResponseHeaderTimeout)
+	}
+}
+
+// TestIdleTimeoutReaderAbortsOnIdle: a body that stalls (no bytes) must trigger
+// the idle callback within roughly the configured timeout.
+func TestIdleTimeoutReaderAbortsOnIdle(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+
+	fired := make(chan struct{}, 1)
+	r := newIdleTimeoutReader(pr, 50*time.Millisecond, func() {
+		select {
+		case fired <- struct{}{}:
+		default:
+		}
+	})
+	defer r.Close()
+
+	go func() { _, _ = r.Read(make([]byte, 8)) }()
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected idle callback to fire on a stalled body")
+	}
+}
+
+// TestIdleTimeoutReaderRenewsOnData: steady data must keep renewing the deadline
+// so the idle callback does NOT fire while bytes flow.
+func TestIdleTimeoutReaderRenewsOnData(t *testing.T) {
+	pr, pw := io.Pipe()
+
+	fired := make(chan struct{}, 1)
+	r := newIdleTimeoutReader(pr, 80*time.Millisecond, func() {
+		select {
+		case fired <- struct{}{}:
+		default:
+		}
+	})
+	defer r.Close()
+
+	go func() {
+		buf := make([]byte, 8)
+		for {
+			if _, err := r.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Feed a byte every 20ms for ~200ms; well under the 80ms idle window.
+	for i := 0; i < 10; i++ {
+		if _, err := pw.Write([]byte{'x'}); err != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case <-fired:
+		t.Fatalf("idle callback fired while data was still flowing")
+	default:
+	}
+	_ = pw.Close()
 }
 
 func TestSetPayloadProfileArnForAccountUsesAccountArn(t *testing.T) {

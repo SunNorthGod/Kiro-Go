@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -978,17 +979,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 对齐旧 Rust 反代 `thinking_enabled = thinking.is_enabled() || output_config.is_some()`。
 	forwardReasoning := thinking || claudeEffortRequested(&req)
 
-	// Stream or non-stream
+	// Stream or non-stream. r.Context() is threaded down to the upstream call so
+	// a client disconnect cancels the upstream request (see CallKiroAPI).
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1420,7 +1422,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := callKiroWithSelfHeal(&account, payload, callback)
+		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
 			releaseSlot()
 			lastErr = err
@@ -1688,7 +1690,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1753,7 +1755,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := callKiroWithSelfHeal(&account, payload, callback)
+		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
 			releaseSlot()
 			lastErr = err
@@ -1903,14 +1905,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2240,7 +2242,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := callKiroWithSelfHeal(&account, payload, callback)
+		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
 			releaseSlot()
 			lastErr = err
@@ -2322,7 +2324,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 // 与其它五条路径同构:走 pool.Acquire(公平准入/并发计数/粘性/RPM,拿到的是账号值拷贝,
 // 修复了旧 GetNextForModelExcluding 返回池内指针后 ensureValidToken 无锁写 token 与
 // 调度器读写竞态的问题)+ callKiroWithSelfHeal(可自愈 400 同账号重试一次)。
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2380,7 +2382,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := callKiroWithSelfHeal(&account, payload, callback)
+		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
 			releaseSlot()
 			lastErr = err
@@ -3783,7 +3785,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnContextUsage: func(pct float64) {},
 	}
 
-	err := CallKiroAPI(account, kiroPayload, callback)
+	err := CallKiroAPI(r.Context(), account, kiroPayload, callback)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
