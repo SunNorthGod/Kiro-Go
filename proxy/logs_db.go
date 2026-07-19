@@ -14,6 +14,7 @@ import (
 
 	"kiro-go/config"
 	"kiro-go/db"
+	"kiro-go/logger"
 )
 
 const (
@@ -105,4 +106,27 @@ func clearRequestLogsDB() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = db.ClearRequestLogs(ctx, pool)
+}
+
+// usageRecordsRetentionDays bounds the display-only usage_records log. 90 days
+// covers everything the UI can request (GetDailyUsage caps at 90; the cache
+// window is 7); beyond that the rows only cost storage and scan time.
+const usageRecordsRetentionDays = 90
+
+// pruneUsageRecordsRetention trims usage_records to the retention window.
+// No-op in JSON mode. Called from the periodic background refresh; billing is
+// unaffected (it reads usage_counters, never this log).
+func pruneUsageRecordsRetention() {
+	pool := config.DatabasePool()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cutoff := time.Now().AddDate(0, 0, -usageRecordsRetentionDays).Unix()
+	if n, err := db.PruneUsageRecordsBefore(ctx, pool, cutoff); err != nil {
+		logger.Warnf("[Retention] prune usage_records failed: %v", err)
+	} else if n > 0 {
+		logger.Infof("[Retention] pruned %d usage_records rows older than %d days", n, usageRecordsRetentionDays)
+	}
 }

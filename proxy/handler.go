@@ -272,12 +272,14 @@ func (h *Handler) backgroundRefresh() {
 	time.Sleep(10 * time.Second)
 	h.refreshModelsCache()
 	h.refreshAllAccounts()
+	pruneUsageRecordsRetention()
 
 	for {
 		select {
 		case <-ticker.C:
 			h.refreshModelsCache()
 			h.refreshAllAccounts()
+			pruneUsageRecordsRetention()
 		case <-h.stopRefresh:
 			return
 		}
@@ -1054,6 +1056,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
+		var meteringCacheRead, meteringCacheCreation int
+		var hasCacheMetering bool
 		activeBlockIndex := -1
 		activeBlockType := ""
 
@@ -1399,6 +1403,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					nativeSignature = sig
 				}
 			},
+			OnCacheMetering: func(read, creation int) {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
+			},
 		}
 
 		err := callKiroWithSelfHeal(&account, payload, callback)
@@ -1429,6 +1437,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		// Final cache accounting: upstream metering truth wins over the local
+		// simulation; both get clamped to the final input so the value sent to
+		// the client, shown in panels and written to the ledgers is identical.
+		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1469,7 +1481,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil || hasCacheMetering),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1700,6 +1712,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var meteringCacheRead, meteringCacheCreation int
+		var hasCacheMetering bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1721,6 +1735,10 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			},
+			OnCacheMetering: func(read, creation int) {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
 			},
 		}
 
@@ -1748,6 +1766,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		// Final cache accounting (metering truth > local simulation, clamped).
+		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		// 空响应检测: 零内容零工具(或近空且上下文过大) → 回错误而非静默的空 end_turn。
@@ -1796,7 +1816,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-		if cacheProfile != nil {
+		if cacheProfile != nil || hasCacheMetering {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
 				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
@@ -1856,19 +1876,20 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	cacheProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1909,12 +1930,15 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(&account, err)
 			continue
 		}
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var toolCalls []ToolCall
 		var toolCallIndex int
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var meteringCacheRead, meteringCacheCreation int
+		var hasCacheMetering bool
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -2189,6 +2213,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnCacheMetering: func(read, creation int) {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
+			},
 		}
 
 		err := callKiroWithSelfHeal(&account, payload, callback)
@@ -2214,6 +2242,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -2228,9 +2257,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		// 修复既有并发名额泄漏:此前成功路径从不 releaseSlot,inflight 只增不减,
+		// 卡密公平准入迟早被顶死到 429。
+		releaseSlot()
+		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := openAIFinishReason(len(toolCalls) > 0, false, inputTokens, model)
@@ -2245,11 +2278,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"delta":         map[string]interface{}{},
 				"finish_reason": finishReason,
 			}},
-			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
-			},
+			"usage": buildOpenAIUsageMap(inputTokens, outputTokens, cacheUsage),
 		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
@@ -2268,7 +2297,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2284,6 +2313,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
 		var reasoningContent string
@@ -2291,6 +2321,8 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var meteringCacheRead, meteringCacheCreation int
+		var hasCacheMetering bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2305,6 +2337,10 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			},
+			OnCacheMetering: func(read, creation int) {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
 			},
 		}
 
@@ -2328,15 +2364,17 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, cacheUsage)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -2573,8 +2611,12 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	// 运行时统计 + 实时 RPM
 	result := make([]map[string]interface{}, len(accounts))
 	for i, a := range accounts {
-		// 获取运行时统计
-		stats := statsMap[a.ID]
+		// 获取运行时统计。池子只装可调度账号(启用且未被配额挡住),被禁用/超额
+		// 的账号不在池里 → 回退 config 里持久化的累计值,统计不再显示为 0。
+		stats, inPool := statsMap[a.ID]
+		if !inPool {
+			stats = a
+		}
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,

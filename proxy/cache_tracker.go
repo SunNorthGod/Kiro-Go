@@ -69,7 +69,31 @@ func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
 }
 
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int) *promptCacheProfile {
-	blocks := flattenClaudeCacheBlocks(req)
+	return buildPromptCacheProfile(flattenClaudeCacheBlocks(req), totalInputTokens, req.Model)
+}
+
+// BuildOpenAIProfile builds the same account-level prefix profile for the
+// OpenAI-compatible paths (/v1/chat/completions and /v1/responses). OpenAI
+// clients never send cache_control, so all breakpoints come from the automatic
+// structural boundaries (end of tools / each message end) with the default TTL,
+// mirroring OpenAI's own automatic prompt caching.
+func (t *promptCacheTracker) BuildOpenAIProfile(req *OpenAIRequest, totalInputTokens int) *promptCacheProfile {
+	if req == nil {
+		return nil
+	}
+	return buildPromptCacheProfile(flattenOpenAICacheBlocks(req), totalInputTokens, req.Model)
+}
+
+// buildPromptCacheProfile hashes the flattened prompt blocks into cumulative
+// prefix fingerprints and derives the breakpoint chain.
+//
+// Breakpoint policy (simulating an optimally cache-annotated client, so plain
+// clients get the same realistic accounting as e.g. Claude Code):
+//   - every structural boundary (end of tools, end of system, end of each
+//     message) is an implicit breakpoint with the default 5m TTL;
+//   - an explicit cache_control block is a breakpoint too and its TTL (e.g. 1h)
+//     carries over to the boundaries that follow it.
+func buildPromptCacheProfile(blocks []cacheablePromptBlock, totalInputTokens int, model string) *promptCacheProfile {
 	if len(blocks) == 0 {
 		return nil
 	}
@@ -77,23 +101,18 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	hasher := sha256.New()
 	breakpoints := make([]promptCacheBreakpoint, 0)
 	cumulativeTokens := 0
-	var activeTTL time.Duration
+	activeTTL := defaultPromptCacheTTL
 
 	for _, block := range blocks {
 		canonical := canonicalizeCacheValue(block.Value)
 		writeHashChunk(hasher, canonical)
 		cumulativeTokens += block.Tokens
 
-		// Determine whether this block acts as a cache breakpoint:
-		//   1) Explicit cache_control on the block itself.
-		//   2) Once any explicit breakpoint has been seen, every message-end
-		//      boundary becomes an implicit breakpoint so that multi-turn
-		//      conversations can hit earlier stored prefixes.
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
 			breakpointTTL = block.TTL
 			activeTTL = block.TTL
-		} else if block.IsMessageEnd && activeTTL > 0 {
+		} else if block.IsBoundary {
 			breakpointTTL = activeTTL
 		}
 
@@ -121,10 +140,16 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	return &promptCacheProfile{
 		Breakpoints:      breakpoints,
 		TotalInputTokens: totalInputTokens,
-		Model:            req.Model,
+		Model:            model,
 	}
 }
 
+// Compute simulates one request against the account's stored prefix cache with
+// Anthropic semantics: the longest still-live stored prefix counts as
+// cache_read, everything cacheable beyond it counts as cache_creation, and a
+// hit refreshes the entry's TTL. Prompts below the model's minimum cacheable
+// size are not cached at all (all-zero usage). The output always satisfies
+// read+creation <= TotalInputTokens and 5m+1h == creation.
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
@@ -133,40 +158,20 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	minTokens := minCacheableTokensForModel(profile.Model)
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
 	lastTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
+	if lastTokens < minTokens {
+		return promptCacheUsage{}
+	}
 	now := time.Now()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	entries := t.entriesByAccount[accountID]
-	if len(entries) == 0 {
-		// First request for this account: report creation only if above threshold.
-		effectiveCreation := lastTokens
-		if effectiveCreation < minTokens {
-			effectiveCreation = 0
-		}
-		cache5m, cache1h := computePromptCacheTTLBreakdown(profile, 0)
-		return promptCacheUsage{
-			CacheCreationInputTokens:   effectiveCreation,
-			CacheReadInputTokens:       0,
-			CacheCreation5mInputTokens: cache5m,
-			CacheCreation1hInputTokens: cache1h,
-		}
-	}
-
-	// Cap cacheable tokens at 85% of total input to ensure a realistic
-	// uncached portion. The newest content in a request is never fully
-	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * 0.85)
-	if lastTokens > maxCacheable {
-		lastTokens = maxCacheable
-	}
-
 	matchedTokens := 0
+	entries := t.entriesByAccount[accountID]
 	for i := len(profile.Breakpoints) - 1; i >= 0; i-- {
 		breakpoint := profile.Breakpoints[i]
-		// Skip breakpoints below the minimum cacheable token threshold.
+		// Breakpoints below the minimum cacheable size were never stored.
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
 		}
@@ -174,17 +179,15 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 		if !ok || entry.ExpiresAt.Before(now) {
 			continue
 		}
+		// A cache hit refreshes the entry's TTL, like the real cache.
 		entry.ExpiresAt = now.Add(entry.TTL)
 		entries[breakpoint.Fingerprint] = entry
-		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
-		if matchedTokens > lastTokens {
-			matchedTokens = lastTokens
-		}
+		matchedTokens = minInt(breakpoint.CumulativeTokens, lastTokens)
 		break
 	}
 
 	creation := maxInt(lastTokens-matchedTokens, 0)
-	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, matchedTokens)
+	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, matchedTokens, lastTokens)
 	return promptCacheUsage{
 		CacheCreationInputTokens:   creation,
 		CacheReadInputTokens:       matchedTokens,
@@ -236,10 +239,13 @@ func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
 }
 
 type cacheablePromptBlock struct {
-	Value        interface{}
-	Tokens       int
-	TTL          time.Duration
-	IsMessageEnd bool
+	Value  interface{}
+	Tokens int
+	TTL    time.Duration
+	// IsBoundary marks a structural prefix boundary (end of the tool
+	// definitions, end of the system prompt, end of each message) where the
+	// simulation places an automatic cache breakpoint.
+	IsBoundary bool
 }
 
 func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
@@ -256,9 +262,10 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 		}
 		fingerprintValue := stripCachePositionKeys(toolValue)
 		blocks = append(blocks, cacheablePromptBlock{
-			Value:  fingerprintValue,
-			Tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
-			TTL:    normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
+			Value:      fingerprintValue,
+			Tokens:     estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
+			TTL:        normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
+			IsBoundary: toolIndex == len(req.Tools)-1,
 		})
 	}
 
@@ -266,6 +273,58 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 
 	for messageIndex, msg := range req.Messages {
 		appendMessageCacheBlocks(&blocks, messageIndex, msg)
+	}
+
+	return blocks
+}
+
+// flattenOpenAICacheBlocks maps an OpenAI-compatible request onto the same
+// block/boundary structure: prelude, tool definitions (boundary after the
+// last), then one block per message (each a boundary). OpenAI clients have no
+// cache_control, so TTLs are always the default.
+func flattenOpenAICacheBlocks(req *OpenAIRequest) []cacheablePromptBlock {
+	blocks := make([]cacheablePromptBlock, 0, len(req.Messages)+len(req.Tools)+1)
+
+	prelude := map[string]interface{}{
+		"kind":  "request_prelude",
+		"model": req.Model,
+	}
+	blocks = append(blocks, cacheablePromptBlock{
+		Value:  prelude,
+		Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)),
+	})
+
+	for toolIndex, tool := range req.Tools {
+		toolValue := map[string]interface{}{
+			"kind":         "tool",
+			"name":         tool.Function.Name,
+			"description":  tool.Function.Description,
+			"input_schema": tool.Function.Parameters,
+		}
+		blocks = append(blocks, cacheablePromptBlock{
+			Value:      toolValue,
+			Tokens:     estimateApproxTokens(canonicalizeCacheValue(toolValue)),
+			IsBoundary: toolIndex == len(req.Tools)-1,
+		})
+	}
+
+	for _, msg := range req.Messages {
+		wrapper := map[string]interface{}{
+			"kind":    "message",
+			"role":    msg.Role,
+			"content": msg.Content,
+		}
+		if msg.ToolCallID != "" {
+			wrapper["tool_call_id"] = msg.ToolCallID
+		}
+		if len(msg.ToolCalls) > 0 {
+			wrapper["tool_calls"] = msg.ToolCalls
+		}
+		blocks = append(blocks, cacheablePromptBlock{
+			Value:      wrapper,
+			Tokens:     estimateApproxTokens(canonicalizeCacheValue(wrapper)),
+			IsBoundary: true,
+		})
 	}
 
 	return blocks
@@ -293,14 +352,14 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 				"type": "text",
 				"text": v,
 			},
-		}, false)
+		}, true)
 	case []interface{}:
 		for i, block := range v {
 			appendPromptBlock(blocks, map[string]interface{}{
 				"kind":         "system",
 				"system_index": i,
 				"block":        block,
-			}, false)
+			}, i == len(v)-1)
 		}
 	case []string:
 		for i, block := range v {
@@ -311,7 +370,7 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 					"type": "text",
 					"text": block,
 				},
-			}, false)
+			}, i == len(v)-1)
 		}
 	}
 }
@@ -354,7 +413,7 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 	}
 }
 
-func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interface{}, isMessageEnd bool) {
+func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interface{}, isBoundary bool) {
 	blockValue := wrapper["block"]
 	ttl := normalizePromptCacheTTL(extractPromptCacheTTL(blockValue))
 
@@ -368,10 +427,10 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	fingerprintValue := stripCachePositionKeys(wrapper)
 	canonical := canonicalizeCacheValue(fingerprintValue)
 	*blocks = append(*blocks, cacheablePromptBlock{
-		Value:        fingerprintValue,
-		Tokens:       estimateApproxTokens(canonical),
-		TTL:          ttl,
-		IsMessageEnd: isMessageEnd,
+		Value:      fingerprintValue,
+		Tokens:     estimateApproxTokens(canonical),
+		TTL:        ttl,
+		IsBoundary: isBoundary,
 	})
 }
 
@@ -482,7 +541,11 @@ func normalizePromptCacheTTL(ttl time.Duration) time.Duration {
 	return defaultPromptCacheTTL
 }
 
-func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens int) (int, int) {
+// computePromptCacheTTLBreakdown splits the newly-created span
+// (matchedTokens, lastTokens] into 5m and 1h tiers by breakpoint TTL. Bounding
+// by lastTokens (the effective creation ceiling) keeps the invariant
+// cache5m+cache1h == creation.
+func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens, lastTokens int) (int, int) {
 	if profile == nil || len(profile.Breakpoints) == 0 {
 		return 0, 0
 	}
@@ -491,7 +554,7 @@ func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens i
 	cache1h := 0
 	previous := matchedTokens
 	for _, breakpoint := range profile.Breakpoints {
-		current := minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
+		current := minInt(breakpoint.CumulativeTokens, lastTokens)
 		if current <= previous {
 			continue
 		}
@@ -504,6 +567,59 @@ func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens i
 		previous = current
 	}
 	return cache5m, cache1h
+}
+
+// resolvePromptCacheUsage picks the request's final prompt-cache accounting:
+// upstream metering truth when Kiro transmitted it (layer 1), otherwise the
+// local prefix simulation (layer 2). Either way the result is clamped against
+// the final input token count, which may come from a different source
+// (contextUsage / upstream metadata) than the estimate the profile was built
+// with. This single value feeds all three surfaces — client response usage,
+// panels, and the usage ledgers — so they can never disagree.
+func resolvePromptCacheUsage(simulated promptCacheUsage, hasMetering bool, meteringRead, meteringCreation, finalInputTokens int) promptCacheUsage {
+	usage := simulated
+	if hasMetering {
+		usage = promptCacheUsage{
+			CacheCreationInputTokens: meteringCreation,
+			CacheReadInputTokens:     meteringRead,
+			// Kiro metering has no 5m/1h split; attribute all creation to 5m.
+			CacheCreation5mInputTokens: meteringCreation,
+		}
+	}
+	return clampPromptCacheUsage(usage, finalInputTokens)
+}
+
+// clampPromptCacheUsage re-normalizes a computed usage against the final input
+// token count (which may come from upstream metadata or contextUsage rather
+// than the local estimate the profile was built with). Invariants enforced:
+// read <= total, read+creation <= total (read wins over creation, matching the
+// Rust clamp_to_total), and the 5m/1h split always sums to creation.
+func clampPromptCacheUsage(usage promptCacheUsage, totalInputTokens int) promptCacheUsage {
+	if totalInputTokens < 0 {
+		totalInputTokens = 0
+	}
+	read := minInt(maxInt(usage.CacheReadInputTokens, 0), totalInputTokens)
+	creation := minInt(maxInt(usage.CacheCreationInputTokens, 0), totalInputTokens-read)
+
+	cache5m := maxInt(usage.CacheCreation5mInputTokens, 0)
+	cache1h := maxInt(usage.CacheCreation1hInputTokens, 0)
+	if cache5m+cache1h != creation {
+		// Rescale the tiers preserving their ratio; remainder goes to 5m.
+		if sum := cache5m + cache1h; sum > 0 && creation > 0 {
+			cache1h = int(float64(cache1h) / float64(sum) * float64(creation))
+			cache5m = creation - cache1h
+		} else {
+			cache5m = creation
+			cache1h = 0
+		}
+	}
+
+	return promptCacheUsage{
+		CacheCreationInputTokens:   creation,
+		CacheReadInputTokens:       read,
+		CacheCreation5mInputTokens: cache5m,
+		CacheCreation1hInputTokens: cache1h,
+	}
 }
 
 func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
@@ -525,6 +641,20 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
 	}
 	return result
+}
+
+// buildOpenAIUsageMap renders usage in OpenAI Chat Completions format. Unlike
+// Anthropic (whose input_tokens EXCLUDES cached tokens), OpenAI's prompt_tokens
+// includes them and the hit is reported via prompt_tokens_details.cached_tokens.
+func buildOpenAIUsageMap(inputTokens, outputTokens int, usage promptCacheUsage) map[string]interface{} {
+	return map[string]interface{}{
+		"prompt_tokens":     inputTokens,
+		"completion_tokens": outputTokens,
+		"total_tokens":      inputTokens + outputTokens,
+		"prompt_tokens_details": map[string]int{
+			"cached_tokens": usage.CacheReadInputTokens,
+		},
+	}
 }
 
 func canonicalizeCacheValue(value interface{}) string {

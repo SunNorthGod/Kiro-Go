@@ -410,6 +410,19 @@ DELETE FROM usage_records
 	return ct.RowsAffected(), nil
 }
 
+// PruneUsageRecordsBefore deletes detail rows older than cutoffUnix across ALL
+// keys and returns how many were removed. This is the time-based retention for
+// the display-only log: billing reads usage_counters, so pruning here can never
+// affect quota or credit totals. Callers must keep at least the 90 days that
+// GetDailyUsage can be asked for.
+func PruneUsageRecordsBefore(ctx context.Context, q Querier, cutoffUnix int64) (int64, error) {
+	ct, err := q.Exec(ctx, `DELETE FROM usage_records WHERE created_at < $1`, cutoffUnix)
+	if err != nil {
+		return 0, fmt.Errorf("db: prune usage records before: %w", err)
+	}
+	return ct.RowsAffected(), nil
+}
+
 // DailyUsage is one calendar day's aggregate over usage_records, for the admin
 // overview trend chart.
 type DailyUsage struct {

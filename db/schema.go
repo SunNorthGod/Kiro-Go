@@ -156,6 +156,11 @@ var schemaStatements = []string{
 )`,
 	`CREATE INDEX IF NOT EXISTS idx_usage_records_api_key ON usage_records (api_key_id, created_at DESC)`,
 	`CREATE INDEX IF NOT EXISTS idx_usage_records_credential ON usage_records (credential_id, created_at DESC)`,
+	// Pure created_at index: the overview's recent-window aggregates
+	// (GetRecentCacheStats / GetDailyUsage) filter by created_at alone, which
+	// the composite indexes above (leading on api_key_id / credential_id)
+	// cannot serve — without this, each poll is a full-table seq scan.
+	`CREATE INDEX IF NOT EXISTS idx_usage_records_created ON usage_records (created_at)`,
 	// Idempotent backfill for deployments whose usage_records table predates the
 	// prompt-cache accounting columns. These are display-only (the cache hit-rate
 	// panel); billing never reads them.

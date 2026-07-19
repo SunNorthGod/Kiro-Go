@@ -1,5 +1,5 @@
 {
-  "version": "1.1.3",
-  "changelog": "✨ 概览页重构：新增「实时」分区（实时 RPM / TPM / 并发），活跃账号与活跃卡密归位。\n✨ 缓存命中率改为近 7 天窗口，不再被历史基数拖低。\n✨ 新增企业 SSO (IAM Identity Center) 手动登录，自动探测区域。\n✨ 积分显示统一为 1 位小数，界面与输入框统一优化。\n✨ Overview redesign with a Realtime section (RPM/TPM/in-flight); cache hit rate now uses a 7-day window; enterprise IAM Identity Center SSO login; unified 1-decimal credits and UI polish.",
+  "version": "1.1.4",
+  "changelog": "✨ 缓存统计全面重做：不再依赖客户端 cache_control，所有客户端（含 OpenAI / Responses 接口）按真实语义模拟（首见=写入、复现=命中、TTL 过期），上游 metering 真值优先；客户端 usage、面板、账本三处同源。\n✨ OpenAI / Responses 接口 usage 新增 cached_tokens 字段。\n🐛 修复禁用/超额账号统计归零；修复 OpenAI 流式路径并发名额泄漏。\n⚡ usage_records 增加 created_at 索引 + 90 天保留，概览查询不再全表扫描。\n✨ Prompt-cache accounting rebuilt with real semantics for all clients (no cache_control required, upstream metering wins when present); cached_tokens in OpenAI/Responses usage; disabled-account stats fix; concurrency slot leak fix; usage_records index + retention.",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }

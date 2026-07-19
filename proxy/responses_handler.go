@@ -109,6 +109,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
+	cacheProfile := h.promptCache.BuildOpenAIProfile(openaiReq, estimatedInputTokens)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -116,17 +117,17 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			cacheProfile, apiKeyID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		cacheProfile, apiKeyID, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
@@ -155,12 +156,15 @@ func (h *Handler) handleResponsesNonStream(
 			h.handleAccountFailure(&account, err)
 			continue
 		}
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var meteringCacheRead, meteringCacheCreation int
+		var hasCacheMetering bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -175,6 +179,10 @@ func (h *Handler) handleResponsesNonStream(
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			},
+			OnCacheMetering: func(read, creation int) {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
 			},
 		}
 
@@ -197,15 +205,18 @@ func (h *Handler) handleResponsesNonStream(
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		releaseSlot()
+		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj.Usage.InputTokensDetails = &ResponsesInputTokensDetails{CachedTokens: cacheUsage.CacheReadInputTokens}
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -287,7 +298,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -370,15 +381,19 @@ func (h *Handler) handleResponsesStream(
 			"type":     "response.in_progress",
 			"response": initial,
 		})
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText              strings.Builder
+			reasoningText         strings.Builder
+			toolUses              []KiroToolUse
+			inputTokens           int
+			outputTokens          int
+			credits               float64
+			realInputTokens       int
+			meteringCacheRead     int
+			meteringCacheCreation int
+			hasCacheMetering      bool
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -505,6 +520,10 @@ func (h *Handler) handleResponsesStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnCacheMetering: func(read, creation int) {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
+			},
 		}
 
 		err := callKiroWithSelfHeal(&account, payload, callback)
@@ -570,15 +589,18 @@ func (h *Handler) handleResponsesStream(
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		releaseSlot()
+		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj.Usage.InputTokensDetails = &ResponsesInputTokensDetails{CachedTokens: cacheUsage.CacheReadInputTokens}
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

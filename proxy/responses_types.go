@@ -53,6 +53,13 @@ type ResponsesUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
+	// InputTokensDetails carries the prompt-cache hit (cached_tokens), matching
+	// the OpenAI Responses API shape. input_tokens includes cached tokens.
+	InputTokensDetails *ResponsesInputTokensDetails `json:"input_tokens_details,omitempty"`
+}
+
+type ResponsesInputTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 type ResponsesError struct {

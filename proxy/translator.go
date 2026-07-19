@@ -2768,7 +2768,7 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string, cacheUsage promptCacheUsage) map[string]interface{} {
 	finishReason := openAIFinishReason(len(toolUses) > 0, false, inputTokens, model)
 
 	message := map[string]interface{}{
@@ -2817,10 +2817,6 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			"message":       message,
 			"finish_reason": finishReason,
 		}},
-		"usage": map[string]int{
-			"prompt_tokens":     inputTokens,
-			"completion_tokens": outputTokens,
-			"total_tokens":      inputTokens + outputTokens,
-		},
+		"usage": buildOpenAIUsageMap(inputTokens, outputTokens, cacheUsage),
 	}
 }

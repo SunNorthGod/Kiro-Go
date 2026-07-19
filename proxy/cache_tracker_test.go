@@ -210,6 +210,183 @@ func TestCanonicalCacheValuePreservesSemanticPositionKeys(t *testing.T) {
 	}
 }
 
+// TestPromptCacheWithoutCacheControl verifies the real-semantics simulation for
+// plain clients that never send cache_control: the first request creates the
+// full cacheable prefix, and a multi-turn continuation reads the stored prefix
+// while only the new tail counts as creation.
+func TestPromptCacheWithoutCacheControl(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+
+	req1 := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   systemText,
+		Messages: []ClaudeMessage{{Role: "user", Content: "question one"}},
+	}
+	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	if profile1 == nil {
+		t.Fatalf("profile should be built without any cache_control")
+	}
+
+	first := tracker.Compute("acct-1", profile1)
+	if first.CacheCreationInputTokens <= 0 || first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected first request to be pure creation, got %+v", first)
+	}
+	if first.CacheCreation5mInputTokens+first.CacheCreation1hInputTokens != first.CacheCreationInputTokens {
+		t.Fatalf("expected 5m+1h == creation, got %+v", first)
+	}
+	tracker.Update("acct-1", profile1)
+
+	req2 := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: systemText,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "question one"},
+			{Role: "assistant", Content: "answer one"},
+			{Role: "user", Content: "follow-up question"},
+		},
+	}
+	profile2 := tracker.BuildClaudeProfile(req2, 4096)
+	second := tracker.Compute("acct-1", profile2)
+	if second.CacheReadInputTokens == 0 {
+		t.Fatalf("expected multi-turn continuation to read the stored prefix, got %+v", second)
+	}
+	if second.CacheCreationInputTokens <= 0 {
+		t.Fatalf("expected the new tail to count as creation, got %+v", second)
+	}
+	lastTokens := profile2.Breakpoints[len(profile2.Breakpoints)-1].CumulativeTokens
+	if lastTokens > profile2.TotalInputTokens {
+		lastTokens = profile2.TotalInputTokens
+	}
+	if got := second.CacheReadInputTokens + second.CacheCreationInputTokens; got != lastTokens {
+		t.Fatalf("expected read+creation to cover the cacheable prefix (%d), got %d", lastTokens, got)
+	}
+	if second.CacheCreation5mInputTokens+second.CacheCreation1hInputTokens != second.CacheCreationInputTokens {
+		t.Fatalf("expected 5m+1h == creation, got %+v", second)
+	}
+}
+
+// TestPromptCacheBelowMinimumIsNotCached: prompts under the model's minimum
+// cacheable size (1024, opus 4096) must report all-zero cache usage.
+func TestPromptCacheBelowMinimumIsNotCached(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   "tiny system",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	profile := tracker.BuildClaudeProfile(req, 64)
+	if profile == nil {
+		t.Fatalf("profile should still be built")
+	}
+	if got := tracker.Compute("acct-1", profile); got != (promptCacheUsage{}) {
+		t.Fatalf("expected all-zero usage below the cacheable minimum, got %+v", got)
+	}
+	tracker.Update("acct-1", profile)
+	if got := tracker.Compute("acct-1", profile); got != (promptCacheUsage{}) {
+		t.Fatalf("expected repeat below minimum to stay zero, got %+v", got)
+	}
+}
+
+func TestClampPromptCacheUsageInvariants(t *testing.T) {
+	// read+creation exceed the (smaller) final input: read wins, creation gets
+	// the remainder, tiers re-sum to creation.
+	clamped := clampPromptCacheUsage(promptCacheUsage{
+		CacheCreationInputTokens:   500,
+		CacheReadInputTokens:       800,
+		CacheCreation5mInputTokens: 400,
+		CacheCreation1hInputTokens: 100,
+	}, 1000)
+	if clamped.CacheReadInputTokens != 800 {
+		t.Fatalf("expected read preserved at 800, got %+v", clamped)
+	}
+	if clamped.CacheCreationInputTokens != 200 {
+		t.Fatalf("expected creation squeezed to 200, got %+v", clamped)
+	}
+	if clamped.CacheCreation5mInputTokens+clamped.CacheCreation1hInputTokens != clamped.CacheCreationInputTokens {
+		t.Fatalf("expected tiers to re-sum to creation, got %+v", clamped)
+	}
+
+	// read alone exceeds total: clamped to total, creation zeroed.
+	clamped = clampPromptCacheUsage(promptCacheUsage{
+		CacheCreationInputTokens: 50,
+		CacheReadInputTokens:     2000,
+	}, 1000)
+	if clamped.CacheReadInputTokens != 1000 || clamped.CacheCreationInputTokens != 0 {
+		t.Fatalf("expected read clamped to total and creation zeroed, got %+v", clamped)
+	}
+	if billed := billedClaudeInputTokens(1000, clamped); billed != 0 {
+		t.Fatalf("expected billed input floor at 0, got %d", billed)
+	}
+}
+
+func TestResolvePromptCacheUsageMeteringWins(t *testing.T) {
+	simulated := promptCacheUsage{
+		CacheCreationInputTokens:   300,
+		CacheReadInputTokens:       200,
+		CacheCreation5mInputTokens: 300,
+	}
+	// Upstream metering present → it replaces the simulation entirely.
+	got := resolvePromptCacheUsage(simulated, true, 600, 100, 1000)
+	if got.CacheReadInputTokens != 600 || got.CacheCreationInputTokens != 100 {
+		t.Fatalf("expected metering values to win, got %+v", got)
+	}
+	if got.CacheCreation5mInputTokens != 100 || got.CacheCreation1hInputTokens != 0 {
+		t.Fatalf("expected metering creation attributed to 5m, got %+v", got)
+	}
+
+	// Metering absent → simulation passes through (clamped).
+	got = resolvePromptCacheUsage(simulated, false, 0, 0, 1000)
+	if got.CacheReadInputTokens != 200 || got.CacheCreationInputTokens != 300 {
+		t.Fatalf("expected simulation passthrough, got %+v", got)
+	}
+
+	// Metering larger than the final input → clamped with read priority.
+	got = resolvePromptCacheUsage(simulated, true, 80, 50, 100)
+	if got.CacheReadInputTokens != 80 || got.CacheCreationInputTokens != 20 {
+		t.Fatalf("expected clamp with read priority, got %+v", got)
+	}
+}
+
+// TestPromptCacheOpenAIProfileMultiTurn mirrors the plain-client Claude test
+// for the OpenAI request shape used by /v1/chat/completions and /v1/responses.
+func TestPromptCacheOpenAIProfileMultiTurn(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+
+	req1 := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemText},
+			{Role: "user", Content: "question one"},
+		},
+	}
+	profile1 := tracker.BuildOpenAIProfile(req1, 2048)
+	if profile1 == nil {
+		t.Fatalf("openai profile should be built")
+	}
+	first := tracker.Compute("acct-1", profile1)
+	if first.CacheCreationInputTokens <= 0 || first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected first openai request to be pure creation, got %+v", first)
+	}
+	tracker.Update("acct-1", profile1)
+
+	req2 := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: systemText},
+			{Role: "user", Content: "question one"},
+			{Role: "assistant", Content: "answer one"},
+			{Role: "user", Content: "follow-up question"},
+		},
+	}
+	profile2 := tracker.BuildOpenAIProfile(req2, 4096)
+	second := tracker.Compute("acct-1", profile2)
+	if second.CacheReadInputTokens == 0 {
+		t.Fatalf("expected openai multi-turn continuation to hit the prefix, got %+v", second)
+	}
+}
+
 // TestPromptCacheImplicitBreakpointAtMessageEnd verifies that once any
 // explicit cache_control breakpoint has been seen, subsequent message-end
 // boundaries act as implicit breakpoints. This allows multi-turn conversations

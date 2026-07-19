@@ -265,6 +265,11 @@ type KiroStreamCallback struct {
 	// The signature must be relayed to the client as a signature_delta so the
 	// client can send it back on the next turn; Kiro rejects unsigned thinking.
 	OnReasoningSignature func(signature string)
+	// OnCacheMetering fires once at stream end when the upstream meteringEvent
+	// carried prompt-cache token fields (cacheReadInputTokens /
+	// cacheWriteInputTokens). These are the upstream truth: when present they
+	// take precedence over the local prompt-cache simulation.
+	OnCacheMetering func(readTokens, creationTokens int)
 }
 
 // ==================== API Call ====================
@@ -462,6 +467,8 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	var meteringCacheRead, meteringCacheCreation int
+	var hasCacheMetering bool
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -535,6 +542,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
+			// Upstream prompt-cache truth, when Kiro chooses to transmit it.
+			// (Rust 侧实测 2026-07 版本不透传；这里保留探测 + INFO 日志,一旦
+			// 上游开始返回就自动切到真值口径。)
+			if read, creation, ok := extractCacheMeteringFromEvent(event); ok {
+				meteringCacheRead, meteringCacheCreation = read, creation
+				hasCacheMetering = true
+				logger.Infof("[Metering] upstream cache fields present: read=%d creation=%d", read, creation)
+			}
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				if callback.OnContextUsage != nil {
@@ -552,10 +567,36 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		callback.OnCredits(totalCredits)
 	}
 
+	// Only surface upstream cache metering when it carries information: an
+	// explicit all-zero pair is indistinguishable from "not implemented" and
+	// must not silence the local simulation.
+	if callback.OnCacheMetering != nil && hasCacheMetering && (meteringCacheRead > 0 || meteringCacheCreation > 0) {
+		callback.OnCacheMetering(meteringCacheRead, meteringCacheCreation)
+	}
+
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
 	return nil
+}
+
+// extractCacheMeteringFromEvent looks for prompt-cache token fields on a
+// meteringEvent payload (flat or inside any nested usage map). ok is true when
+// at least one of the fields is present; an absent field reads as 0.
+func extractCacheMeteringFromEvent(event map[string]interface{}) (readTokens, creationTokens int, ok bool) {
+	candidates := []map[string]interface{}{event}
+	collectUsageMaps(event, &candidates)
+	for _, m := range candidates {
+		if m == nil {
+			continue
+		}
+		read, readOK := readTokenNumber(m, "cacheReadInputTokens", "cache_read_input_tokens")
+		creation, creationOK := readTokenNumber(m, "cacheWriteInputTokens", "cache_write_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens")
+		if readOK || creationOK {
+			return read, creation, true
+		}
+	}
+	return 0, 0, false
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {

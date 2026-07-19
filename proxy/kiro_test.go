@@ -7,6 +7,7 @@ import (
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -107,6 +108,50 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 	}
 }
 
+// TestParseEventStreamSurfacesCacheMetering: when the upstream meteringEvent
+// carries prompt-cache token fields, OnCacheMetering must fire with them.
+func TestParseEventStreamSurfacesCacheMetering(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{
+		"usage":                 1.25,
+		"cacheReadInputTokens":  700,
+		"cacheWriteInputTokens": 300,
+	}))
+
+	var gotRead, gotCreation int
+	fired := false
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnCacheMetering: func(read, creation int) {
+			gotRead, gotCreation = read, creation
+			fired = true
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if !fired || gotRead != 700 || gotCreation != 300 {
+		t.Fatalf("expected cache metering 700/300, got fired=%v %d/%d", fired, gotRead, gotCreation)
+	}
+}
+
+// TestParseEventStreamIgnoresZeroCacheMetering: an explicit all-zero pair
+// carries no information and must not fire (it would silence the simulation).
+func TestParseEventStreamIgnoresZeroCacheMetering(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{
+		"usage":                 1.25,
+		"cacheReadInputTokens":  0,
+		"cacheWriteInputTokens": 0,
+	}))
+
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnCacheMetering: func(read, creation int) {
+			t.Fatalf("expected zero metering to be ignored, got %d/%d", read, creation)
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+}
+
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
 	current := handleToolUseEvent(map[string]interface{}{
@@ -178,18 +223,20 @@ func TestBuildKiroTransportUsesExplicitProxyURL(t *testing.T) {
 }
 
 func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://env-proxy.local:2323")
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
-
+	// http.ProxyFromEnvironment caches env vars process-wide on first call, and
+	// earlier tests can trigger HTTP requests through it — so resolving an env
+	// proxy set via t.Setenv here is order-dependent (flaked in full runs).
+	// Assert the wiring instead: empty proxyURL must fall back to the
+	// environment resolver, non-empty must not.
 	transport := buildKiroTransport("")
-	req := &http.Request{URL: mustParseURL(t, "https://q.us-east-1.amazonaws.com")}
-
-	got, err := transport.Proxy(req)
-	if err != nil {
-		t.Fatalf("unexpected proxy error: %v", err)
+	if transport.Proxy == nil {
+		t.Fatalf("expected env-proxy fallback to be wired, got nil Proxy")
 	}
-	assertProxyURL(t, got, "http://env-proxy.local:2323")
+	got := reflect.ValueOf(transport.Proxy).Pointer()
+	want := reflect.ValueOf(http.ProxyFromEnvironment).Pointer()
+	if got != want {
+		t.Fatalf("expected Proxy to be http.ProxyFromEnvironment")
+	}
 }
 
 func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
