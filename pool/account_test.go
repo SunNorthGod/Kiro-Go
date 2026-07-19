@@ -4,9 +4,78 @@ import (
 	"errors"
 	"kiro-go/config"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+// newSchedTestPool builds a pool with the scheduler state (cond + maps)
+// initialized, mirroring GetPool, so Acquire/release can be exercised (the
+// lighter newTestPool omits the scheduler fields).
+func newSchedTestPool(accounts ...config.Account) *AccountPool {
+	p := &AccountPool{
+		cooldowns:    make(map[string]time.Time),
+		errorCounts:  make(map[string]int),
+		modelLists:   make(map[string]map[string]bool),
+		inflightAcct: make(map[string]int),
+		inflightKey:  make(map[string]int),
+		sticky:       make(map[string]stickyRef),
+		rpmAcct:      make(map[string]*rpmRing),
+		rpmKey:       make(map[string]*rpmRing),
+		rpmAll:       &rpmRing{},
+		accounts:     accounts,
+	}
+	p.schedCond = sync.NewCond(&p.schedMu)
+	return p
+}
+
+// A key bound to specific accounts may only be routed to those accounts; an
+// empty binding allows any; a binding to an out-of-pool id yields no account.
+func TestAcquireRespectsBoundAccountIDs(t *testing.T) {
+	p := newSchedTestPool(config.Account{ID: "a"}, config.Account{ID: "b"}, config.Account{ID: "c"})
+
+	for i := 0; i < 10; i++ {
+		acc, release, err := p.Acquire("key1", 0, false, "", "", nil, []string{"b"})
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		if acc.ID != "b" {
+			t.Fatalf("bound key routed to %q, want b", acc.ID)
+		}
+		release()
+	}
+
+	if _, _, err := p.Acquire("key1", 0, false, "", "", nil, []string{"zzz"}); err != ErrNoAccount {
+		t.Fatalf("expected ErrNoAccount for out-of-pool binding, got %v", err)
+	}
+
+	acc, release, err := p.Acquire("key1", 0, false, "", "", nil, nil)
+	if err != nil {
+		t.Fatalf("unbound acquire failed: %v", err)
+	}
+	release()
+	if acc.ID == "" {
+		t.Fatalf("expected an account for an unbound key")
+	}
+}
+
+func TestEvictStaleStickySessions(t *testing.T) {
+	p := newSchedTestPool(config.Account{ID: "a"})
+	now := time.Now().Unix()
+	staleAge := int64(48*time.Hour/time.Second)
+	p.sticky["fresh"] = stickyRef{accountID: "a", lastSeen: now}
+	p.sticky["stale"] = stickyRef{accountID: "a", lastSeen: now - staleAge}
+
+	if removed := p.EvictStaleStickySessions(); removed != 1 {
+		t.Fatalf("expected 1 stale binding evicted, got %d", removed)
+	}
+	if _, ok := p.sticky["fresh"]; !ok {
+		t.Fatalf("fresh binding must survive eviction")
+	}
+	if _, ok := p.sticky["stale"]; ok {
+		t.Fatalf("stale binding must be evicted")
+	}
+}
 
 func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
 	p := &AccountPool{}

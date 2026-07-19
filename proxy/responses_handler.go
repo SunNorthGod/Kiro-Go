@@ -148,11 +148,22 @@ func (h *Handler) handleResponsesNonStream(
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
 	keyFloor := 0
+	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
 		keyFloor = e.MaxConcurrency
+		boundAccountIDs = e.BoundAccountIDs
 	}
+	// Panic-safety net: release the acquired slot even on a handler/callback panic.
+	// releaseSlot is idempotent, so it never double-releases with the explicit calls.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendOpenAIError(w, 429, "rate_limit_exceeded", "Too many concurrent requests for this key; retry shortly")
 			return
@@ -356,11 +367,22 @@ func (h *Handler) handleResponsesStream(
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
 	keyFloor := 0
+	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
 		keyFloor = e.MaxConcurrency
+		boundAccountIDs = e.BoundAccountIDs
 	}
+	// Panic-safety net: release the acquired slot even on a handler/callback panic.
+	// releaseSlot is idempotent, so it never double-releases with the explicit calls.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",

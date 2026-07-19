@@ -282,6 +282,14 @@ func (h *Handler) backgroundRefresh() {
 			h.refreshAllAccounts()
 			pruneUsageRecordsRetention()
 			sweepLowBalanceGates(time.Hour)
+			// Periodic maintenance that previously ran only once at startup or
+			// never: expire stored responses on every tick (not just the single
+			// startup goroutine), and evict idle sticky conversation bindings so
+			// the sticky map stays proportional to active conversations.
+			purgeExpiredResponses(responsesDefaultTTL)
+			if n := h.pool.EvictStaleStickySessions(); n > 0 {
+				logger.Infof("[Maintenance] evicted %d stale sticky sessions", n)
+			}
 		case <-h.stopRefresh:
 			return
 		}
@@ -1038,11 +1046,24 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	bypassFairness := apiKeyID == ""
 	// 每卡密并发下限(公平准入基线):取该卡密配置的 MaxConcurrency,未配置则 0(用池默认)。
 	keyFloor := 0
+	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
 		keyFloor = e.MaxConcurrency
+		boundAccountIDs = e.BoundAccountIDs
 	}
+	// Panic-safety net: guarantee the acquired concurrency slot is released even
+	// if a handler/callback panics. releaseSlot is idempotent (sync.Once), so the
+	// explicit release on the normal path and this deferred guard never
+	// double-release; on Acquire failure releaseSlot is nil (no-op guard).
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			// 本卡密并发已达公平上限且池子饱和 → 429(软限制:空载时不会到这里)。
 			h.sendClaudeError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
@@ -1698,11 +1719,25 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
 	keyFloor := 0
+	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
 		keyFloor = e.MaxConcurrency
+		boundAccountIDs = e.BoundAccountIDs
 	}
+	// Panic-safety net: guarantee the acquired concurrency slot is released even
+	// if a handler/callback panics between Acquire and the explicit release.
+	// releaseSlot is idempotent (sync.Once), so the normal path's explicit
+	// release and this deferred guard never double-release. On Acquire failure
+	// releaseSlot is nil, so activeRelease stays nil and the guard is a no-op.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendClaudeError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
 			return
@@ -1934,11 +1969,25 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
 	keyFloor := 0
+	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
 		keyFloor = e.MaxConcurrency
+		boundAccountIDs = e.BoundAccountIDs
 	}
+	// Panic-safety net: guarantee the acquired concurrency slot is released even
+	// if a handler/callback panics between Acquire and the explicit release.
+	// releaseSlot is idempotent (sync.Once), so the normal path's explicit
+	// release and this deferred guard never double-release. On Acquire failure
+	// releaseSlot is nil, so activeRelease stays nil and the guard is a no-op.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendOpenAIError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
 			return
@@ -2332,11 +2381,25 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
 	keyFloor := 0
+	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
 		keyFloor = e.MaxConcurrency
+		boundAccountIDs = e.BoundAccountIDs
 	}
+	// Panic-safety net: guarantee the acquired concurrency slot is released even
+	// if a handler/callback panics between Acquire and the explicit release.
+	// releaseSlot is idempotent (sync.Once), so the normal path's explicit
+	// release and this deferred guard never double-release. On Acquire failure
+	// releaseSlot is nil, so activeRelease stays nil and the guard is a no-op.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendOpenAIError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
 			return

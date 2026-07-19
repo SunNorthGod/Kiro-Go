@@ -33,6 +33,11 @@ type kiroEndpoint struct {
 	Name      string
 }
 
+// maxEventFrameBytes caps a single AWS event-stream frame. The declared 4-byte
+// length is untrusted (corruption / a hostile upstream), so it must not drive an
+// unbounded allocation. 16 MiB is far above any real Kiro event.
+const maxEventFrameBytes = 16 << 20
+
 var kiroEndpoints = []kiroEndpoint{
 	{
 		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
@@ -413,14 +418,11 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 	}
 	setPayloadProfileArnForAccount(payload, account)
 
-	if _, err := json.Marshal(payload); err != nil {
-		return err
-	}
-
-	// Debug: dump full payload for troubleshooting upstream rejections
-	if payloadJSON, err := json.Marshal(payload); err == nil {
-		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
-	}
+	// Payload serialization now happens once per endpoint attempt below (its error
+	// is the validation, and DEBUG logging reuses that same bytes). This drops the
+	// previous 3x marshal (standalone validate + unconditional debug dump + body)
+	// to a single marshal on the common single-endpoint path.
+	debugPayload := logger.GetLevel() <= logger.LevelDebug
 
 	// Wrap OnToolUse to restore original tool names for the client.
 	if callback != nil && callback.OnToolUse != nil && len(payload.ToolNameMap) > 0 {
@@ -467,7 +469,14 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
-		reqBody, _ := json.Marshal(payload)
+		reqBody, mErr := json.Marshal(payload)
+		if mErr != nil {
+			lastErr = mErr
+			continue
+		}
+		if debugPayload {
+			logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
+		}
 
 		// Per-endpoint attempt in a closure so the derived cancel is always
 		// released (defer), whether we fail fast or stream to completion.
@@ -570,9 +579,13 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 	var meteringCacheRead, meteringCacheCreation int
 	var hasCacheMetering bool
 
+	// Reused across frames so a long stream doesn't allocate a fresh prelude +
+	// message buffer per event.
+	prelude := make([]byte, 12)
+	var msgBuf []byte
+
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
-		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
 			break
@@ -594,12 +607,26 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 		if totalLength < 16 {
 			continue
 		}
+		// Cap a single frame's declared size: the 4-byte totalLength is attacker/
+		// corruption-influenced, and make([]byte, totalLength-12) on a bogus large
+		// value would try to allocate up to ~4 GiB and OOM the process. Legit Kiro
+		// frames are far below 16 MiB.
+		if totalLength > maxEventFrameBytes {
+			return fmt.Errorf("event stream frame too large: %d bytes (cap %d)", totalLength, maxEventFrameBytes)
+		}
 
-		// Read the remaining message bytes.
+		// Read the remaining message bytes into the reused buffer (grown on demand).
 		remaining := totalLength - 12
-		msgBuf := make([]byte, remaining)
+		if cap(msgBuf) < remaining {
+			msgBuf = make([]byte, remaining)
+		} else {
+			msgBuf = msgBuf[:remaining]
+		}
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
 

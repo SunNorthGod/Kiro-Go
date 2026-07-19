@@ -52,10 +52,18 @@ type promptCacheEntry struct {
 	TTL       time.Duration
 }
 
+// promptCachePruneInterval throttles the full-map expiry sweep. Compute/Update
+// run on every request and each previously did a full O(accounts×entries) prune;
+// under load that repeated scan dominated the lock hold. Expired entries are
+// still skipped lazily on read (ExpiresAt check), so bounding the sweep to at
+// most once per interval only delays reclaiming memory, never correctness.
+const promptCachePruneInterval = 60 * time.Second
+
 type promptCacheTracker struct {
 	mu               sync.Mutex
 	entriesByAccount map[string]map[[32]byte]promptCacheEntry
 	maxSupportedTTL  time.Duration
+	lastPrune        time.Time
 }
 
 func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
@@ -104,8 +112,9 @@ func buildPromptCacheProfile(blocks []cacheablePromptBlock, totalInputTokens int
 	activeTTL := defaultPromptCacheTTL
 
 	for _, block := range blocks {
-		canonical := canonicalizeCacheValue(block.Value)
-		writeHashChunk(hasher, canonical)
+		// Reuse the canonical string computed at block construction (no second
+		// serialization of the same value).
+		writeHashChunk(hasher, block.Canonical)
 		cumulativeTokens += block.Tokens
 
 		breakpointTTL := time.Duration(0)
@@ -225,7 +234,15 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 	}
 }
 
+// pruneExpiredLocked sweeps expired entries, but at most once per
+// promptCachePruneInterval (throttled): the full-map scan is expensive and
+// running it on every Compute/Update was pure overhead since reads already skip
+// expired entries lazily. Caller holds t.mu.
 func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
+	if !t.lastPrune.IsZero() && now.Sub(t.lastPrune) < promptCachePruneInterval {
+		return
+	}
+	t.lastPrune = now
 	for accountID, entries := range t.entriesByAccount {
 		for fingerprint, entry := range entries {
 			if !entry.ExpiresAt.After(now) {
@@ -239,13 +256,31 @@ func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
 }
 
 type cacheablePromptBlock struct {
-	Value  interface{}
-	Tokens int
-	TTL    time.Duration
+	Value interface{}
+	// Canonical is the canonical JSON of Value, computed ONCE at block
+	// construction and reused for both the token estimate and the prefix hash
+	// (buildPromptCacheProfile). Previously every block was canonicalized twice
+	// — once here for tokens, once again in buildPromptCacheProfile for the hash.
+	Canonical string
+	Tokens    int
+	TTL       time.Duration
 	// IsBoundary marks a structural prefix boundary (end of the tool
 	// definitions, end of the system prompt, end of each message) where the
 	// simulation places an automatic cache breakpoint.
 	IsBoundary bool
+}
+
+// makeCacheBlock canonicalizes value once and derives both the token estimate
+// and the stored canonical string from that single serialization.
+func makeCacheBlock(value interface{}, ttl time.Duration, isBoundary bool) cacheablePromptBlock {
+	canonical := canonicalizeCacheValue(value)
+	return cacheablePromptBlock{
+		Value:      value,
+		Canonical:  canonical,
+		Tokens:     estimateApproxTokens(canonical),
+		TTL:        ttl,
+		IsBoundary: isBoundary,
+	}
 }
 
 func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
@@ -261,12 +296,11 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 			"input_schema": tool.InputSchema,
 		}
 		fingerprintValue := stripCachePositionKeys(toolValue)
-		blocks = append(blocks, cacheablePromptBlock{
-			Value:      fingerprintValue,
-			Tokens:     estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
-			TTL:        normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
-			IsBoundary: toolIndex == len(req.Tools)-1,
-		})
+		blocks = append(blocks, makeCacheBlock(
+			fingerprintValue,
+			normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
+			toolIndex == len(req.Tools)-1,
+		))
 	}
 
 	appendSystemCacheBlocks(&blocks, req.System)
@@ -289,10 +323,7 @@ func flattenOpenAICacheBlocks(req *OpenAIRequest) []cacheablePromptBlock {
 		"kind":  "request_prelude",
 		"model": req.Model,
 	}
-	blocks = append(blocks, cacheablePromptBlock{
-		Value:  prelude,
-		Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)),
-	})
+	blocks = append(blocks, makeCacheBlock(prelude, 0, false))
 
 	for toolIndex, tool := range req.Tools {
 		toolValue := map[string]interface{}{
@@ -301,11 +332,7 @@ func flattenOpenAICacheBlocks(req *OpenAIRequest) []cacheablePromptBlock {
 			"description":  tool.Function.Description,
 			"input_schema": tool.Function.Parameters,
 		}
-		blocks = append(blocks, cacheablePromptBlock{
-			Value:      toolValue,
-			Tokens:     estimateApproxTokens(canonicalizeCacheValue(toolValue)),
-			IsBoundary: toolIndex == len(req.Tools)-1,
-		})
+		blocks = append(blocks, makeCacheBlock(toolValue, 0, toolIndex == len(req.Tools)-1))
 	}
 
 	for _, msg := range req.Messages {
@@ -320,11 +347,7 @@ func flattenOpenAICacheBlocks(req *OpenAIRequest) []cacheablePromptBlock {
 		if len(msg.ToolCalls) > 0 {
 			wrapper["tool_calls"] = msg.ToolCalls
 		}
-		blocks = append(blocks, cacheablePromptBlock{
-			Value:      wrapper,
-			Tokens:     estimateApproxTokens(canonicalizeCacheValue(wrapper)),
-			IsBoundary: true,
-		})
+		blocks = append(blocks, makeCacheBlock(wrapper, 0, true))
 	}
 
 	return blocks
@@ -336,10 +359,7 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 		"model":       req.Model,
 		"tool_choice": req.ToolChoice,
 	}
-	return cacheablePromptBlock{
-		Value:  prelude,
-		Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)),
-	}
+	return makeCacheBlock(prelude, 0, false)
 }
 
 func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{}) {
@@ -425,13 +445,7 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	}
 
 	fingerprintValue := stripCachePositionKeys(wrapper)
-	canonical := canonicalizeCacheValue(fingerprintValue)
-	*blocks = append(*blocks, cacheablePromptBlock{
-		Value:      fingerprintValue,
-		Tokens:     estimateApproxTokens(canonical),
-		TTL:        ttl,
-		IsBoundary: isBoundary,
-	})
+	*blocks = append(*blocks, makeCacheBlock(fingerprintValue, ttl, isBoundary))
 }
 
 func stripCachePositionKeys(value map[string]interface{}) map[string]interface{} {

@@ -73,7 +73,19 @@ type snapAcct struct {
 // the given model (deduped by ID), captured under mu.RLock. Returning copies —
 // never &p.accounts[i] — is what fixes the data race where the request path read
 // a pool-internal account while a token refresh wrote it.
-func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool) []snapAcct {
+//
+// boundAccountIDs, when non-empty, restricts selection to the intersection with
+// the pool (a key bound to specific accounts may only use those); empty means any
+// account is allowed.
+func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, boundAccountIDs []string) []snapAcct {
+	var boundSet map[string]bool
+	if len(boundAccountIDs) > 0 {
+		boundSet = make(map[string]bool, len(boundAccountIDs))
+		for _, id := range boundAccountIDs {
+			boundSet[id] = true
+		}
+	}
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -88,6 +100,9 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool) [
 			continue
 		}
 		seen[a.ID] = true
+		if boundSet != nil && !boundSet[a.ID] {
+			continue
+		}
 		if excluded != nil && excluded[a.ID] {
 			continue
 		}
@@ -116,8 +131,9 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool) [
 // keyConcurrencyFloor is the per-key guaranteed baseline (0 → default 5); the
 // effective fair cap under contention is max(floor, poolCapacity/activeKeys).
 // isAdmin bypasses the fairness gate entirely (still counted for observability).
-func (p *AccountPool) Acquire(keyID string, keyConcurrencyFloor int, isAdmin bool, conversationID, model string, excluded map[string]bool) (config.Account, func(), error) {
-	snap := p.eligibleSnapshot(model, excluded)
+// boundAccountIDs restricts selection to those accounts (empty = any).
+func (p *AccountPool) Acquire(keyID string, keyConcurrencyFloor int, isAdmin bool, conversationID, model string, excluded map[string]bool, boundAccountIDs []string) (config.Account, func(), error) {
+	snap := p.eligibleSnapshot(model, excluded, boundAccountIDs)
 	if len(snap) == 0 {
 		return config.Account{}, nil, ErrNoAccount
 	}
@@ -333,6 +349,31 @@ func (p *AccountPool) unbindAccount(accountID string) {
 		}
 	}
 	p.schedMu.Unlock()
+}
+
+// stickySessionTTL bounds how long an idle conversation→account binding is kept.
+// A binding is only touched (lastSeen updated) while its conversation is active;
+// once a conversation goes quiet its binding is dead weight, so the map grew
+// without bound (one entry per conversation id ever seen). Evict bindings unseen
+// for this long so a long-running server's sticky map stays proportional to
+// ACTIVE conversations, not all-time conversations.
+const stickySessionTTL = 24 * time.Hour
+
+// EvictStaleStickySessions drops conversation bindings not seen within
+// stickySessionTTL and returns how many were removed. Meant to be called
+// periodically from the background maintenance loop.
+func (p *AccountPool) EvictStaleStickySessions() int {
+	cutoff := time.Now().Add(-stickySessionTTL).Unix()
+	removed := 0
+	p.schedMu.Lock()
+	for cid, ref := range p.sticky {
+		if ref.lastSeen < cutoff {
+			delete(p.sticky, cid)
+			removed++
+		}
+	}
+	p.schedMu.Unlock()
+	return removed
 }
 
 // StickyMetrics returns cumulative sticky-cache hit/miss counters (for /admin observability).
