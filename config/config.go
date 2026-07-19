@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -269,18 +270,34 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.4"
+const Version = "1.1.5"
 
 var (
 	cfg     *Config
 	cfgLock sync.RWMutex
-	cfgPath string
+	// cfgPath is written once by Init and read from Save/ConfigDir/Load, which
+	// run on request/background goroutines. A plain string field raced (the
+	// -race detector flagged the Init write vs. those unsynchronized reads, even
+	// though they are temporally separated). Storing it in an atomic.Pointer
+	// gives every read a proper happens-before edge to the single startup write.
+	cfgPathAtomic atomic.Pointer[string]
 )
+
+// setCfgPath records the config file path (called once from Init).
+func setCfgPath(p string) { cfgPathAtomic.Store(&p) }
+
+// getCfgPath returns the config file path, or "" before Init has run.
+func getCfgPath() string {
+	if p := cfgPathAtomic.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
-	cfgPath = path
+	setCfgPath(path)
 	return Load()
 }
 
@@ -288,7 +305,7 @@ func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
-	data, err := os.ReadFile(cfgPath)
+	data, err := os.ReadFile(getCfgPath())
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Create default configuration.
@@ -375,17 +392,18 @@ func Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	return os.WriteFile(getCfgPath(), data, 0600)
 }
 
 // ConfigDir returns the directory holding the config file, so sibling runtime
 // data files (e.g. daily_stats.json) can live alongside it. Returns "." until
 // Init has run.
 func ConfigDir() string {
-	if cfgPath == "" {
+	p := getCfgPath()
+	if p == "" {
 		return "."
 	}
-	return filepath.Dir(cfgPath)
+	return filepath.Dir(p)
 }
 
 // SetPassword updates the admin password.
@@ -400,12 +418,10 @@ func SetPassword(password string) {
 // Useful for sibling state (e.g. stored Responses, caches) that should live
 // alongside the configuration file.
 func GetConfigDir() string {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfgPath == "" {
+	dir := getCfgPath()
+	if dir == "" {
 		return "."
 	}
-	dir := cfgPath
 	for i := len(dir) - 1; i >= 0; i-- {
 		if dir[i] == '/' || dir[i] == '\\' {
 			return dir[:i]
@@ -675,18 +691,37 @@ func DeleteAccount(id string) error {
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts[i].AccessToken = accessToken
-			if refreshToken != "" {
-				cfg.Accounts[i].RefreshToken = refreshToken
-			}
-			cfg.Accounts[i].ExpiresAt = expiresAt
-			return persistAccountLocked(cfg.Accounts[i])
+	if cfg == nil {
+		cfgLock.Unlock()
+		return nil
+	}
+	idx := -1
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			idx = i
+			break
 		}
 	}
-	return nil
+	if idx < 0 {
+		cfgLock.Unlock()
+		return nil
+	}
+	cfg.Accounts[idx].AccessToken = accessToken
+	if refreshToken != "" {
+		cfg.Accounts[idx].RefreshToken = refreshToken
+	}
+	cfg.Accounts[idx].ExpiresAt = expiresAt
+	dbOn := dbEnabled
+	if !dbOn {
+		err := saveLocked()
+		cfgLock.Unlock()
+		return err
+	}
+	cfgLock.Unlock()
+	// DB mode: targeted token UPDATE OUTSIDE cfgLock. Disjoint from the stats
+	// columns, so it can't revert a concurrent stats write and vice versa. The
+	// blank-refreshToken "keep existing" semantics are handled in db.UpdateAccountToken.
+	return dbUpdateAccountToken(id, accessToken, refreshToken, expiresAt)
 }
 
 func GetApiKey() string {
@@ -749,18 +784,35 @@ func GetStats() (int, int, int, int, float64) {
 
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts[i].RequestCount = requestCount
-			cfg.Accounts[i].ErrorCount = errorCount
-			cfg.Accounts[i].TotalTokens = totalTokens
-			cfg.Accounts[i].TotalCredits = totalCredits
-			cfg.Accounts[i].LastUsed = lastUsed
-			return persistAccountLocked(cfg.Accounts[i])
+	if cfg == nil {
+		cfgLock.Unlock()
+		return nil
+	}
+	idx := -1
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			idx = i
+			break
 		}
 	}
-	return nil
+	if idx < 0 {
+		cfgLock.Unlock()
+		return nil
+	}
+	cfg.Accounts[idx].RequestCount = requestCount
+	cfg.Accounts[idx].ErrorCount = errorCount
+	cfg.Accounts[idx].TotalTokens = totalTokens
+	cfg.Accounts[idx].TotalCredits = totalCredits
+	cfg.Accounts[idx].LastUsed = lastUsed
+	dbOn := dbEnabled
+	if !dbOn {
+		err := saveLocked()
+		cfgLock.Unlock()
+		return err
+	}
+	cfgLock.Unlock()
+	// DB mode: targeted stats UPDATE OUTSIDE cfgLock (disjoint from token columns).
+	return dbUpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 }
 
 // UpdateAccountInfo updates an account's subscription and usage information.

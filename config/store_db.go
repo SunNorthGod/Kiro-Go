@@ -214,9 +214,11 @@ func dbRecordApiKeyUsage(id, model string, inputTokens, outputTokens, cacheReadT
 	}
 	ctx, cancel := dbOpCtx()
 	defer cancel()
-	// Cache tokens ride along into the detail log (usage_records) only; the
-	// authoritative counter (usage_counters) still bills on input/output/credits.
-	if err := db.RecordUsageWithDetail(ctx, dbPool, db.Usage{
+	// Counter + detail log + per-key mirror advance together in ONE transaction
+	// (RecordUsageAndTouch), so the authoritative ledger and the api_keys mirror
+	// the quota check reads can never diverge from a mid-way failure. Cache tokens
+	// ride along into the detail log only; billing stays on input/output/credits.
+	return db.RecordUsageAndTouch(ctx, dbPool, db.Usage{
 		APIKeyID:                 id,
 		Model:                    model,
 		Requests:                 1,
@@ -225,10 +227,23 @@ func dbRecordApiKeyUsage(id, model string, inputTokens, outputTokens, cacheReadT
 		Credits:                  credits,
 		CacheReadInputTokens:     cacheReadTokens,
 		CacheCreationInputTokens: cacheCreationTokens,
-	}); err != nil {
-		return err
-	}
-	return db.TouchAPIKeyUsage(ctx, dbPool, id, inputTokens+outputTokens, credits, lastUsedAt)
+	}, lastUsedAt)
+}
+
+// dbUpdateAccountStats persists only the runtime-stats columns (targeted UPDATE),
+// invoked OUTSIDE cfgLock by the stats worker. Disjoint from token columns.
+func dbUpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
+	ctx, cancel := dbOpCtx()
+	defer cancel()
+	return db.UpdateAccountStats(ctx, dbPool, id, requestCount, errorCount, int64(totalTokens), totalCredits, lastUsed)
+}
+
+// dbUpdateAccountToken persists only the token/expiry columns (targeted UPDATE),
+// invoked OUTSIDE cfgLock. Disjoint from the stats columns.
+func dbUpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	ctx, cancel := dbOpCtx()
+	defer cancel()
+	return db.UpdateAccountToken(ctx, dbPool, id, accessToken, refreshToken, expiresAt)
 }
 
 // dbRechargeApiKey folds a top-up into the unified ledger via db.RechargeAPIKey,

@@ -232,6 +232,25 @@ UPDATE accounts
 	return nil
 }
 
+// UpdateAccountStats writes only the runtime-stats columns (request/error counts,
+// cumulative tokens/credits, last_used). It is a TARGETED update — disjoint from
+// the columns UpdateAccountToken touches — so the two can run concurrently off
+// the config lock without a full-row upsert reverting each other's fields.
+func UpdateAccountStats(ctx context.Context, q Querier, id string, requestCount, errorCount int, totalTokens int64, totalCredits float64, lastUsed int64) error {
+	_, err := q.Exec(ctx, `
+UPDATE accounts
+   SET request_count = $2,
+       error_count   = $3,
+       total_tokens  = $4,
+       total_credits = $5,
+       last_used     = $6
+ WHERE id = $1`, id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+	if err != nil {
+		return fmt.Errorf("db: update account stats: %w", err)
+	}
+	return nil
+}
+
 // DeleteAccount removes the account with the given id. It is idempotent: deleting
 // an unknown id is not an error.
 func DeleteAccount(ctx context.Context, q Querier, id string) error {

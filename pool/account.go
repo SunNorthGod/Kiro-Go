@@ -508,7 +508,10 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 		}
 	}
 	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		// Hand the latest cumulative snapshot to the single coalescing persistence
+		// worker instead of spawning a goroutine per success (which was unbounded
+		// and could persist snapshots out of order). See config.EnqueueAccountStats.
+		config.EnqueueAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 	}
 }
 

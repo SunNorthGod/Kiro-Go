@@ -126,22 +126,44 @@ func RecordUsage(ctx context.Context, q Querier, u Usage) error {
 // consistent. Callers that don't need the detail log should prefer RecordUsage.
 func RecordUsageWithDetail(ctx context.Context, pool *pgxpool.Pool, u Usage) error {
 	return WithTx(ctx, pool, func(tx pgx.Tx) error {
-		if err := RecordUsage(ctx, tx, u); err != nil {
+		return recordUsageWithDetailTx(ctx, tx, u)
+	})
+}
+
+// recordUsageWithDetailTx runs the counter increment + detail-log insert on an
+// existing transaction (shared by RecordUsageWithDetail and RecordUsageAndTouch).
+func recordUsageWithDetailTx(ctx context.Context, tx pgx.Tx, u Usage) error {
+	if err := RecordUsage(ctx, tx, u); err != nil {
+		return err
+	}
+	_, err := AddUsageRecord(ctx, tx, UsageRecord{
+		APIKeyID:                 u.APIKeyID,
+		CredentialID:             u.CredentialID,
+		Model:                    u.Model,
+		InputTokens:              u.InputTokens,
+		OutputTokens:             u.OutputTokens,
+		Credits:                  u.Credits,
+		CreatedAt:                time.Now().Unix(),
+		ClientIP:                 u.ClientIP,
+		CacheReadInputTokens:     u.CacheReadInputTokens,
+		CacheCreationInputTokens: u.CacheCreationInputTokens,
+	})
+	return err
+}
+
+// RecordUsageAndTouch folds one request into the authoritative counter, the
+// detail log, AND the per-key api_keys mirror (credits_used / tokens_used /
+// requests_count / last_used_at) in a SINGLE transaction. Previously these were
+// two independent writes (RecordUsageWithDetail then TouchAPIKeyUsage): a crash
+// or error between them left the authoritative ledger and the api_keys mirror
+// disagreeing (the mirror is what the fast quota check reads). One transaction
+// makes them atomic — either all three advance or none do.
+func RecordUsageAndTouch(ctx context.Context, pool *pgxpool.Pool, u Usage, lastUsedAt int64) error {
+	return WithTx(ctx, pool, func(tx pgx.Tx) error {
+		if err := recordUsageWithDetailTx(ctx, tx, u); err != nil {
 			return err
 		}
-		_, err := AddUsageRecord(ctx, tx, UsageRecord{
-			APIKeyID:                 u.APIKeyID,
-			CredentialID:             u.CredentialID,
-			Model:                    u.Model,
-			InputTokens:              u.InputTokens,
-			OutputTokens:             u.OutputTokens,
-			Credits:                  u.Credits,
-			CreatedAt:                time.Now().Unix(),
-			ClientIP:                 u.ClientIP,
-			CacheReadInputTokens:     u.CacheReadInputTokens,
-			CacheCreationInputTokens: u.CacheCreationInputTokens,
-		})
-		return err
+		return TouchAPIKeyUsage(ctx, tx, u.APIKeyID, u.InputTokens+u.OutputTokens, u.Credits, lastUsedAt)
 	})
 }
 

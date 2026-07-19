@@ -257,11 +257,6 @@ func RecordApiKeyUsageWithCache(id, model string, inputTokens, outputTokens, cac
 }
 
 func recordApiKeyUsage(id, model string, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int64, credits float64) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	if cfg == nil {
-		return errors.New("config not initialized")
-	}
 	// Clamp negative deltas up front so the in-memory mirror and the DB ledgers
 	// agree and neither can roll backward.
 	if inputTokens < 0 {
@@ -280,35 +275,69 @@ func recordApiKeyUsage(id, model string, inputTokens, outputTokens, cacheReadTok
 		credits = 0
 	}
 	totalTokens := inputTokens + outputTokens
+
+	// Phase 1: update the in-memory mirror under cfgLock and copy out what the DB
+	// write needs. The mirror is what the fast quota check (ApiKeyOverLimit) reads,
+	// so it must advance synchronously; the multi-round-trip DB write is deferred
+	// to phase 2 OUTSIDE the lock so the global cfgLock is not held across it.
+	cfgLock.Lock()
+	if cfg == nil {
+		cfgLock.Unlock()
+		return errors.New("config not initialized")
+	}
+	idx := -1
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
-			if totalTokens > 0 {
-				cfg.ApiKeys[i].TokensUsed += totalTokens
-			}
-			if credits > 0 {
-				usedBefore := cfg.ApiKeys[i].CreditsUsed
-				cfg.ApiKeys[i].CreditsUsed += credits
-				// Overdraft alert: the balance check happens before the request
-				// while the real cost lands here at stream end, so concurrent
-				// requests can push a card past its grant. Log the crossing once
-				// (no clawback — accepted conservative behavior; the low-balance
-				// serialization gate in the proxy layer bounds the exposure).
-				if g := cfg.ApiKeys[i].CreditsGranted; g > 0 && usedBefore <= g && cfg.ApiKeys[i].CreditsUsed > g {
-					logger.Warnf("[Billing] api key %s (%s) overdrafted: used %.2f > granted %.2f (overdraft %.2f credits)",
-						cfg.ApiKeys[i].ID, cfg.ApiKeys[i].Name, cfg.ApiKeys[i].CreditsUsed, g, cfg.ApiKeys[i].CreditsUsed-g)
-				}
-			}
-			cfg.ApiKeys[i].RequestsCount++
-			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
-			if dbEnabled {
-				// Hot path: fold into the authoritative monotonic ledger + detail
-				// log + per-key mirror directly (no full JSON rewrite).
-				return dbRecordApiKeyUsage(id, model, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, credits, cfg.ApiKeys[i].LastUsedAt)
-			}
-			return saveLocked()
+			idx = i
+			break
 		}
 	}
-	return errors.New("api key not found")
+	if idx < 0 {
+		cfgLock.Unlock()
+		return errors.New("api key not found")
+	}
+	if totalTokens > 0 {
+		cfg.ApiKeys[idx].TokensUsed += totalTokens
+	}
+	var overdraft, overGranted float64
+	overdrafted := false
+	var overKeyName string
+	if credits > 0 {
+		usedBefore := cfg.ApiKeys[idx].CreditsUsed
+		cfg.ApiKeys[idx].CreditsUsed += credits
+		// Overdraft alert: the balance check happens before the request while the
+		// real cost lands here at stream end, so concurrent requests can push a
+		// card past its grant. Note the crossing (logged after unlock — no
+		// clawback; the low-balance serialization gate bounds the exposure).
+		if g := cfg.ApiKeys[idx].CreditsGranted; g > 0 && usedBefore <= g && cfg.ApiKeys[idx].CreditsUsed > g {
+			overdrafted = true
+			overGranted = g
+			overdraft = cfg.ApiKeys[idx].CreditsUsed - g
+			overKeyName = cfg.ApiKeys[idx].Name
+		}
+	}
+	cfg.ApiKeys[idx].RequestsCount++
+	cfg.ApiKeys[idx].LastUsedAt = time.Now().Unix()
+	lastUsedAt := cfg.ApiKeys[idx].LastUsedAt
+	dbOn := dbEnabled
+	if !dbOn {
+		// JSON mode: single local-file write; keep it under the lock (marshal
+		// needs a consistent view, and this is not the multi-round-trip DB path).
+		err := saveLocked()
+		cfgLock.Unlock()
+		if overdrafted {
+			logger.Warnf("[Billing] api key %s (%s) overdrafted: used > granted %.2f (overdraft %.2f credits)", id, overKeyName, overGranted, overdraft)
+		}
+		return err
+	}
+	cfgLock.Unlock()
+
+	if overdrafted {
+		logger.Warnf("[Billing] api key %s (%s) overdrafted: used > granted %.2f (overdraft %.2f credits)", id, overKeyName, overGranted, overdraft)
+	}
+	// Phase 2 (DB mode): fold into the authoritative monotonic ledger + detail
+	// log + per-key mirror in one transaction, OUTSIDE cfgLock.
+	return dbRecordApiKeyUsage(id, model, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, credits, lastUsedAt)
 }
 
 // RechargeApiKey credits `amount` onto the key's unified ledger (CreditsGranted),
@@ -390,25 +419,31 @@ func SetApiKeyGrant(id string, total float64) error {
 // when the id is unknown (or, in DB mode, when the read fails).
 func GetApiKeyBalanceByID(id string) (granted, used, balance float64, ok bool) {
 	cfgLock.RLock()
-	defer cfgLock.RUnlock()
 	if cfg == nil {
+		cfgLock.RUnlock()
 		return 0, 0, 0, false
 	}
-	if dbEnabled {
-		g, u, b, err := dbGetApiKeyBalance(id)
-		if err != nil {
-			return 0, 0, 0, false
+	dbOn := dbEnabled
+	if !dbOn {
+		for i := range cfg.ApiKeys {
+			if cfg.ApiKeys[i].ID == id {
+				g := cfg.ApiKeys[i].CreditsGranted
+				u := cfg.ApiKeys[i].CreditsUsed
+				cfgLock.RUnlock()
+				return g, u, g - u, true
+			}
 		}
-		return g, u, b, true
+		cfgLock.RUnlock()
+		return 0, 0, 0, false
 	}
-	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].ID == id {
-			g := cfg.ApiKeys[i].CreditsGranted
-			u := cfg.ApiKeys[i].CreditsUsed
-			return g, u, g - u, true
-		}
+	// DB mode: release the read lock BEFORE the DB round-trip so the query cannot
+	// block cfgLock writers for its duration.
+	cfgLock.RUnlock()
+	g, u, b, err := dbGetApiKeyBalance(id)
+	if err != nil {
+		return 0, 0, 0, false
 	}
-	return 0, 0, 0, false
+	return g, u, b, true
 }
 
 // ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
