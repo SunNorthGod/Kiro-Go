@@ -210,6 +210,13 @@ func (h *Handler) handleResponsesNonStream(
 
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
+			// Client disconnected → release and return silently (see clientGone).
+			if clientGone(ctx) {
+				releaseSlot()
+				h.noteClientDisconnect("responses", model, apiKeyID,
+					estimateApproxTokens(content)+estimateApproxTokens(reasoningContent))
+				return
+			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
@@ -561,6 +568,15 @@ func (h *Handler) handleResponsesStream(
 
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
+			// Client disconnected → release and return silently (see clientGone):
+			// no exclude/retry, no account-failure signal, no response.failed event
+			// (there is no client to receive it).
+			if clientGone(ctx) {
+				releaseSlot()
+				h.noteClientDisconnect("responses", model, apiKeyID,
+					estimateApproxTokens(fullText.String())+estimateApproxTokens(reasoningText.String()))
+				return
+			}
 			if !responseStarted {
 				releaseSlot()
 				lastErr = err

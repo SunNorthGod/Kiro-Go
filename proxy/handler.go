@@ -49,7 +49,10 @@ type Handler struct {
 	totalRequests   int64
 	successRequests int64
 	failedRequests  int64
-	totalTokens     int64
+	// clientDisconnects 计数被客户端断开中断、因此未走到上游 metering 计费的请求
+	// (仅观测:计费策略不变,断开是否计费留待产品决策)。
+	clientDisconnects int64
+	totalTokens       int64
 	totalCredits    float64 // float64 需要用锁保护
 	creditsMu       sync.RWMutex
 	startTime       int64
@@ -1495,6 +1498,15 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
+			// Client disconnected: the error is just our own cancellation, not an
+			// account fault. Release and return silently — no exclude/retry, no
+			// account-failure signal, no failure stat (observability only).
+			if clientGone(ctx) {
+				releaseSlot()
+				h.noteClientDisconnect("claude", model, apiKeyID,
+					estimateApproxTokens(rawContentBuilder.String())+estimateApproxTokens(rawThinkingBuilder.String()))
+				return
+			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
@@ -1703,6 +1715,42 @@ func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID, model string, inputT
 	}
 }
 
+// clientGone reports whether the client's request context is already done, i.e.
+// the caller disconnected. It is checked against the OUTER request context
+// (r.Context(), threaded into each handler as ctx), which distinguishes a real
+// client disconnect from an idle-timeout abort: the idle timeout cancels only
+// the inner per-request context created inside CallKiroAPI and leaves this outer
+// ctx untouched. On a client disconnect there is no one left to serve, so the
+// handler must release its slot and return silently — NOT blame the account
+// (handleAccountFailure), NOT exclude/retry it, and NOT record a failure.
+func clientGone(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
+// noteClientDisconnect records (WARN + counter) that a request was interrupted
+// by a client disconnect before the upstream metering event, so it was NOT
+// billed. Observability ONLY — billing policy is intentionally unchanged
+// (whether to bill on disconnect is a product decision). apiKeyID is the
+// internal card id (a UUID, not the secret key value); it is shortened for the
+// log. approxOutputTokens is a best-effort estimate of what had already streamed.
+func (h *Handler) noteClientDisconnect(endpoint, model, apiKeyID string, approxOutputTokens int) {
+	n := atomic.AddInt64(&h.clientDisconnects, 1)
+	logger.Warnf("[Billing] client disconnect before metering; request not billed: endpoint=%s model=%s apiKey=%s approxOutputTokens=%d totalClientDisconnects=%d",
+		endpoint, model, shortID(apiKeyID), approxOutputTokens, n)
+}
+
+// shortID returns a log-friendly prefix of an internal id (UUID). Not a secret,
+// but shortened to keep logs tidy.
+func shortID(id string) string {
+	if id == "" {
+		return "(none)"
+	}
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8] + "…"
+}
+
 // recordFailureWithDetails records a failure and stores it in the request logs.
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
@@ -1876,6 +1924,13 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
+			// Client disconnected → release and return silently (see clientGone).
+			if clientGone(ctx) {
+				releaseSlot()
+				h.noteClientDisconnect("claude", model, apiKeyID,
+					estimateApproxTokens(content)+estimateApproxTokens(thinkingContent))
+				return
+			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
@@ -2377,6 +2432,13 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
+			// Client disconnected → release and return silently (see clientGone).
+			if clientGone(ctx) {
+				releaseSlot()
+				h.noteClientDisconnect("openai", model, apiKeyID,
+					estimateApproxTokens(rawContentBuilder.String())+estimateApproxTokens(rawReasoningBuilder.String()))
+				return
+			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
@@ -2531,6 +2593,13 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
 		if err != nil {
+			// Client disconnected → release and return silently (see clientGone).
+			if clientGone(ctx) {
+				releaseSlot()
+				h.noteClientDisconnect("openai", model, apiKeyID,
+					estimateApproxTokens(content)+estimateApproxTokens(reasoningContent))
+				return
+			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
@@ -3803,12 +3872,13 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"uptime":          time.Now().Unix() - h.startTime,
+		"totalRequests":     atomic.LoadInt64(&h.totalRequests),
+		"successRequests":   atomic.LoadInt64(&h.successRequests),
+		"failedRequests":    atomic.LoadInt64(&h.failedRequests),
+		"clientDisconnects": atomic.LoadInt64(&h.clientDisconnects),
+		"totalTokens":       atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":      h.getCredits(),
+		"uptime":            time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -3887,12 +3957,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"uptime":          time.Now().Unix() - h.startTime,
+		"totalRequests":     atomic.LoadInt64(&h.totalRequests),
+		"successRequests":   atomic.LoadInt64(&h.successRequests),
+		"failedRequests":    atomic.LoadInt64(&h.failedRequests),
+		"clientDisconnects": atomic.LoadInt64(&h.clientDisconnects),
+		"totalTokens":       atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":      h.getCredits(),
+		"uptime":            time.Now().Unix() - h.startTime,
 	})
 }
 
