@@ -46,6 +46,18 @@ func main() {
 	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
 	logger.Init(config.GetLogLevel())
 
+	// Optionally switch persistence to PostgreSQL (via DATABASE_URL). When enabled,
+	// accounts, API keys and usage/billing become PG-backed (existing JSON data is
+	// migrated in on first run); server settings continue to live in the JSON file.
+	// Must run before pool.GetPool() so the pool sees the DB-sourced accounts.
+	if usingDB, err := config.EnableDatabaseFromEnv(); err != nil {
+		log.Fatalf("Failed to initialize PostgreSQL backend: %v", err)
+	} else if usingDB {
+		logger.Infof("Persistence backend: PostgreSQL (DATABASE_URL)")
+	} else {
+		logger.Infof("Persistence backend: JSON file (%s)", configPath)
+	}
+
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
@@ -59,7 +71,7 @@ func main() {
 
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
-	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
+	logger.Infof("NorthGod Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
 	logger.Infof("Admin panel: http://%s/admin", addr)
 	logger.Infof("Claude API: http://%s/v1/messages", addr)
 	logger.Infof("OpenAI API: http://%s/v1/chat/completions", addr)

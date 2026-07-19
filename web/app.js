@@ -1,5 +1,5 @@
 /*
- * Kiro-Go admin UI logic.
+ * NorthGod Kiro-Go admin UI logic.
  */
 (() => {
   'use strict';
@@ -17,11 +17,9 @@
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
+  let accountsSortBy = 'priority';
   let privacyModeEnabled = true;
   let promptRules = [];
-  let builderIdSession = '';
-  let builderIdPollTimer = null;
-  let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
   let testLogs = [];
@@ -33,6 +31,14 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  // Unified auto-refresh: track the active tab + last-rendered data signatures
+  // so the 1s loop only re-renders lists when data actually changed.
+  let currentTab = 'overview';
+  let autoRefreshTimer = null;
+  let lastAccountsSig = '';
+  let lastKeysSig = '';
+  let lastLogsSig = '';
+  let lastDailySig = '';
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -93,6 +99,146 @@
   }
 
   // i18n
+  // Inline admin-only strings merged into the runtime dict so we never touch
+  // the shared locale JSON files. t() falls back to the key when missing.
+  const ADMIN_I18N = {
+    zh: {
+      'tabs.overview': '概览',
+      'overview.title': '概览',
+      'overview.totalRpm': '总实时 RPM',
+      'overview.promptCacheHitRate': '缓存命中率(7天)',
+      'accounts.remainingQuota': '剩余额度',
+      'overview.accounts': '账号',
+      'overview.cards': '卡密',
+      'overview.totalRequests': '总请求',
+      'overview.successRate': '成功率',
+      'overview.todayCredits': '今日消耗积分',
+      'overview.inflight': '当前并发',
+      'overview.stickySessions': '粘性会话',
+      'overview.rpmTrend': '实时 RPM 趋势',
+      'overview.dailyStats': '每日统计',
+      'overview.cacheTitle': '缓存 / 并发',
+      'overview.activeAccounts': '活跃账号',
+      'overview.activeKeys': '活跃卡密',
+      'overview.uptime': '运行时间',
+      'settings.advanced': '高级设置',
+      'keys.total': '总卡密',
+      'keys.rpmLabel': '实时 RPM',
+      'keys.sortLabel': '排序方式',
+      'keys.sortBalance': '按余额',
+      'keys.sortRpm': '按实时 RPM',
+      'keys.sortCreatedDesc': '最新创建',
+      'keys.copyKey': '复制 Key',
+      'keys.copyUrl': '复制地址',
+      'keys.copyKeyDone': 'Key 已复制',
+      'keys.copyUrlDone': '接口地址已复制',
+      'keys.baseUrl': '接口地址',
+      'apiKeys.concurrencyModeDefault': '默认（系统限制）',
+      'apiKeys.concurrencyModeCustom': '自定义',
+      'apiKeys.concurrencyModeUnlimited': '无限',
+      'accounts.rpm': '实时 RPM',
+      'accounts.priority': '优先级',
+      'accounts.priorityHint': '数值越高优先级越高，自动负载均衡时优先调度（0 = 最低，默认 1）',
+      'accounts.sortLabel': '排序方式',
+      'accounts.sortPriority': '按优先级',
+      'accounts.sortRpm': '按实时 RPM',
+      'accounts.sortUsage': '按用量',
+      'accounts.usage': '用量',
+      'overview.sectionRealtime': '实时',
+      'overview.sectionTraffic': '流量',
+      'overview.sectionAccounts': '账号',
+      'overview.sectionCards': '卡密',
+      'overview.sectionConcurrency': '会话 & 缓存',
+      'overview.realtimeRpm': '实时 RPM',
+      'overview.realtimeTpm': '实时 TPM',
+      'overview.enabled': '启用',
+      'overview.disabled': '禁用',
+      'overview.tokenTrend': '实时 Token 趋势',
+      'overview.tokensPerMin': 'Tokens/分钟',
+      'overview.dailyTable': '历史数据',
+      'overview.tableDate': '日期',
+      'overview.tableRequests': '请求数',
+      'overview.tableCredits': '积分',
+      'overview.tableTokens': 'Tokens',
+      'overview.tableEmpty': '暂无历史数据',
+      'keys.filterLabel': '筛选',
+      'keys.parentTag': '父卡',
+      'keys.childAllocated': '子卡额度',
+      'keys.childCount': '{0} 张子卡',
+      'apiKeys.createdCopyHint': '卡密已创建，可在列表中直接复制',
+      'apiKeys.createdCopied': '卡密已创建，Key 已复制到剪贴板',
+      'iam.openNote': '在浏览器打开，用你的 AWS 用户名/密码登录并授权',
+      'iam.authorized': '我已授权，完成添加'
+    },
+    en: {
+      'tabs.overview': 'Overview',
+      'overview.title': 'Overview',
+      'overview.totalRpm': 'Total RPM',
+      'overview.promptCacheHitRate': 'Cache Hit Rate (7d)',
+      'accounts.remainingQuota': 'Remaining Quota',
+      'overview.accounts': 'Accounts',
+      'overview.cards': 'Cards',
+      'overview.totalRequests': 'Total Requests',
+      'overview.successRate': 'Success Rate',
+      'overview.todayCredits': "Today's Credits",
+      'overview.inflight': 'In-flight',
+      'overview.stickySessions': 'Sticky Sessions',
+      'overview.rpmTrend': 'Live RPM Trend',
+      'overview.dailyStats': 'Daily Stats',
+      'overview.cacheTitle': 'Cache & Concurrency',
+      'overview.activeAccounts': 'Active Accounts',
+      'overview.activeKeys': 'Active Cards',
+      'overview.uptime': 'Uptime',
+      'settings.advanced': 'Advanced Settings',
+      'keys.total': 'Total Cards',
+      'keys.rpmLabel': 'Live RPM',
+      'keys.sortLabel': 'Sort by',
+      'keys.sortBalance': 'By balance',
+      'keys.sortRpm': 'By live RPM',
+      'keys.sortCreatedDesc': 'Newest first',
+      'keys.copyKey': 'Copy Key',
+      'keys.copyUrl': 'Copy URL',
+      'keys.copyKeyDone': 'Key copied',
+      'keys.copyUrlDone': 'Base URL copied',
+      'keys.baseUrl': 'Base URL',
+      'apiKeys.concurrencyModeDefault': 'Default (system limit)',
+      'apiKeys.concurrencyModeCustom': 'Custom',
+      'apiKeys.concurrencyModeUnlimited': 'Unlimited',
+      'accounts.rpm': 'Live RPM',
+      'accounts.priority': 'Priority',
+      'accounts.priorityHint': 'Higher value = higher priority; served first by the auto load-balancer (0 = lowest, default 1)',
+      'accounts.sortLabel': 'Sort by',
+      'accounts.sortPriority': 'By priority',
+      'accounts.sortRpm': 'By live RPM',
+      'accounts.sortUsage': 'By usage',
+      'accounts.usage': 'Usage',
+      'overview.sectionRealtime': 'Realtime',
+      'overview.sectionTraffic': 'Traffic',
+      'overview.sectionAccounts': 'Accounts',
+      'overview.sectionCards': 'Cards',
+      'overview.sectionConcurrency': 'Session & Cache',
+      'overview.realtimeRpm': 'Realtime RPM',
+      'overview.realtimeTpm': 'Realtime TPM',
+      'overview.enabled': 'Enabled',
+      'overview.disabled': 'Disabled',
+      'overview.tokenTrend': 'Live Token Trend',
+      'overview.tokensPerMin': 'Tokens/min',
+      'overview.dailyTable': 'Daily History',
+      'overview.tableDate': 'Date',
+      'overview.tableRequests': 'Requests',
+      'overview.tableCredits': 'Credits',
+      'overview.tableTokens': 'Tokens',
+      'overview.tableEmpty': 'No history yet',
+      'keys.filterLabel': 'Filter',
+      'keys.parentTag': 'Parent',
+      'keys.childAllocated': 'Allocated',
+      'keys.childCount': '{0} sub-cards',
+      'apiKeys.createdCopyHint': 'Card created \u2014 copy it directly from the list',
+      'apiKeys.createdCopied': 'Card created \u2014 key copied to clipboard',
+      'iam.openNote': 'Open it in a browser and sign in with your AWS username/password to authorize',
+      'iam.authorized': "I've authorized \u2014 finish"
+    }
+  };
   async function loadLocale(lang) {
     if (dict[lang]) return dict[lang];
     try {
@@ -101,6 +247,7 @@
     } catch (e) {
       dict[lang] = {};
     }
+    if (ADMIN_I18N[lang]) Object.assign(dict[lang], ADMIN_I18N[lang]);
     return dict[lang];
   }
   function t(key, ...args) {
@@ -128,8 +275,13 @@
     applyTranslations();
     renderVersionBadge();
     renderAccounts();
+    renderApiKeys();
     renderPromptRules();
     renderLogs(logsCache);
+    if (overviewData) {
+      renderOverview(overviewData);
+      refreshOverviewCharts(); // recreates with translated legend when visible
+    }
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -402,7 +554,10 @@
   function initTheme() {
     applyTheme(getThemePref());
     themeMQ.addEventListener('change', () => {
-      if (getThemePref() === 'system') applyTheme('system');
+      if (getThemePref() === 'system') {
+        applyTheme('system');
+        refreshOverviewCharts();
+      }
     });
   }
   function toggleTheme() {
@@ -410,6 +565,7 @@
     const next = THEME_ORDER[(THEME_ORDER.indexOf(cur) + 1) % THEME_ORDER.length];
     localStorage.setItem('kiro_theme', next);
     applyTheme(next);
+    refreshOverviewCharts();
   }
 
   // Privacy and email mask
@@ -419,19 +575,11 @@
     const toggle = $('privacyModeToggle');
     if (toggle) toggle.checked = privacyModeEnabled;
   }
+  // Admin panel is operator-only: never mask emails/tokens. Kept as a
+  // pass-through so existing call sites keep working after the privacy toggle
+  // was removed.
   function maskEmail(email) {
-    if (!privacyModeEnabled || !email || email.indexOf('@') === -1) return email;
-    const [local, domain] = email.split('@');
-    const maskedLocal = local.length <= 2 ? local : local.substring(0, 2) + '***';
-    const parts = domain.split('.');
-    if (parts.length >= 2) {
-      const tld = parts[parts.length - 1];
-      const sld = parts[parts.length - 2];
-      const maskedSld = sld.length <= 2 ? sld : sld.substring(0, 2) + '***';
-      const subs = parts.slice(0, -2).map(s => s.length <= 2 ? s : s.substring(0, 2) + '***');
-      return maskedLocal + '@' + [...subs, maskedSld, tld].join('.');
-    }
-    return maskedLocal + '@' + domain;
+    return email;
   }
   function getDisplayEmail(email, id) {
     const raw = email || (id ? id.substring(0, 12) + '...' : '-');
@@ -650,38 +798,383 @@
     }
   }
   function logout() {
+    stopAutoRefresh();
     clearActivePassword();
     location.reload();
   }
   function showMain() {
     $('loginPage').classList.add('hidden');
     $('mainPage').classList.remove('hidden');
+    let saved = 'overview';
+    try { const s = localStorage.getItem('kiro_tab'); if (s && KNOWN_TABS.indexOf(s) !== -1) saved = s; } catch (e) { }
+    switchTab(saved);
+    startAutoRefresh();
   }
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
-    renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
-    renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
-    renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
-    renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
-    renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
-    setTimeout(checkUpdate, 2000);
+    await Promise.all([loadAccounts(), loadSettings(), loadVersion()]);
+    loadStats();
   }
-  async function loadStats() {
-    const res = await api('/status');
-    const d = await res.json();
-    $('statAccounts').textContent = d.accounts || 0;
-    $('statRequests').textContent = d.totalRequests || 0;
-    $('statSuccess').textContent = d.successRequests || 0;
-    $('statFailed').textContent = d.failedRequests || 0;
-    $('statTokens').textContent = formatNum(d.totalTokens || 0);
-    $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+  // Global stats now live on the Overview tab; loadStats() just refreshes the
+  // per-tab scoped stat panels (rendered from already-loaded caches).
+  function loadStats() {
+    renderAccountStats();
+    renderKeysStats();
+  }
+
+  // ===== Stat tiles (ng-stat) shared by overview + per-tab panels =====
+  function ngStatTile(label, value, opts) {
+    opts = opts || {};
+    const cls = 'ng-stat-value' + (opts.valueClass ? ' ' + opts.valueClass : '');
+    const countAttr = (opts.count != null) ? ' data-count="' + opts.count + '" data-dec="' + (opts.dec || 0) + '"' : '';
+    let valueHtml;
+    if (opts.rpm) {
+      // Card-format RPM: number only. The ● dot is reserved for INLINE rpm text
+      // (overview header + per-account row), never on stat cards.
+      valueHtml = '<div class="' + cls + ' ng-rpm"><span' + countAttr + '>' + escapeHtml(String(value)) + '</span></div>';
+    } else {
+      valueHtml = '<div class="' + cls + '"' + countAttr + '>' + escapeHtml(String(value)) + '</div>';
+    }
+    const sub = opts.sub ? '<div class="ng-stat-sub">' + escapeHtml(opts.sub) + '</div>' : '';
+    return '<div class="ng-stat"><div class="ng-stat-label">' + escapeHtml(label) + '</div>' + valueHtml + sub + '</div>';
+  }
+  function renderAccountStats() {
+    const el = $('accountsStats');
+    if (!el) return;
+    const total = accountsData.length;
+    const enabled = accountsData.filter(a => a.enabled).length;
+    const banned = accountsData.filter(a => a.banStatus && a.banStatus !== 'ACTIVE').length;
+    const rpm = accountsData.reduce((s, a) => s + (a.rpm || 0), 0);
+    // Remaining quota across all accounts: main quota (usageLimit - usageCurrent)
+    // plus any active trial quota. Clamped at 0 so an overspent account can't
+    // drag the total negative.
+    const remaining = accountsData.reduce((s, a) => {
+      let r = 0;
+      if (a.usageLimit > 0) r += Math.max(0, (a.usageLimit || 0) - (a.usageCurrent || 0));
+      if (a.trialUsageLimit > 0) r += Math.max(0, (a.trialUsageLimit || 0) - (a.trialUsageCurrent || 0));
+      return s + r;
+    }, 0);
+    el.innerHTML =
+      ngStatTile(t('overview.accounts'), total) +
+      ngStatTile(t('accounts.enabled'), enabled) +
+      ngStatTile(t('accounts.banned'), banned) +
+      ngStatTile(t('accounts.remainingQuota'), formatNumber(remaining), { valueClass: 'success-text' }) +
+      ngStatTile(t('overview.totalRpm'), rpm, { rpm: true });
+  }
+  function renderKeysStats() {
+    const el = $('keysStats');
+    if (!el) return;
+    const keys = apiKeysCache.map(normalizeKey);
+    const total = keys.length;
+    const active = keys.filter(k => k.enabled && !keyIsExpired(k)).length;
+    const used = keys.reduce((s, k) => s + (k.used || 0), 0);
+    const balance = keys.reduce((s, k) => s + (k.granted > 0 ? (k.balance || 0) : 0), 0);
+    el.innerHTML =
+      ngStatTile(t('keys.total'), total) +
+      ngStatTile(t('keys.enabled'), active) +
+      ngStatTile(t('keys.used'), formatNumber(used)) +
+      ngStatTile(t('keys.balance'), formatNumber(balance), { valueClass: 'success-text' });
+  }
+  // ===== Overview dashboard =====
+  let overviewData = null;
+  let rpmSamples = [];
+  let rpmChart = null;
+  // Live tokens-per-minute trend, sampled from the totalTokens counter delta.
+  let tokenRateSamples = [];
+  let tokenChart = null;
+  let lastTokenTotal = null;
+  let lastTokenAt = 0;
+  let ovAnimated = false;
+  const RPM_WINDOW = 30;
+
+  function isOverviewVisible() {
+    const el = $('tabOverview');
+    return !!el && !el.classList.contains('hidden');
+  }
+  function hexToRgba(hex, a) {
+    let h = String(hex || '').trim().replace('#', '');
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
+    if (h.length !== 6) return 'rgba(45,98,239,' + a + ')';
+    const n = parseInt(h, 16);
+    return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+  }
+  function ngThemeColors() {
+    const cs = getComputedStyle(document.documentElement);
+    const g = (n, f) => { const v = (cs.getPropertyValue(n) || '').trim(); return v || f; };
+    return {
+      primary: g('--primary', '#000000'),
+      info: g('--info', '#2d62ef'),
+      success: g('--success', '#0f766e'),
+      border: g('--border', '#e4e4e4'),
+      muted: g('--muted-foreground', '#666666')
+    };
+  }
+  function fmtCount(v, dec) {
+    if (dec > 0) return Number(v).toFixed(dec);
+    return Math.round(v).toLocaleString('en-US');
+  }
+  function animateCount(el, to, dec) {
+    if (!el) return;
+    const dur = 620, startT = performance.now();
+    function step(now) {
+      const p = Math.min(1, (now - startT) / dur);
+      const eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = fmtCount(to * eased, dec);
+      if (p < 1) requestAnimationFrame(step);
+      else el.textContent = fmtCount(to, dec);
+    }
+    requestAnimationFrame(step);
+  }
+  function runCountUps(root) {
+    qsa('[data-count]', root).forEach(el => {
+      const to = parseFloat(el.dataset.count);
+      if (isNaN(to)) return;
+      animateCount(el, to, parseInt(el.dataset.dec || '0', 10));
+    });
+  }
+  async function loadOverview() {
+    let d;
+    try {
+      const res = await api('/overview');
+      if (!res.ok) throw new Error('http ' + res.status);
+      d = await res.json();
+    } catch (e) {
+      return;
+    }
+    overviewData = d;
+    const rpm = d.totalRPM || 0;
+    rpmSamples.push(rpm);
+    if (rpmSamples.length > RPM_WINDOW) rpmSamples.shift();
+    // Derive tokens-per-minute from the running totalTokens counter.
+    const nowTs = Date.now();
+    const totalTokens = d.totalTokens || 0;
+    if (lastTokenTotal != null && nowTs > lastTokenAt) {
+      const dtSec = (nowTs - lastTokenAt) / 1000;
+      let rate = dtSec > 0 ? ((totalTokens - lastTokenTotal) / dtSec) * 60 : 0;
+      if (rate < 0) rate = 0; // guard against counter resets
+      tokenRateSamples.push(rate);
+      if (tokenRateSamples.length > RPM_WINDOW) tokenRateSamples.shift();
+    }
+    lastTokenTotal = totalTokens;
+    lastTokenAt = nowTs;
+    renderOverview(d);
+    renderOverviewCharts();
+  }
+  function renderOverview(d) {
+    d = d || {};
+    const acc = d.accounts || {};
+    const keys = d.keys || {};
+    const conc = d.concurrency || {};
+    const cache = d.cache || {};
+    const daily = Array.isArray(d.daily) ? d.daily : [];
+    const totalReq = d.totalRequests || 0;
+    const okReq = d.successRequests || 0;
+    const rate = totalReq > 0 ? ((okReq / totalReq) * 100).toFixed(1) : '0.0';
+    const todayCredits = daily.length ? (daily[daily.length - 1].credits || 0) : 0;
+    const rpm = d.totalRPM || 0;
+
+    const hv = $('ovHeaderRpmVal');
+    if (hv) hv.textContent = String(rpm);
+    const hb = $('ovHeaderRpm');
+    if (hb) hb.classList.remove('ng-rpm-live'); // header RPM indicator stays neutral (no green/pulse)
+
+    // Overview metrics grouped into labelled sections (流量 / 账号 / 卡密 /
+    // 并发 & 缓存) so it reads as an organised dashboard, not one flat block.
+    const grid = $('ovStatGrid');
+    if (grid) {
+      const hits = cache.stickyHits || 0;
+      const misses = cache.stickyMisses || 0;
+      const totSticky = hits + misses;
+      const hitRate = totSticky > 0 ? ((hits / totSticky) * 100).toFixed(1) + '%' : '-';
+      // Deployment-wide prompt-cache hit rate over the last 7 days (from usage_records); '-' until there's input in the window.
+      const pc = d.promptCache || {};
+      const pcHit = (typeof pc.hitRate === 'number') ? (pc.hitRate * 100).toFixed(1) + '%' : '-';
+      const pcClass = (typeof pc.hitRate === 'number' && pc.hitRate >= 0.6) ? 'success-text' : '';
+      // Live tokens-per-minute: latest sample from the totalTokens-delta trend.
+      const tpm = tokenRateSamples.length ? Math.round(tokenRateSamples[tokenRateSamples.length - 1]) : 0;
+      grid.innerHTML =
+        ngSection(t('overview.sectionRealtime'),
+          ngStatTile(t('overview.realtimeRpm'), rpm, { rpm: true, count: rpm, dec: 0 }) +
+          ngStatTile(t('overview.realtimeTpm'), formatNumber(tpm), { rpm: true, count: tpm, dec: 0 }) +
+          ngStatTile(t('overview.inflight'), conc.inflight || 0, { count: conc.inflight || 0, dec: 0 })
+        ) +
+        ngSection(t('overview.sectionTraffic'),
+          ngStatTile(t('overview.totalRequests'), formatNumber(totalReq), { count: totalReq, dec: 0 }) +
+          ngStatTile(t('overview.successRate'), rate + '%') +
+          ngStatTile(t('overview.todayCredits'), Number(todayCredits).toFixed(1), { count: todayCredits, dec: 1, valueClass: 'success-text' }) +
+          ngStatTile(t('overview.promptCacheHitRate'), pcHit, { valueClass: pcClass })
+        ) +
+        ngSection(t('overview.sectionAccounts'),
+          ngStatTile(t('overview.accounts'), (acc.available || 0) + ' / ' + (acc.total || 0)) +
+          ngStatTile(t('overview.enabled'), acc.enabled || 0, { count: acc.enabled || 0, dec: 0 }) +
+          ngStatTile(t('overview.disabled'), acc.disabled || 0, { count: acc.disabled || 0, dec: 0 }) +
+          ngStatTile(t('overview.activeAccounts'), conc.activeAccounts || 0, { count: conc.activeAccounts || 0, dec: 0 })
+        ) +
+        ngSection(t('overview.sectionCards'),
+          ngStatTile(t('overview.cards'), (keys.active || 0) + ' / ' + (keys.total || 0)) +
+          ngStatTile(t('overview.activeKeys'), conc.activeKeys || 0, { count: conc.activeKeys || 0, dec: 0 })
+        ) +
+        ngSection(t('overview.sectionConcurrency'),
+          ngStatTile(t('overview.stickySessions'), cache.stickySessions || 0, { count: cache.stickySessions || 0, dec: 0 }) +
+          ngStatTile(t('concurrency.stickyHits'), formatNumber(hits)) +
+          ngStatTile(t('concurrency.stickyMisses'), formatNumber(misses)) +
+          ngStatTile(t('concurrency.hitRate'), hitRate)
+        );
+      if (!ovAnimated) { runCountUps(grid); ovAnimated = true; }
+    }
+    renderDailyTable(daily);
+  }
+  function ngSection(title, inner) {
+    return '<div class="ng-section"><div class="ng-section-title">' + escapeHtml(title) + '</div>' +
+      '<div class="ng-grid">' + inner + '</div></div>';
+  }
+  // 历史数据表: a compact Rust-style list (not a chart) from overview.daily[].
+  function renderDailyTable(daily) {
+    const el = $('ovDailyTable');
+    if (!el) return;
+    // Daily data changes at most once a day; skip the rebuild (and keep the
+    // table's scroll position) when nothing changed. Language is part of the
+    // signature so a locale switch still re-renders the headers.
+    const sig = currentLang + '|' + JSON.stringify(daily || []);
+    if (sig === lastDailySig && el.childElementCount) return;
+    lastDailySig = sig;
+    const rows = Array.isArray(daily) ? daily.slice() : [];
+    if (!rows.length) {
+      el.innerHTML = '<div class="empty-state">' + escapeHtml(t('overview.tableEmpty')) + '</div>';
+      return;
+    }
+    rows.reverse(); // newest first
+    let html = '<table class="data-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('overview.tableDate')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('overview.tableRequests')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('overview.tableCredits')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('overview.tableTokens')) + '</th>' +
+      '</tr></thead><tbody>';
+    rows.forEach(r => {
+      html += '<tr>' +
+        '<td class="ov-daily-date">' + escapeHtml(r.date || '-') + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.requests || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(Number(r.credits || 0).toFixed(1)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.tokens || 0)) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }
+  function makeRpmChart() {
+    const c = $('ovRpmChart');
+    if (!c || typeof Chart === 'undefined') return;
+    const col = ngThemeColors();
+    rpmChart = new Chart(c.getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: rpmSamples.map((_, i) => i + 1),
+        datasets: [{
+          data: rpmSamples.slice(),
+          borderColor: col.info,
+          backgroundColor: hexToRgba(col.info, 0.14),
+          borderWidth: 2, fill: true, tension: 0.35, pointRadius: 0
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { display: false, grid: { display: false } },
+          y: { beginAtZero: true, grid: { color: col.border }, ticks: { color: col.muted, precision: 0, maxTicksLimit: 5 } }
+        }
+      }
+    });
+  }
+  // Live tokens-per-minute trend (same client-sampled pattern as the RPM ring).
+  function makeTokenChart() {
+    const c = $('ovTokenChart');
+    if (!c || typeof Chart === 'undefined') return;
+    const col = ngThemeColors();
+    tokenChart = new Chart(c.getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: tokenRateSamples.map((_, i) => i + 1),
+        datasets: [{
+          data: tokenRateSamples.slice(),
+          borderColor: col.success,
+          backgroundColor: hexToRgba(col.success, 0.14),
+          borderWidth: 2, fill: true, tension: 0.35, pointRadius: 0
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: (ctx) => formatNumber(Math.round(ctx.parsed.y)) + ' ' + t('overview.tokensPerMin') } }
+        },
+        scales: {
+          x: { display: false, grid: { display: false } },
+          y: { beginAtZero: true, grid: { color: col.border }, ticks: { color: col.muted, precision: 0, maxTicksLimit: 5 } }
+        }
+      }
+    });
+  }
+  function ensureCharts() {
+    if (typeof Chart === 'undefined') return;
+    if (!rpmChart) makeRpmChart();
+    if (!tokenChart) makeTokenChart();
+  }
+  function renderOverviewCharts() {
+    if (typeof Chart === 'undefined' || !isOverviewVisible()) return;
+    ensureCharts();
+    if (rpmChart) {
+      rpmChart.data.labels = rpmSamples.map((_, i) => i + 1);
+      rpmChart.data.datasets[0].data = rpmSamples.slice();
+      rpmChart.update('none');
+    }
+    if (tokenChart) {
+      tokenChart.data.labels = tokenRateSamples.map((_, i) => i + 1);
+      tokenChart.data.datasets[0].data = tokenRateSamples.slice();
+      tokenChart.update('none');
+    }
+  }
+  function refreshOverviewCharts() {
+    if (rpmChart) { rpmChart.destroy(); rpmChart = null; }
+    if (tokenChart) { tokenChart.destroy(); tokenChart = null; }
+    renderOverviewCharts();
+  }
+  // ── Unified ~1s auto-refresh for the active tab ─────────────────────────
+  // A single interval refreshes only the visible tab's data (概览→/overview,
+  // 账号→/accounts, 卡密→/api-keys, 日志→/logs). 设置 is never auto-refreshed
+  // (it holds form inputs). The tick pauses while any modal or custom-select
+  // dropdown is open, or while the page is hidden; list renders preserve scroll
+  // and only rebuild when data changed, so there is no per-second flicker.
+  let autoRefreshBusy = false;
+  function anyModalOpen() { return !!document.querySelector('.modal.active'); }
+  function anyCustomSelectOpen() { return !!document.querySelector('.custom-select.is-open'); }
+  async function autoRefreshTick() {
+    if (autoRefreshBusy || !password) return;
+    const main = $('mainPage');
+    if (!main || main.classList.contains('hidden')) return;
+    if (document.hidden) return;
+    if (anyModalOpen() || anyCustomSelectOpen()) return;
+    // Guard against overlapping refreshes if a fetch runs longer than the tick.
+    autoRefreshBusy = true;
+    try {
+      if (currentTab === 'overview') await loadOverview();
+      else if (currentTab === 'accounts') await loadAccounts(true);
+      else if (currentTab === 'keys') await loadApiKeys(true);
+      else if (currentTab === 'logs') await loadLogs(true);
+    } catch (e) { /* transient error: the next tick retries */ }
+    finally { autoRefreshBusy = false; }
+  }
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    autoRefreshTimer = setInterval(autoRefreshTick, 1000);
+  }
+  function stopAutoRefresh() {
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   }
 
   // ===== Logs =====
   let logsFilter = 'all';
-  let logsAutoTimer = null;
   let logsCache = [];
 
   function errorTypeLabel(type) {
@@ -706,22 +1199,28 @@
     return id.slice(0, 8);
   }
 
-  async function loadLogs() {
+  async function loadLogs(quiet) {
     try {
       const res = await api('/logs');
       const d = await res.json();
       const logs = d.logs || [];
-      renderLogs(logs);
+      renderLogs(logs, quiet);
     } catch (e) {
       // silent
     }
   }
 
-  function renderLogs(logs) {
+  function renderLogs(logs, quiet) {
     logsCache = logs;
     const list = $('logsList');
     const summary = $('logsSummary');
     if (!list) return;
+
+    // On a quiet auto-refresh, skip the rebuild (keeping the log list's scroll
+    // position) unless the logs or the active filter changed.
+    const sig = currentLang + '|' + logsFilter + '|' + JSON.stringify(logs);
+    if (quiet && sig === lastLogsSig && list.childElementCount) return;
+    lastLogsSig = sig;
 
     const total = logs.length;
     const okCount = logs.filter(l => l.status === 'success').length;
@@ -738,7 +1237,15 @@
       return;
     }
 
-    let html = '<table class="logs-table"><thead><tr>' +
+    // Fixed-layout table: colgroup sets the widths so the table always fits its
+    // container (no horizontal scrollbar); long cells truncate/wrap via CSS.
+    let html = '<table class="logs-table">' +
+      '<colgroup>' +
+      '<col class="lc-time" /><col class="lc-status" /><col class="lc-endpoint" />' +
+      '<col class="lc-model" /><col class="lc-account" /><col class="lc-tokens" />' +
+      '<col class="lc-duration" /><col class="lc-detail" />' +
+      '</colgroup>' +
+      '<thead><tr>' +
       '<th>' + escapeHtml(t('logs.time')) + '</th>' +
       '<th>' + escapeHtml(t('logs.status')) + '</th>' +
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
@@ -756,51 +1263,55 @@
       if (isErr) {
         detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
           escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
-          '<span class="log-msg" title="' + escapeAttr(l.error) + '">' + escapeHtml(l.error) + '</span>';
+          '<span class="log-msg">' + escapeHtml(l.error) + '</span>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
+        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(1) + ' cr') : '-') + '</span>';
       }
+      const endpoint = l.endpoint || '-';
+      const model = l.model || '-';
+      const account = accountLabel(l.accountId);
       html += '<tr>' +
         '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
         '<td>' + statusCell + '</td>' +
-        '<td>' + escapeHtml(l.endpoint) + '</td>' +
-        '<td>' + escapeHtml(l.model || '-') + '</td>' +
-        '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
+        '<td title="' + escapeAttr(endpoint) + '">' + escapeHtml(endpoint) + '</td>' +
+        '<td title="' + escapeAttr(model) + '">' + escapeHtml(model) + '</td>' +
+        '<td title="' + escapeAttr(account) + '">' + escapeHtml(account) + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
-        '<td>' + detailCell + '</td>' +
+        '<td class="log-cell-wrap" title="' + escapeAttr(isErr ? (l.error || '') : '') + '">' + detailCell + '</td>' +
         '</tr>';
     }
     html += '</tbody></table>';
+    const scrollTop = list.scrollTop;
     list.innerHTML = html;
+    if (quiet) list.scrollTop = scrollTop;
   }
 
   async function clearLogs() {
-    if (!confirm(t('logs.clearConfirm'))) return;
+    const ok = await confirmAction(t('logs.clearConfirm'), { title: t('logs.clear'), variant: 'danger' });
+    if (!ok) return;
     await api('/logs', { method: 'DELETE' });
     renderLogs([]);
     toast(t('logs.cleared'), 'success');
   }
 
-  function toggleLogsAutoRefresh() {
-    const on = $('logsAutoRefresh').checked;
-    if (logsAutoTimer) { clearInterval(logsAutoTimer); logsAutoTimer = null; }
-    if (on) {
-      logsAutoTimer = setInterval(() => {
-        if (!$('tabLogs').classList.contains('hidden')) loadLogs();
-      }, 5000);
+  async function loadAccounts(quiet) {
+    let data;
+    try {
+      const res = await api('/accounts');
+      if (!res.ok) throw new Error('http ' + res.status);
+      data = await res.json();
+    } catch (e) {
+      if (quiet) return; // keep the current view on a transient auto-refresh error
+      throw e;
     }
-  }
-
-  async function loadAccounts() {
-    const res = await api('/accounts');
-    accountsData = await res.json();
-    renderAccounts();
+    accountsData = data;
+    renderAccounts(quiet);
   }
 
   // Account list
   function getFilteredAccounts() {
-    return accountsData.filter(a => {
+    const list = accountsData.filter(a => {
       if (filterStatus === 'enabled' && !a.enabled) return false;
       if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
       if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
@@ -810,6 +1321,16 @@
       }
       return true;
     });
+    // All account sorts are high→low (descending), mirroring the card-key list.
+    list.sort((a, b) => {
+      switch (accountsSortBy) {
+        case 'rpm': return (b.rpm || 0) - (a.rpm || 0);
+        case 'usage': return (b.usagePercent || 0) - (a.usagePercent || 0);
+        case 'priority':
+        default: return (b.weight || 0) - (a.weight || 0);
+      }
+    });
+    return list;
   }
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
@@ -896,7 +1417,7 @@
     } else {
       if (!a.hasToken)
         out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
-      else if (a.expiresAt && a.expiresAt < Date.now() / 1000)
+      else if (accountTokenExpired(a))
         out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.expired')) + '</span>');
       else
         out.push('<span class="badge badge-success">' + escapeHtml(t('accounts.normal')) + '</span>');
@@ -914,10 +1435,43 @@
     if (diff < 86400) return Math.floor(diff / 3600) + t('time.hours');
     return Math.floor(diff / 86400) + t('time.days');
   }
+  // Compact number for dense card blocks: 1.7B / 21.9K / 940. Keeps every value
+  // to <=5 glyphs so fixed-width block columns never overflow (no ellipsis).
   function formatNum(n) {
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-    return n.toString();
+    n = Number(n) || 0;
+    const abs = Math.abs(n);
+    if (abs >= 1e9) return (n / 1e9).toFixed(abs >= 1e10 ? 0 : 1) + 'B';
+    if (abs >= 1e6) return (n / 1e6).toFixed(abs >= 1e7 ? 0 : 1) + 'M';
+    if (abs >= 1e3) return (n / 1e3).toFixed(abs >= 1e4 ? 0 : 1) + 'K';
+    if (Math.floor(n) === n) return n.toString();
+    return n.toFixed(1);
+  }
+  // Relative "time ago" for a Unix-seconds timestamp (used by account added-at / logs / records).
+  function formatRelTime(ts) {
+    if (!ts) return '';
+    let diff = Date.now() / 1000 - ts;
+    if (diff < 0) diff = 0;
+    if (diff < 60) return t('reltime.now');
+    if (diff < 3600) return t('reltime.minutes', Math.floor(diff / 60));
+    if (diff < 86400) return t('reltime.hours', Math.floor(diff / 3600));
+    if (diff < 86400 * 30) return t('reltime.days', Math.floor(diff / 86400));
+    if (diff < 86400 * 365) return t('reltime.months', Math.floor(diff / (86400 * 30)));
+    return t('reltime.years', Math.floor(diff / (86400 * 365)));
+  }
+  // Compact duration (e.g. account uptime since createdAt).
+  function formatDurationShort(seconds) {
+    seconds = Math.max(0, Math.floor(seconds));
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (d > 0) return d + t('time.days') + (h > 0 ? ' ' + h + t('time.hours') : '');
+    if (h > 0) return h + t('time.hours') + (m > 0 ? ' ' + m + t('time.minutes') : '');
+    if (m > 0) return m + t('time.minutes');
+    return seconds + 's';
+  }
+  function formatDateTime(ts) {
+    if (!ts) return '-';
+    try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return '-'; }
   }
   function applyUsageBars(root) {
     qsa('.usage-fill[data-usage-pct]', root).forEach(el => {
@@ -926,83 +1480,148 @@
     });
   }
 
-  function renderAccounts() {
+  function renderAccounts(quiet) {
+    renderAccountStats();
     const container = $('accountsList');
     if (!container) return;
     const filtered = getFilteredAccounts();
+    // Quiet auto-refresh: bail out (preserving scroll/selection/focus) unless
+    // the filtered rows, filters, sort, selection or language changed.
+    const sig = currentLang + '|' + filterStatus + '|' + filterKeyword + '|' + accountsSortBy + '|' +
+      Array.from(selectedAccounts).sort().join(',') + '|' + JSON.stringify(filtered);
+    if (quiet && sig === lastAccountsSig && container.childElementCount) return;
+    lastAccountsSig = sig;
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
       return;
     }
-    container.innerHTML = filtered.map(a => {
-      const usagePct = (a.usagePercent || 0) * 100;
-      const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
-      const trialPct = (a.trialUsagePercent || 0) * 100;
-      const trialClass = trialPct > 90 ? 'critical' : trialPct > 70 ? 'high' : '';
-      const isSelected = selectedAccounts.has(a.id);
-      const weight = a.weight || 0;
-      const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
-      const overageBadge = renderOverageBadge(a);
-      const banned = a.banStatus && a.banStatus !== 'ACTIVE';
-      const idAttr = escapeAttr(a.id);
-      const displayEmail = getDisplayEmail(a.email, a.id);
-      const selectLabel = t('accounts.selectAccount', displayEmail);
-
-      const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
-      const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
-      const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-
-      return '' +
-        '<div class="account-card' + (isSelected ? ' selected' : '') + '" data-id="' + idAttr + '">' +
-        '<div class="account-header">' +
-        '<div class="account-info">' +
-        '<input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" />' +
-        '<div class="account-info-text">' +
-        '<div class="account-email">' + escapeHtml(displayEmail) + '</div>' +
-        '<div class="account-meta">' +
-        getSubBadge(a.subscriptionType) +
-        getTrialBadge(a) +
-        weightBadge +
-        overageBadge +
-        '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
-        getStatusBadge(a) +
-        '</div>' +
-        '</div>' +
-        '</div>' +
-        '<div class="account-actions">' +
-        '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
-        '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
-        '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
-        (banned ? '' :
-          '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
-          escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
-          '</button>') +
-        '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
-        '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
-        '</div>' +
-        '</div>' +
-        (a.usageLimit > 0 ?
-          '<div class="account-usage">' +
-          '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +
-          '<div class="usage-bar"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '"></div></div>' +
-          '<div class="usage-text"><span>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + '</span><span>' + usagePct.toFixed(1) + '%</span></div>' +
-          '</div>' : '') +
-        (a.trialUsageLimit > 0 ?
-          '<div class="account-usage">' +
-          '<div class="usage-label">' + escapeHtml(t('accounts.trialQuota')) + ' ' + escapeHtml(formatTrialExpiry(a.trialExpiresAt)) + '</div>' +
-          '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
-          '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
-          '</div>' : '') +
-        '<div class="account-stats">' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
-        '</div>' +
-        '</div>';
-    }).join('');
+    const scrollY = window.scrollY;
+    container.innerHTML = filtered.map(a => renderAccountRow(a)).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+    if (quiet) window.scrollTo(0, scrollY);
+  }
+  // One dense row per account: identity + badges on the left, aligned metric
+  // segments in the middle, actions on the right. Preserves every action
+  // (refresh / detail / copyJSON / enable-disable / test / delete).
+  function renderAccountRow(a) {
+    const usagePct = (a.usagePercent || 0) * 100;
+    const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
+    const hasUsage = a.usageLimit > 0;
+    const hasTrial = a.trialUsageLimit > 0;
+    const isSelected = selectedAccounts.has(a.id);
+    const weight = a.weight || 0;
+    const weightBadge = '<span class="badge badge-priority" title="' + escapeAttr(t('accounts.priorityHint')) + '">' + escapeHtml(t('accounts.priority')) + ': ' + weight + '</span>';
+    const overageBadge = renderOverageBadge(a);
+    const banned = a.banStatus && a.banStatus !== 'ACTIVE';
+    const idAttr = escapeAttr(a.id);
+    const displayEmail = getDisplayEmail(a.email, a.id);
+    const selectLabel = t('accounts.selectAccount', displayEmail);
+    const rpm = a.rpm || 0;
+
+    const seg = (html, title) => '<span class="ng-sub-seg"' + (title ? ' title="' + escapeAttr(title) + '"' : '') + '>' + html + '</span>';
+    const subSegs = [];
+    subSegs.push(seg('<i class="fa-solid fa-shield-halved"></i>' + escapeHtml(formatAuthMethod(a.provider || a.authMethod))));
+    subSegs.push(seg('<i class="fa-regular fa-hourglass-half"></i>' + escapeHtml(t('accounts.expiry') + ' ' + formatTokenExpiry(a.expiresAt))));
+    if (a.createdAt) {
+      subSegs.push(seg('<i class="fa-regular fa-clock"></i>' + escapeHtml(t('accounts.addedAt') + ' ' + formatRelTime(a.createdAt)), formatDateTime(a.createdAt)));
+      subSegs.push(seg(escapeHtml(t('accounts.uptime') + ' ' + formatDurationShort(Date.now() / 1000 - a.createdAt))));
+    }
+    if (hasUsage) subSegs.push(seg(escapeHtml(t('accounts.mainQuota') + ' ' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + '/' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0))));
+    if (hasTrial) subSegs.push(seg(escapeHtml(t('accounts.trialQuota') + ' ' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + '/' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + ' ' + formatTrialExpiry(a.trialExpiresAt))));
+
+    // RPM value only — no live dot inside the dense card rows (per design: the
+    // pulsing dot is reserved for the single big "total RPM" figure elsewhere).
+    const rpmVal = escapeHtml(String(rpm));
+    const usageExtra = hasUsage ? '<div class="ng-usage-mini"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '"></div></div>' : '';
+    // Two soft-tinted data blocks: 计费 (credits + usage%) and 流量 (rpm/req/tokens).
+    // Compact numbers keep each fixed-width column from overflowing; full value on hover.
+    const credits = a.totalCredits || 0;
+    const creditBlock = '<div class="ng-block ng-block--credit">' +
+      ngMetric(escapeHtml(formatNum(credits)), t('accounts.credits'), '', '', credits.toFixed(2)) +
+      ngMetric(hasUsage ? escapeHtml(usagePct.toFixed(0) + '%') : '\u2014', t('accounts.usage'), usageExtra) +
+      '</div>';
+    const trafficBlock = '<div class="ng-block ng-block--traffic">' +
+      ngMetric(rpmVal, t('accounts.rpm')) +
+      ngMetric(escapeHtml(formatNum(a.requestCount || 0)), t('accounts.requests'), '', '', formatNumber(a.requestCount || 0)) +
+      ngMetric(escapeHtml(formatNum(a.totalTokens || 0)), t('accounts.tokens'), '', '', formatNumber(a.totalTokens || 0)) +
+      '</div>';
+    const blocks = creditBlock + trafficBlock;
+    const dotCls = accountDotClass(a);
+
+    const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+    const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+    const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    const actions =
+      '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
+      '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
+      '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
+      (banned ? '' :
+        '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
+        escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>') +
+      '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
+      '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>';
+
+    return '<div class="account-card' + (isSelected ? ' selected' : '') + '" data-id="' + idAttr + '">' +
+      '<input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" />' +
+      '<div class="ng-row-main">' +
+        '<div class="ng-row-title">' +
+          '<span class="ng-status-dot ' + dotCls + '" aria-hidden="true"></span>' +
+          '<span class="ng-row-name">' + escapeHtml(displayEmail) + '</span>' +
+        '</div>' +
+        '<div class="ng-row-tags">' +
+          getSubBadge(a.subscriptionType) + getTrialBadge(a) + overageBadge + weightBadge + accountStateBadges(a) +
+        '</div>' +
+        '<div class="ng-row-sub">' + subSegs.join('') + '</div>' +
+      '</div>' +
+      '<div class="ng-row-blocks">' + blocks + '</div>' +
+      '<div class="ng-row-actions">' + actions + '</div>' +
+    '</div>';
+  }
+  // Aligned metric segment (value + label, optional extra element e.g. mini bar,
+  // optional value color class e.g. success-text for a positive balance).
+  function ngMetric(valHtml, label, extra, valCls, title) {
+    const titleAttr = title ? ' title="' + escapeAttr(String(title)) + '"' : '';
+    return '<div class="ng-metric"' + titleAttr + '><span class="ng-metric-val' + (valCls ? ' ' + valCls : '') + '">' + valHtml + '</span>' +
+      '<span class="ng-metric-label">' + escapeHtml(label) + '</span>' + (extra || '') + '</div>';
+  }
+  // A short-lived access token past its expiry is normal and self-healing for
+  // accounts that can renew it: OAuth/IdC accounts refresh via refreshToken, and
+  // api_key (ksk_) accounts use the key itself as a long-lived bearer. The backend
+  // auto-refreshes on demand and every 30 min, so only accounts that genuinely
+  // *cannot* refresh should ever read as "expired". canRefresh comes from the API.
+  function accountTokenExpired(a) {
+    return a.expiresAt && a.expiresAt < Date.now() / 1000 && !a.canRefresh;
+  }
+  // Overall-health dot shown on the account title line. Red = banned / no-token /
+  // token-expired; amber = manually disabled; green = normal & enabled. The full
+  // reasons live in the grouped tag strip below.
+  function accountDotClass(a) {
+    const banned = a.banStatus && a.banStatus !== 'ACTIVE';
+    if (banned || !a.hasToken || accountTokenExpired(a)) return 'is-bad';
+    if (!a.enabled) return 'is-warn';
+    return 'is-ok';
+  }
+  // Exceptional state badges only (banned / suspended / no-token / expired /
+  // disabled). The healthy "normal + enabled" case is conveyed by the green dot,
+  // so it adds no badge here — keeping the strip focused on what needs attention.
+  function accountStateBadges(a) {
+    const banned = a.banStatus && a.banStatus !== 'ACTIVE';
+    const out = [];
+    if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned">' + escapeHtml(t('accounts.banned')) + '</span>');
+    else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
+    if (!a.hasToken) out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
+    else if (accountTokenExpired(a)) out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.expired')) + '</span>');
+    if (!a.enabled && !banned) out.push('<span class="badge badge-muted">' + escapeHtml(t('accounts.disabled')) + '</span>');
+    return out.join('');
+  }
+  // Overall-health dot for a card row: red = expired; amber = disabled or an
+  // overspent (negative) balance; green otherwise.
+  function keyDotClass(k, expired) {
+    if (expired) return 'is-bad';
+    if (!k.enabled) return 'is-warn';
+    if (k.granted > 0 && k.balance < 0) return 'is-warn';
+    return 'is-ok';
   }
 
   // Account actions
@@ -1041,11 +1660,14 @@
   }
   async function copyAccountJSON(id, btn) {
     try {
-      const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
+      // Copy the same Kiro Account Manager (KAM) format as the export/download,
+      // scoped to this one account, so region / authMethod / startUrl survive —
+      // critical for IdC (IAM Identity Center) and enterprise accounts, which the
+      // old 4-field {clientId,clientSecret,accessToken,refreshToken} copy dropped.
+      const jsonPromise = api('/export', { method: 'POST', body: JSON.stringify({ ids: [id] }) }).then(async res => {
         if (!res.ok) throw new Error('Failed');
-        const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        const data = await res.json();
+        return JSON.stringify(data, null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -1197,10 +1819,10 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div></div>' +
 
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
+      '<div class="detail-section"><h4>' + escapeHtml(t('accounts.priority')) + '</h4>' +
       '<div class="form-group">' +
-      '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" />' +
-      '<small>' + escapeHtml(t('detail.weightHint')) + '</small>' +
+      '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" step="1" placeholder="1" />' +
+      '<small>' + escapeHtml(t('accounts.priorityHint')) + '</small>' +
       '</div>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
@@ -1307,7 +1929,7 @@
     await putAccount(id, { machineId: m }, t('detail.saved'));
   }
   async function saveWeight(id) {
-    const weight = parseInt($('weightInput').value, 10) || 0;
+    const weight = Math.max(0, parseInt($('weightInput').value, 10) || 0);
     await putAccount(id, { weight }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
@@ -1337,8 +1959,8 @@
       '<div class="detail-grid">' +
       detailItem(t('detail.overageStatus'), status || '-') +
       detailItem(t('detail.overageCap'), a.overageCap ? '$' + Number(a.overageCap).toFixed(2) : '-') +
-      detailItem(t('detail.overageRate'), a.overageRate ? '$' + Number(a.overageRate).toFixed(4) : '-') +
-      detailItem(t('detail.overageCurrent'), a.currentOverages ? '$' + Number(a.currentOverages).toFixed(4) : '$0') +
+      detailItem(t('detail.overageRate'), a.overageRate ? '$' + Number(a.overageRate).toFixed(2) : '-') +
+      detailItem(t('detail.overageCurrent'), a.currentOverages ? '$' + Number(a.currentOverages).toFixed(2) : '$0') +
       detailItem(t('detail.overageCheckedAt'), checkedAt) +
       '</div>';
   }
@@ -1531,11 +2153,9 @@
 
   // Settings
   async function loadSettings() {
-    const res = await api('/settings');
-    const d = await res.json();
-    $('requireApiKey').checked = d.requireApiKey;
-    $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    // Global allowOverUsage was removed (overage is per-account now); just load
+    // the remaining settings panels.
+    await Promise.all([loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1624,7 +2244,8 @@
       if (requireApiKey) {
         const hasEnabledKey = Array.isArray(apiKeysCache) && apiKeysCache.some(k => k && k.enabled);
         if (!hasEnabledKey) {
-          if (!confirm(t('apiKeys.requireWithoutEnabledKeyWarning'))) {
+          const ok = await confirmAction(t('apiKeys.requireWithoutEnabledKeyWarning'), { variant: 'danger' });
+          if (!ok) {
             $('requireApiKey').checked = false;
             return;
           }
@@ -1637,11 +2258,6 @@
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
     }
-  }
-  async function saveOverUsageConfig() {
-    const allowOverUsage = $('allowOverUsage').checked;
-    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
-    toast(t('settings.overUsageSaved'), 'success');
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -1657,46 +2273,85 @@
       toast((e && e.message) || t('common.saveFailed'), 'error');
     }
   }
-  async function resetStats() {
-    const ok = await confirmAction(t('settings.confirmReset'), {
-      title: t('settings.statistics'),
-      confirmText: t('settings.resetStats'),
-      variant: 'danger'
-    });
-    if (!ok) return;
-    try {
-      const res = await api('/stats/reset', { method: 'POST' });
-      if (!res.ok) throw new Error(t('common.failed'));
-      loadStats();
-      toastPrimary(t('settings.statsReset'));
-    } catch (e) {
-      toastError((e && e.message) || t('common.failed'));
-    }
-  }
-  // Multi API Key management
+  // Multi API Key / card billing management
   let apiKeysCache = [];
   let apiKeyEditingId = '';
   let apiKeyModalSubmitting = false;
+  let keysFilterKeyword = '';
+  let keysFilterStatus = 'all';
+  let keysSortBy = 'balance';
+  let topupKeyId = '';
+  let keyDetailId = '';
+  let keyDetailTab = 'summary';
+  let keyRechargePage = 1;
+  let keyUsagePage = 1;
+  const KEY_PAGE_SIZE = 20;
 
-  async function loadApiKeys() {
-    const list = $('apiKeysList');
-    if (!list) return;
+  async function loadApiKeys(quiet) {
+    const list = $('keysList');
     try {
       const res = await api('/api-keys');
       if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
       apiKeysCache = Array.isArray(d.apiKeys) ? d.apiKeys : [];
-      renderApiKeys();
+      renderApiKeys(quiet);
     } catch (e) {
+      if (quiet) return; // keep the current list on a transient auto-refresh error
       apiKeysCache = [];
-      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.loadFailed')) + '</div>';
+      if (list) list.innerHTML = '<div class="empty-state">' + escapeHtml(t('keys.loadFailed')) + '</div>';
     }
+  }
+  // Normalize a key entry into a billing view, with graceful fallbacks for the
+  // richer fields the backend may not expose yet (granted/balance/expiresAt/...).
+  function normalizeKey(item) {
+    item = item || {};
+    const granted = item.granted != null ? item.granted
+      : item.creditsGranted != null ? item.creditsGranted
+      : (item.creditLimit || 0);
+    const used = item.used != null ? item.used : (item.creditsUsed || 0);
+    const balance = item.balance != null ? item.balance : (granted ? granted - used : 0);
+    return {
+      id: item.id || '',
+      name: item.name || '',
+      key: item.key || '',
+      keyMasked: item.keyMasked || '',
+      rpm: item.rpm || 0,
+      enabled: !!item.enabled,
+      migrated: !!item.migrated,
+      granted: granted,
+      used: used,
+      balance: balance,
+      creditLimit: item.creditLimit || 0,
+      tokenLimit: item.tokenLimit || 0,
+      tokensUsed: item.tokensUsed || 0,
+      requestsCount: item.requestsCount || 0,
+      expiresAt: item.expiresAt || 0,
+      maxConcurrency: item.maxConcurrency != null ? item.maxConcurrency : 0,
+      boundAccountIds: Array.isArray(item.boundAccountIds) ? item.boundAccountIds : [],
+      parentKeyId: item.parentKeyId || '',
+      createdAt: item.createdAt || 0,
+      raw: item
+    };
+  }
+  function keyIsExpired(k) {
+    return k.expiresAt && k.expiresAt > 0 && k.expiresAt < Date.now() / 1000;
+  }
+  function toDatetimeLocal(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  function fromDatetimeLocal(val) {
+    if (!val) return 0;
+    const ms = new Date(val).getTime();
+    return isNaN(ms) ? 0 : Math.floor(ms / 1000);
   }
 
   function formatNumber(n) {
     if (n == null || isNaN(n)) return '0';
     if (Math.abs(n) >= 1 && Math.floor(n) === n) return Number(n).toLocaleString('en-US');
-    return Number(n).toLocaleString('en-US', { maximumFractionDigits: 4 });
+    return Number(n).toLocaleString('en-US', { maximumFractionDigits: 1 });
   }
 
   function usageBar(used, limit) {
@@ -1720,52 +2375,205 @@
     return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
   }
 
-  function renderApiKeys() {
-    const list = $('apiKeysList');
+  function keyBillingItem(label, value, variant) {
+    return '<div class="key-billing-item' + (variant ? ' key-billing-item--' + variant : '') + '">' +
+      '<div class="key-billing-value">' + escapeHtml(String(value)) + '</div>' +
+      '<div class="key-billing-label">' + escapeHtml(label) + '</div>' +
+      '</div>';
+  }
+  function keyBoundLabel(k) {
+    if (!k.boundAccountIds.length) return t('keys.boundNone');
+    if (k.boundAccountIds.length <= 2) {
+      return k.boundAccountIds.map(id => {
+        const acc = accountsData.find(a => a.id === id);
+        return acc ? getDisplayEmail(acc.email, acc.id) : id.slice(0, 8);
+      }).join(', ');
+    }
+    return t('keys.boundCount', k.boundAccountIds.length);
+  }
+  function keyParentLabel(parentId) {
+    if (!parentId) return '';
+    const p = apiKeysCache.find(x => x.id === parentId);
+    return p ? (p.name || t('keys.unnamed')) : parentId.slice(0, 8);
+  }
+  function getFilteredKeys() {
+    const kw = keysFilterKeyword.trim().toLowerCase();
+    const list = apiKeysCache.map(normalizeKey).filter(k => {
+      if (keysFilterStatus === 'active' && (!k.enabled || keyIsExpired(k))) return false;
+      if (keysFilterStatus === 'disabled' && k.enabled) return false;
+      if (keysFilterStatus === 'expired' && !keyIsExpired(k)) return false;
+      if (keysFilterStatus === 'sub' && !k.parentKeyId) return false;
+      if (kw && !((k.name + ' ' + k.key + ' ' + k.keyMasked).toLowerCase().includes(kw))) return false;
+      return true;
+    });
+    const balanceKey = k => (k.granted > 0 ? k.balance : Infinity);
+    list.sort((a, b) => {
+      switch (keysSortBy) {
+        case 'rpm': return (b.rpm || 0) - (a.rpm || 0);
+        case 'createdDesc': return (b.createdAt || 0) - (a.createdAt || 0);
+        case 'balance':
+        default: return balanceKey(b) - balanceKey(a);
+      }
+    });
+    return list;
+  }
+  function renderApiKeys(quiet) {
+    renderKeysStats();
+    const list = $('keysList');
     if (!list) return;
-    if (!apiKeysCache.length) {
-      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
+    const keys = getFilteredKeys();
+    // Quiet auto-refresh: skip the rebuild (keeping scroll/focus) unless the key
+    // data, filter, sort or language changed.
+    const sig = currentLang + '|' + keysFilterStatus + '|' + keysFilterKeyword + '|' + keysSortBy + '|' + JSON.stringify(apiKeysCache);
+    if (quiet && sig === lastKeysSig && list.childElementCount) return;
+    lastKeysSig = sig;
+    if (!keys.length) {
+      list.innerHTML = '<div class="empty-state">' + escapeHtml(t('keys.empty')) + '</div>';
       return;
     }
-    const html = apiKeysCache.map(item => {
-      const id = escapeAttr(item.id || '');
-      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
-      const masked = escapeHtml(item.keyMasked || '');
-      const migrated = item.migrated
-        ? '<span class="text-xs" style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.migrated')) + '</span>'
-        : '';
-      const disabled = !item.enabled
-        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
-        : '';
-      const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
-      const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
-      const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
-      return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
-        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
-            '<span class="font-semibold">' + name + '</span>' +
-            migrated +
-            disabled +
-            '<span class="text-xs muted-text font-mono">' + masked + '</span>' +
-          '</div>' +
-          '<div class="flex items-center gap-2">' +
-            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
-              '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
-              '<span class="slider"></span>' +
-            '</label>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
-            '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
-          '</div>' +
-        '</div>' +
-        '<div style="margin-top:0.5rem;display:grid;gap:0.35rem;">' +
-          tokensLine +
-          creditsLine +
-          requestsLine +
-        '</div>' +
+    // Parent/child pool math is computed over ALL keys (not just the filtered
+    // view) so parent badges + pool usage stay correct even while filtered.
+    const allKeys = apiKeysCache.map(normalizeKey);
+    const parentIds = new Set();
+    const childGrantByParent = {};
+    const childCountByParent = {};
+    allKeys.forEach(x => {
+      if (!x.parentKeyId) return;
+      parentIds.add(x.parentKeyId);
+      childGrantByParent[x.parentKeyId] = (childGrantByParent[x.parentKeyId] || 0) + (x.granted > 0 ? x.granted : 0);
+      childCountByParent[x.parentKeyId] = (childCountByParent[x.parentKeyId] || 0) + 1;
+    });
+    // Group the filtered rows: each root key is followed by its filtered
+    // children (indented). A child whose parent is filtered out shows standalone.
+    const inView = new Map(keys.map(x => [x.id, x]));
+    const childrenOf = {};
+    keys.forEach(x => { if (x.parentKeyId) (childrenOf[x.parentKeyId] = childrenOf[x.parentKeyId] || []).push(x); });
+    const emitted = new Set();
+    const ordered = [];
+    keys.forEach(x => {
+      if (x.parentKeyId && inView.has(x.parentKeyId)) return; // emitted under its parent
+      if (emitted.has(x.id)) return;
+      ordered.push({ k: x, isChild: false });
+      emitted.add(x.id);
+      (childrenOf[x.id] || []).forEach(c => { if (!emitted.has(c.id)) { ordered.push({ k: c, isChild: true }); emitted.add(c.id); } });
+    });
+    keys.forEach(x => { if (!emitted.has(x.id)) { ordered.push({ k: x, isChild: !!x.parentKeyId }); emitted.add(x.id); } });
+    const scrollY = window.scrollY;
+    list.innerHTML = ordered.map(o => renderKeyRow(o.k, {
+      isParent: parentIds.has(o.k.id),
+      isChild: o.isChild,
+      childGrant: childGrantByParent[o.k.id] || 0,
+      childCount: childCountByParent[o.k.id] || 0
+    })).join('');
+    applyUsageBars(list);
+    if (quiet) window.scrollTo(0, scrollY);
+  }
+  // One dense row per card. Preserves all actions (toggle / topup / detail /
+  // edit / reset / delete / copy key+url) and shows sub-card / parent lineage.
+  function renderKeyRow(k, info) {
+    info = info || {};
+    const id = escapeAttr(k.id);
+    const nameHtml = k.name ? escapeHtml(k.name) : '<span class="muted-text">' + escapeHtml(t('keys.unnamed')) + '</span>';
+    const expired = keyIsExpired(k);
+    const tags = [];
+    if (info.isParent) tags.push('<span class="key-tag key-tag-parent"><i class="fa-solid fa-sitemap"></i>' + escapeHtml(t('keys.parentTag')) + '</span>');
+    if (k.parentKeyId) tags.push('<span class="key-tag key-tag-sub"><i class="fa-solid fa-code-branch"></i>' + escapeHtml(t('keys.subKey')) + '</span>');
+    if (k.migrated) tags.push('<span class="key-tag key-tag-migrated">' + escapeHtml(t('keys.migrated')) + '</span>');
+    if (!k.enabled) tags.push('<span class="key-tag key-tag-disabled">' + escapeHtml(t('keys.disabled')) + '</span>');
+    if (expired) tags.push('<span class="key-tag key-tag-expired">' + escapeHtml(t('keys.expired')) + '</span>');
+
+    const grantedPct = k.granted > 0 ? Math.min(100, (k.used / k.granted) * 100) : 0;
+    const usageClass = grantedPct > 90 ? 'critical' : grantedPct > 70 ? 'high' : '';
+    const grantedText = k.granted > 0 ? formatNumber(k.granted) : t('keys.unlimited');
+    // balance = granted - used; ∞ when unlimited; may be negative if overspent.
+    const balanceText = k.granted > 0 ? formatNumber(k.balance) : '\u221e';
+    const balanceCls = (k.granted <= 0 || k.balance >= 0) ? 'success-text' : '';
+    const usageExtra = k.granted > 0 ? '<div class="ng-usage-mini"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(grantedPct) + '"></div></div>' : '';
+    const rpmVal = escapeHtml(String(k.rpm));
+    // Two soft-tinted data blocks: 计费 (balance / quota / used) and 流量
+    // (tokens / requests / rpm), so money and traffic read as distinct groups.
+    // Blocks use compact numbers (1.7B / 21.9K) so each fixed-width column fits
+    // without truncation; full values remain available via title tooltip.
+    const balanceFull = k.granted > 0 ? formatNumber(k.balance) : '\u221e';
+    const grantedFull = k.granted > 0 ? formatNumber(k.granted) : t('keys.unlimited');
+    const balanceCompact = k.granted > 0 ? formatNum(k.balance) : '\u221e';
+    const grantedCompact = k.granted > 0 ? formatNum(k.granted) : t('keys.unlimited');
+    const creditBlock = '<div class="ng-block ng-block--credit">' +
+      ngMetric(escapeHtml(balanceCompact), t('keys.balance'), '', balanceCls, balanceFull) +
+      ngMetric(escapeHtml(grantedCompact), t('keys.granted'), usageExtra, '', grantedFull) +
+      ngMetric(escapeHtml(formatNum(k.used)), t('keys.used'), '', '', formatNumber(k.used)) +
       '</div>';
-    }).join('');
-    list.innerHTML = html;
+    const trafficBlock = '<div class="ng-block ng-block--traffic">' +
+      ngMetric(escapeHtml(formatNum(k.tokensUsed)), t('keys.tokens'), '', '', formatNumber(k.tokensUsed)) +
+      ngMetric(escapeHtml(formatNum(k.requestsCount)), t('keys.requests'), '', '', formatNumber(k.requestsCount)) +
+      ngMetric(rpmVal, t('keys.rpmLabel')) +
+      '</div>';
+    const blocks = creditBlock + trafficBlock;
+    const dotCls = keyDotClass(k, expired);
+
+    const mcLabel = k.maxConcurrency === -1 ? t('keys.unlimited') : (k.maxConcurrency > 0 ? String(k.maxConcurrency) : t('keys.concurrencyDefault'));
+    const fullKey = k.key || k.keyMasked || '';
+    const seg = (html) => '<span class="ng-sub-seg">' + html + '</span>';
+    // Line 1: the key value + copy buttons.
+    const keySegs = [];
+    keySegs.push('<code class="key-inline">' + escapeHtml(fullKey) + '</code>');
+    keySegs.push('<button class="ng-copy-btn ng-copy-xs" type="button" data-key-action="copyKey" data-id="' + id + '"><i class="fa-regular fa-copy"></i>' + escapeHtml(t('keys.copyKey')) + '</button>');
+    keySegs.push('<button class="ng-copy-btn ng-copy-xs" type="button" data-key-action="copyUrl" data-id="' + id + '"><i class="fa-solid fa-link"></i>' + escapeHtml(t('keys.copyUrl')) + '</button>');
+    // Line 2: metadata grouped as one compact strip (过期 · 并发 · 绑定账号 …).
+    const metaSegs = [];
+    metaSegs.push(seg('<i class="fa-regular fa-clock"></i>' + escapeHtml(t('keys.expiresAt') + ': ' + (k.expiresAt ? formatDateTime(k.expiresAt) : t('keys.neverExpires')))));
+    metaSegs.push(seg('<i class="fa-solid fa-layer-group"></i>' + escapeHtml(t('keys.maxConcurrency') + ': ' + mcLabel)));
+    metaSegs.push(seg('<i class="fa-solid fa-users"></i>' + escapeHtml(t('keys.boundAccounts') + ': ' + keyBoundLabel(k))));
+    if (k.parentKeyId) metaSegs.push(seg('<i class="fa-solid fa-code-branch"></i>' + escapeHtml(t('keys.parentKey') + ': ' + keyParentLabel(k.parentKeyId))));
+    if (info.isParent) {
+      const poolTxt = t('keys.childAllocated') + ' ' + formatNumber(info.childGrant) + ' / ' + (k.granted > 0 ? formatNumber(k.granted) : '\u221e') + ' \u00b7 ' + t('keys.childCount', info.childCount || 0);
+      metaSegs.push(seg('<i class="fa-solid fa-sitemap"></i>' + escapeHtml(poolTxt)));
+    }
+
+    const actions =
+      '<label class="switch" title="' + escapeAttr(k.enabled ? t('accounts.disable') : t('accounts.enable')) + '"><input type="checkbox" data-key-action="toggle" data-id="' + id + '"' + (k.enabled ? ' checked' : '') + ' /><span class="slider"></span></label>' +
+      '<button class="btn btn-primary btn-sm" type="button" data-key-action="topup" data-id="' + id + '"><i class="fa-solid fa-wallet"></i><span>' + escapeHtml(t('keys.topup')) + '</span></button>' +
+      '<button class="btn btn-outline btn-sm" type="button" data-key-action="detail" data-id="' + id + '"><i class="fa-solid fa-chart-line"></i><span>' + escapeHtml(t('keys.detail')) + '</span></button>' +
+      '<button class="btn btn-outline btn-sm" type="button" data-key-action="edit" data-id="' + id + '">' + escapeHtml(t('keys.edit')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" type="button" data-key-action="reset" data-id="' + id + '">' + escapeHtml(t('keys.reset')) + '</button>' +
+      '<button class="btn btn-danger btn-sm" type="button" data-key-action="delete" data-id="' + id + '">' + escapeHtml(t('keys.delete')) + '</button>';
+
+    const rowCls = 'key-card' + (k.enabled ? '' : ' is-disabled') + (expired ? ' is-expired' : '') +
+      (k.parentKeyId ? ' is-sub' : '') + (info.isParent ? ' is-parent' : '') + (info.isChild ? ' key-child-row' : '');
+    return '<div class="' + rowCls + '" data-key-id="' + id + '">' +
+      (info.isChild ? '<span class="key-child-connector" aria-hidden="true">\u21b3</span>' : '') +
+      '<div class="ng-row-main">' +
+        '<div class="ng-row-title"><span class="ng-status-dot ' + dotCls + '" aria-hidden="true"></span><span class="ng-row-name">' + nameHtml + '</span></div>' +
+        (tags.length ? '<div class="ng-row-tags">' + tags.join('') + '</div>' : '') +
+        '<div class="ng-row-sub ng-row-sub--key">' + keySegs.join('') + '</div>' +
+        '<div class="ng-row-sub ng-row-sub--meta">' + metaSegs.join('') + '</div>' +
+      '</div>' +
+      '<div class="ng-row-blocks">' + blocks + '</div>' +
+      '<div class="ng-row-actions">' + actions + '</div>' +
+    '</div>';
+  }
+
+  function markKeyCopied(btn) {
+    if (!btn) return;
+    btn.classList.add('ng-copied');
+    setTimeout(() => btn.classList.remove('ng-copied'), 1200);
+  }
+  async function copyKeyValue(entry, btn) {
+    const val = entry && (entry.key || entry.keyMasked) || '';
+    if (!val) { toastWarning(t('common.failed')); return; }
+    try { await copyText(val); markKeyCopied(btn); toast(t('keys.copyKeyDone'), 'primary'); }
+    catch (e) { toastError(t('common.failed')); }
+  }
+  async function copyKeyBaseUrl(btn) {
+    try { await copyText(location.origin); markKeyCopied(btn); toast(t('keys.copyUrlDone'), 'primary'); }
+    catch (e) { toastError(t('common.failed')); }
+  }
+  // Max-concurrency control: default(0) / custom(N) / unlimited(-1)
+  function updateMaxConcurrencyField() {
+    const mode = $('apiKeyForm_maxConcurrencyMode');
+    const input = $('apiKeyForm_maxConcurrency');
+    if (!mode || !input) return;
+    input.classList.toggle('hidden', mode.value !== 'custom');
   }
 
   function openApiKeyModal(entry) {
@@ -1783,10 +2591,55 @@
     }
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
-    $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
+    // "额度" is the card's total credit grant (CreditsGranted), which drives both
+    // the displayed balance and quota enforcement. Pre-fill from the current grant
+    // so editing sets an absolute quota (recharges are preserved when left as-is);
+    // fall back to the legacy creditLimit only when no grant is present.
+    $('apiKeyForm_creditLimit').value = entry ? String((entry.granted != null ? entry.granted : entry.creditLimit) || 0) : '0';
+    const mc = entry && entry.maxConcurrency != null ? entry.maxConcurrency : 0;
+    const mcMode = $('apiKeyForm_maxConcurrencyMode');
+    const mcInput = $('apiKeyForm_maxConcurrency');
+    if (mc === -1) { if (mcMode) mcMode.value = '-1'; if (mcInput) mcInput.value = '0'; }
+    else if (mc > 0) { if (mcMode) mcMode.value = 'custom'; if (mcInput) mcInput.value = String(mc); }
+    else { if (mcMode) mcMode.value = '0'; if (mcInput) mcInput.value = '0'; }
+    updateMaxConcurrencyField();
+    $('apiKeyForm_expiresAt').value = entry ? toDatetimeLocal(entry.expiresAt) : '';
+    populateParentKeySelect(apiKeyEditingId, entry ? (entry.parentKeyId || '') : '');
+    populateBoundAccounts(entry && Array.isArray(entry.boundAccountIds) ? entry.boundAccountIds : []);
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
     openDialog('apiKeyModal');
+    refreshCustomSelects($('apiKeyModal'));
+  }
+  function populateParentKeySelect(currentId, selectedParentId) {
+    const sel = $('apiKeyForm_parentKey');
+    if (!sel) return;
+    let html = '<option value="">' + escapeHtml(t('apiKeys.formParentNone')) + '</option>';
+    apiKeysCache.forEach(item => {
+      if (item.id === currentId) return;   // never self
+      if (item.parentKeyId) return;        // only root cards can be a parent
+      const label = (item.name || t('keys.unnamed')) + (item.keyMasked ? ' \u00b7 ' + item.keyMasked : '');
+      html += '<option value="' + escapeAttr(item.id) + '"' + (item.id === selectedParentId ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+    });
+    sel.innerHTML = html;
+    sel.value = selectedParentId || '';
+  }
+  function populateBoundAccounts(selectedIds) {
+    const box = $('apiKeyForm_boundAccounts');
+    if (!box) return;
+    const set = new Set(selectedIds || []);
+    if (!accountsData.length) {
+      box.innerHTML = '<div class="muted-text text-xs bound-accounts-empty">' + escapeHtml(t('apiKeys.formBoundAccountsEmpty')) + '</div>';
+      return;
+    }
+    box.innerHTML = accountsData.map(a => {
+      const id = escapeAttr(a.id);
+      const label = getDisplayEmail(a.email, a.id);
+      return '<label class="bound-account-item">' +
+        '<input type="checkbox" value="' + id + '"' + (set.has(a.id) ? ' checked' : '') + ' />' +
+        '<span class="bound-account-email">' + escapeHtml(label) + '</span>' +
+        '</label>';
+    }).join('');
   }
 
   function closeApiKeyModal() {
@@ -1805,12 +2658,34 @@
       const name = $('apiKeyForm_name').value.trim();
       const enabled = $('apiKeyForm_enabled').checked;
       const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
+      // "额度" quota drives the unified ledger (CreditsGranted). Send it as both
+      // creditsGranted (authoritative grant) and creditLimit (legacy mirror) so a
+      // created/edited card shows and enforces exactly what the operator typed.
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      const creditQuota = isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit;
+      const mcMode = ($('apiKeyForm_maxConcurrencyMode') && $('apiKeyForm_maxConcurrencyMode').value) || '0';
+      let maxConcurrency;
+      if (mcMode === '-1') {
+        maxConcurrency = -1;
+      } else if (mcMode === 'custom') {
+        const n = parseInt($('apiKeyForm_maxConcurrency').value, 10);
+        maxConcurrency = (isNaN(n) || n < 1) ? 0 : n;
+      } else {
+        maxConcurrency = 0;
+      }
+      const expiresAt = fromDatetimeLocal($('apiKeyForm_expiresAt').value);
+      const parentKeyId = ($('apiKeyForm_parentKey').value || '').trim();
+      const boundAccountIds = qsa('#apiKeyForm_boundAccounts input[type="checkbox"]:checked').map(cb => cb.value);
       const payload = {
         name: name,
         enabled: enabled,
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
-        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
+        creditLimit: creditQuota,
+        creditsGranted: creditQuota,
+        maxConcurrency: maxConcurrency,
+        expiresAt: expiresAt,
+        parentKeyId: parentKeyId,
+        boundAccountIds: boundAccountIds
       };
       let res, d;
       if (apiKeyEditingId) {
@@ -1826,10 +2701,18 @@
         res = await api('/api-keys', { method: 'POST', body: JSON.stringify(payload) });
         d = await res.json().catch(() => ({}));
         if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
-        toast(t('apiKeys.created'), 'success');
         closeApiKeyModal();
         await loadApiKeys();
-        if (d.key) showNewApiKey(d.key);
+        // Auto-copy the freshly created key to the clipboard so the operator can
+        // paste it straight away. The cleartext key is only returned once, on
+        // creation (d.key). Fall back to the "copy from the list" hint if the
+        // response carried no key or the clipboard write failed.
+        const createdKey = (d && (d.key || d.apiKey && d.apiKey.key)) || '';
+        let copied = false;
+        if (createdKey) {
+          try { await copyText(createdKey); copied = true; } catch (e) { }
+        }
+        toast(t(copied ? 'apiKeys.createdCopied' : 'apiKeys.createdCopyHint'), 'success');
       }
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
@@ -1887,70 +2770,358 @@
     }
   }
 
-  function showNewApiKey(plaintext) {
-    $('apiKeyShowValue').value = plaintext || '';
-    openDialog('apiKeyShowModal');
-    setTimeout(() => {
-      const el = $('apiKeyShowValue');
-      if (el) { try { el.select(); } catch (_) { } }
-    }, 0);
+  // ── Top-up ──
+  function openTopupModal(id) {
+    const entry = apiKeysCache.find(x => x.id === id);
+    topupKeyId = id;
+    $('topupCardName').textContent = entry ? (entry.name || t('keys.unnamed')) : id;
+    $('topupAmount').value = '';
+    $('topupNote').value = '';
+    openDialog('topupModal');
+    setTimeout(() => { const el = $('topupAmount'); if (el) el.focus(); }, 30);
   }
-
-  function closeShowApiKeyModal() {
-    closeDialog('apiKeyShowModal');
-    $('apiKeyShowValue').value = '';
-  }
-
-  async function copyNewApiKey() {
-    const val = $('apiKeyShowValue').value;
-    if (!val) return;
+  function closeTopupModal() { closeDialog('topupModal'); topupKeyId = ''; }
+  async function submitTopup() {
+    const amount = parseFloat($('topupAmount').value);
+    if (isNaN(amount) || amount <= 0) { toastWarning(t('topup.invalidAmount')); return; }
+    const note = $('topupNote').value.trim();
+    const btn = $('topupSubmitBtn');
+    if (btn) btn.disabled = true;
     try {
-      await copyText(val);
-      toast(t('apiKeys.copySuccess'), 'success');
+      const res = await api('/api-keys/' + encodeURIComponent(topupKeyId) + '/topup', { method: 'POST', body: JSON.stringify({ amount, note }) });
+      if (res.status === 404) throw new Error(t('topup.notAvailable'));
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('topup.success'), 'success');
+      closeTopupModal();
+      await loadApiKeys();
     } catch (e) {
-      toast(t('common.failed'), 'error');
+      toastError((e && e.message) || t('common.failed'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ── Card detail (usage summary / recharges / usage records / sub-cards) ──
+  function openKeyDetail(id) {
+    keyDetailId = id;
+    keyDetailTab = 'summary';
+    keyRechargePage = 1;
+    keyUsagePage = 1;
+    const entry = apiKeysCache.find(x => x.id === id);
+    const nameEl = $('keyDetailName');
+    if (nameEl) nameEl.textContent = entry ? (entry.name || t('keys.unnamed')) : id;
+    qsa('#keyDetailSubtabs .key-subtab').forEach(b => b.classList.toggle('active', b.dataset.subtab === 'summary'));
+    openDialog('keyDetailModal');
+    renderKeyDetailTab();
+  }
+  function switchKeyDetailTab(tab) {
+    keyDetailTab = tab;
+    qsa('#keyDetailSubtabs .key-subtab').forEach(b => b.classList.toggle('active', b.dataset.subtab === tab));
+    renderKeyDetailTab();
+  }
+  function keyDetailLoading() {
+    return '<div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> ' + escapeHtml(t('detail.loading')) + '</div>';
+  }
+  function keyDetailUnavailable() {
+    return '<div class="empty-state key-detail-unavailable"><i class="fa-solid fa-plug-circle-xmark"></i><span>' + escapeHtml(t('keyDetail.notAvailable')) + '</span></div>';
+  }
+  function renderKeyDetailTab() {
+    const c = $('keyDetailContent');
+    if (!c) return;
+    c.innerHTML = keyDetailLoading();
+    if (keyDetailTab === 'summary') renderKeySummary(c);
+    else if (keyDetailTab === 'recharges') renderKeyRecharges(c);
+    else if (keyDetailTab === 'usage') renderKeyUsageRecords(c);
+    else if (keyDetailTab === 'children') renderKeyChildren(c);
+  }
+  function keySummaryCard(label, value, variant) {
+    return '<div class="key-summary-item' + (variant ? ' key-summary-item--' + variant : '') + '">' +
+      '<div class="key-summary-value">' + escapeHtml(String(value)) + '</div>' +
+      '<div class="key-summary-label">' + escapeHtml(label) + '</div>' +
+      '</div>';
+  }
+  async function renderKeySummary(c) {
+    let d = null;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(keyDetailId) + '/usage');
+      if (res.ok) d = await res.json();
+    } catch (e) { /* fall back to local key data */ }
+    const entry = normalizeKey(apiKeysCache.find(x => x.id === keyDetailId));
+    const granted = d && d.creditsGranted != null ? d.creditsGranted : entry.granted;
+    const used = d && d.creditsUsed != null ? d.creditsUsed : entry.used;
+    const balance = d && d.balance != null ? d.balance : entry.balance;
+    const tokensUsed = d && d.tokensUsed != null ? d.tokensUsed : entry.tokensUsed;
+    const requestsCount = d && d.requestsCount != null ? d.requestsCount : entry.requestsCount;
+    const byModel = d && Array.isArray(d.byModel) ? d.byModel : [];
+    const cacheHitRate = d && typeof d.cacheHitRate === 'number' ? d.cacheHitRate : null;
+    const chrTxt = cacheHitRate == null ? '\u2014' : (cacheHitRate * 100).toFixed(1) + '%';
+    const chrColor = cacheHitRate == null ? '' : (cacheHitRate >= 0.6 ? '#16a34a' : cacheHitRate >= 0.3 ? '#ca8a04' : '#dc2626');
+    let html = '<div class="key-summary-grid">';
+    html += keySummaryCard(t('keyDetail.summaryBalance'), granted > 0 ? formatNumber(balance) : '\u221e', 'balance');
+    html += keySummaryCard(t('keyDetail.summaryGranted'), granted > 0 ? formatNumber(granted) : t('keys.unlimited'), '');
+    html += keySummaryCard(t('keyDetail.summaryUsed'), formatNumber(used), 'used');
+    html += keySummaryCard(t('keyDetail.summaryTokens'), formatNumber(tokensUsed), '');
+    html += keySummaryCard(t('keyDetail.summaryRequests'), formatNumber(requestsCount), '');
+    html += '<div class="key-summary-item"><div class="key-summary-value"' + (chrColor ? ' style="color:' + chrColor + '"' : '') + '>' + escapeHtml(chrTxt) + '</div>' +
+      '<div class="key-summary-label">' + escapeHtml(t('keyDetail.summaryCacheHit')) + '</div></div>';
+    html += '</div>';
+    if (byModel.length) {
+      html += '<div class="key-detail-subheading">' + escapeHtml(t('keyDetail.byModel')) + '</div>';
+      html += '<table class="data-table"><thead><tr>' +
+        '<th>' + escapeHtml(t('usageRec.model')) + '</th>' +
+        '<th class="ta-right">' + escapeHtml(t('usageRec.credits')) + '</th>' +
+        '<th class="ta-right">' + escapeHtml(t('keys.requests')) + '</th>' +
+        '</tr></thead><tbody>';
+      byModel.forEach(m => {
+        html += '<tr>' +
+          '<td class="font-mono">' + escapeHtml(m.model || '-') + '</td>' +
+          '<td class="ta-right">' + escapeHtml(formatNumber(m.credits || 0)) + '</td>' +
+          '<td class="ta-right">' + escapeHtml(formatNumber(m.requests || 0)) + '</td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+    c.innerHTML = html;
+  }
+  function pagerHtml(kind, page, total) {
+    const pages = Math.max(1, Math.ceil((total || 0) / KEY_PAGE_SIZE));
+    return '<div class="data-pager">' +
+      '<span class="data-pager-total">' + escapeHtml(t('page.total', total || 0)) + '</span>' +
+      '<div class="data-pager-ctrl">' +
+      '<button class="btn btn-outline btn-xs" type="button" data-pager="' + kind + '" data-dir="-1"' + (page <= 1 ? ' disabled' : '') + '>' + escapeHtml(t('page.prev')) + '</button>' +
+      '<span class="data-pager-info">' + escapeHtml(t('page.info', page, pages)) + '</span>' +
+      '<button class="btn btn-outline btn-xs" type="button" data-pager="' + kind + '" data-dir="1"' + (page >= pages ? ' disabled' : '') + '>' + escapeHtml(t('page.next')) + '</button>' +
+      '</div></div>';
+  }
+  async function renderKeyRecharges(c) {
+    let d = null, unavailable = false;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(keyDetailId) + '/recharges?page=' + keyRechargePage + '&pageSize=' + KEY_PAGE_SIZE);
+      if (res.status === 404) unavailable = true;
+      else if (res.ok) d = await res.json();
+      else unavailable = true;
+    } catch (e) { unavailable = true; }
+    if (unavailable) { c.innerHTML = keyDetailUnavailable(); return; }
+    const records = d && Array.isArray(d.records) ? d.records : [];
+    const total = d && d.total != null ? d.total : records.length;
+    if (!records.length) { c.innerHTML = '<div class="empty-state">' + escapeHtml(t('keyDetail.empty')) + '</div>'; return; }
+    let html = '<table class="data-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('recharge.time')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('recharge.amount')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('recharge.balanceAfter')) + '</th>' +
+      '<th>' + escapeHtml(t('recharge.operator')) + '</th>' +
+      '<th>' + escapeHtml(t('recharge.note')) + '</th>' +
+      '</tr></thead><tbody>';
+    records.forEach(r => {
+      html += '<tr>' +
+        '<td>' + escapeHtml(formatDateTime(r.createdAt)) + '</td>' +
+        '<td class="ta-right data-pos">+' + escapeHtml(formatNumber(r.amount || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.balanceAfter || 0)) + '</td>' +
+        '<td>' + escapeHtml(r.operator || '-') + '</td>' +
+        '<td class="data-note">' + escapeHtml(r.note || '-') + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>' + pagerHtml('recharge', keyRechargePage, total);
+    c.innerHTML = html;
+  }
+  async function renderKeyUsageRecords(c) {
+    let d = null, unavailable = false;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(keyDetailId) + '/usage/records?page=' + keyUsagePage + '&pageSize=' + KEY_PAGE_SIZE);
+      if (res.status === 404) unavailable = true;
+      else if (res.ok) d = await res.json();
+      else unavailable = true;
+    } catch (e) { unavailable = true; }
+    if (unavailable) { c.innerHTML = keyDetailUnavailable(); return; }
+    const records = d && Array.isArray(d.records) ? d.records : [];
+    const total = d && d.total != null ? d.total : records.length;
+    if (!records.length) { c.innerHTML = '<div class="empty-state">' + escapeHtml(t('keyDetail.empty')) + '</div>'; return; }
+    let html = '<table class="data-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('usageRec.time')) + '</th>' +
+      '<th>' + escapeHtml(t('usageRec.model')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('usageRec.input')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('usageRec.output')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('usageRec.cacheRead')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('usageRec.credits')) + '</th>' +
+      '</tr></thead><tbody>';
+    records.forEach(r => {
+      html += '<tr>' +
+        '<td>' + escapeHtml(formatDateTime(r.createdAt)) + '</td>' +
+        '<td class="font-mono">' + escapeHtml(r.model || '-') + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.inputTokens || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.outputTokens || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.cacheReadInputTokens || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(r.credits || 0)) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>' + pagerHtml('usage', keyUsagePage, total);
+    c.innerHTML = html;
+  }
+  async function renderKeyChildren(c) {
+    let d = null, unavailable = false;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(keyDetailId) + '/children');
+      if (res.status === 404) unavailable = true;
+      else if (res.ok) d = await res.json();
+      else unavailable = true;
+    } catch (e) { unavailable = true; }
+    let children = [];
+    if (d) children = Array.isArray(d.children) ? d.children : (Array.isArray(d.records) ? d.records : (Array.isArray(d) ? d : []));
+    // Fall back to deriving children from the local cache via parentKeyId.
+    if (!children.length) children = apiKeysCache.filter(k => k.parentKeyId === keyDetailId);
+    let html = '<div class="key-children-head"><button class="btn btn-primary btn-sm" type="button" data-child-create="1"><i class="fa-solid fa-plus"></i>' + escapeHtml(t('children.create')) + '</button></div>';
+    if (!children.length) {
+      html += '<div class="empty-state">' + escapeHtml(t('children.empty')) + '</div>';
+      c.innerHTML = html;
+      return;
+    }
+    const parent = normalizeKey(apiKeysCache.find(x => x.id === keyDetailId));
+    html += '<table class="data-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('children.name')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('children.granted')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('children.used')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('children.balance')) + '</th>' +
+      '<th class="ta-right">' + escapeHtml(t('children.poolShare')) + '</th>' +
+      '</tr></thead><tbody>';
+    children.forEach(raw => {
+      const k = normalizeKey(raw);
+      const share = parent.granted > 0 ? ((k.granted / parent.granted) * 100).toFixed(1) + '%' : '-';
+      html += '<tr>' +
+        '<td>' + escapeHtml(k.name || t('keys.unnamed')) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(k.granted > 0 ? formatNumber(k.granted) : t('keys.unlimited')) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatNumber(k.used)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(k.granted > 0 ? formatNumber(k.balance) : '\u221e') + '</td>' +
+        '<td class="ta-right">' + escapeHtml(share) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    c.innerHTML = html;
+  }
+  function onKeyDetailContentClick(e) {
+    const pager = e.target.closest('[data-pager]');
+    if (pager && !pager.disabled) {
+      const dir = parseInt(pager.dataset.dir, 10) || 0;
+      if (pager.dataset.pager === 'recharge') keyRechargePage = Math.max(1, keyRechargePage + dir);
+      else if (pager.dataset.pager === 'usage') keyUsagePage = Math.max(1, keyUsagePage + dir);
+      renderKeyDetailTab();
+      return;
+    }
+    const childCreate = e.target.closest('[data-child-create]');
+    if (childCreate) {
+      const parentId = keyDetailId;
+      closeDialog('keyDetailModal');
+      openApiKeyModal(null);
+      const sel = $('apiKeyForm_parentKey');
+      if (sel) { sel.value = parentId; refreshCustomSelects($('apiKeyModal')); }
+    }
+  }
+
+  // ── Concurrency / sticky cache board (read-only, gracefully hidden) ──
+  function concurrencyItem(label, value, variant) {
+    return '<div class="concurrency-item' + (variant ? ' concurrency-item--' + variant : '') + '">' +
+      '<div class="concurrency-value">' + escapeHtml(String(value)) + '</div>' +
+      '<div class="concurrency-label">' + escapeHtml(label) + '</div>' +
+      '</div>';
+  }
+  function renderConcurrency(grid, d) {
+    d = d || {};
+    const hits = d.stickyHits || 0;
+    const misses = d.stickyMisses || 0;
+    const totalSticky = hits + misses;
+    const rate = totalSticky > 0 ? ((hits / totalSticky) * 100).toFixed(1) + '%' : '-';
+    const sumVals = obj => (obj && typeof obj === 'object') ? Object.values(obj).reduce((a, b) => a + (Number(b) || 0), 0) : 0;
+    grid.innerHTML =
+      concurrencyItem(t('concurrency.stickyHits'), formatNumber(hits), 'success') +
+      concurrencyItem(t('concurrency.stickyMisses'), formatNumber(misses), '') +
+      concurrencyItem(t('concurrency.hitRate'), rate, 'info') +
+      concurrencyItem(t('concurrency.inflightAccounts'), formatNumber(sumVals(d.inflightByAccount)), '') +
+      concurrencyItem(t('concurrency.inflightKeys'), formatNumber(sumVals(d.inflightByKey)), '');
+  }
+  async function loadConcurrency() {
+    const card = $('concurrencyCard');
+    const grid = $('concurrencyGrid');
+    if (!card || !grid) return;
+    try {
+      const res = await api('/concurrency');
+      if (!res.ok) throw new Error('unavailable');
+      const d = await res.json();
+      renderConcurrency(grid, d);
+      card.classList.remove('hidden');
+    } catch (e) {
+      card.classList.add('hidden');
     }
   }
 
   function bindApiKeyEvents() {
-    const list = $('apiKeysList');
+    const list = $('keysList');
     if (list) {
       list.addEventListener('click', e => {
-        const btn = e.target.closest('[data-apikey-action]');
+        const btn = e.target.closest('[data-key-action]');
         if (!btn) return;
-        const action = btn.dataset.apikeyAction;
+        const action = btn.dataset.keyAction;
         const id = btn.dataset.id;
-        if (!id) return;
+        if (!id || action === 'toggle') return;
         const entry = apiKeysCache.find(x => x.id === id);
         const name = entry ? entry.name : '';
         if (action === 'edit') openApiKeyModal(entry);
         else if (action === 'delete') deleteApiKeyEntry(id, name);
         else if (action === 'reset') resetApiKeyUsageEntry(id, name);
+        else if (action === 'topup') openTopupModal(id);
+        else if (action === 'detail') openKeyDetail(id);
+        else if (action === 'copyKey') copyKeyValue(entry, btn);
+        else if (action === 'copyUrl') copyKeyBaseUrl(btn);
       });
       list.addEventListener('change', e => {
-        const cb = e.target.closest('input[data-apikey-action="toggle"]');
-        if (!cb) return;
-        const id = cb.dataset.id;
-        if (!id) return;
-        toggleApiKeyEntry(id, cb.checked);
+        const cb = e.target.closest('input[data-key-action="toggle"]');
+        if (!cb || !cb.dataset.id) return;
+        toggleApiKeyEntry(cb.dataset.id, cb.checked);
       });
     }
-    const addBtn = $('addApiKeyBtn');
+    // Keys tab controls
+    const addBtn = $('keysAddBtn');
     if (addBtn) addBtn.addEventListener('click', () => openApiKeyModal(null));
+    const search = $('keysSearch');
+    if (search) search.addEventListener('input', e => { keysFilterKeyword = e.target.value; renderApiKeys(); });
+    const filterSel = $('keysFilterSelect');
+    if (filterSel) filterSel.addEventListener('change', e => { keysFilterStatus = e.target.value; renderApiKeys(); });
+    const sortSel = $('keysSortSelect');
+    if (sortSel) sortSel.addEventListener('change', e => { keysSortBy = e.target.value; renderApiKeys(); });
+    const gotoBtn = $('gotoKeysBtn');
+    if (gotoBtn) gotoBtn.addEventListener('click', () => switchTab('keys'));
+
+    // Create/edit modal
     const saveBtn = $('apiKeyModalSaveBtn');
     if (saveBtn) saveBtn.addEventListener('click', submitApiKeyModal);
+    const mcModeSel = $('apiKeyForm_maxConcurrencyMode');
+    if (mcModeSel) mcModeSel.addEventListener('change', updateMaxConcurrencyField);
     const cancelBtn = $('apiKeyModalCancelBtn');
     if (cancelBtn) cancelBtn.addEventListener('click', closeApiKeyModal);
     const closeBtn = $('apiKeyModalClose');
     if (closeBtn) closeBtn.addEventListener('click', closeApiKeyModal);
-    const showCloseBtn = $('apiKeyShowCloseBtn');
-    if (showCloseBtn) showCloseBtn.addEventListener('click', closeShowApiKeyModal);
-    const showCloseX = $('apiKeyShowClose');
-    if (showCloseX) showCloseX.addEventListener('click', closeShowApiKeyModal);
-    const copyBtn = $('apiKeyShowCopyBtn');
-    if (copyBtn) copyBtn.addEventListener('click', copyNewApiKey);
+
+    // Top-up modal
+    const topupClose = $('topupModalClose');
+    if (topupClose) topupClose.addEventListener('click', closeTopupModal);
+    const topupCancel = $('topupCancelBtn');
+    if (topupCancel) topupCancel.addEventListener('click', closeTopupModal);
+    const topupSubmit = $('topupSubmitBtn');
+    if (topupSubmit) topupSubmit.addEventListener('click', submitTopup);
+
+    // Card detail modal
+    const kdClose = $('keyDetailModalClose');
+    if (kdClose) kdClose.addEventListener('click', () => closeDialog('keyDetailModal'));
+    const subtabs = $('keyDetailSubtabs');
+    if (subtabs) subtabs.addEventListener('click', e => {
+      const b = e.target.closest('[data-subtab]');
+      if (b) switchKeyDetailTab(b.dataset.subtab);
+    });
+    const kdContent = $('keyDetailContent');
+    if (kdContent) kdContent.addEventListener('click', onKeyDetailContentClick);
+
     bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
-    bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
+    bindDialogBackdropClose('topupModal', closeTopupModal);
+    bindDialogBackdropClose('keyDetailModal', () => closeDialog('keyDetailModal'));
   }
 
   // Prompt filter rules
@@ -2015,261 +3186,118 @@
     renderPromptRules();
   }
 
-  // Add-account modal templates
-  var METHOD_ICONS = {
-    builderid: 'fa-solid fa-id-card',
-    iam: 'fa-solid fa-key',
-    sso: 'fa-solid fa-shield-halved',
-    local: 'fa-solid fa-folder-open',
-    credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
-  };
-  function methodCard(type, title, desc) {
-    var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
-    return '<button type="button" class="method-card" data-method="' + escapeAttr(type) + '">' +
-      '<span class="method-icon"><i class="' + icon + '" aria-hidden="true"></i></span>' +
-      '<span class="method-body">' +
-      '<span class="method-title">' + escapeHtml(title) + '</span>' +
-      '<span class="method-desc">' + escapeHtml(desc) + '</span>' +
-      '</span>' +
-      '<span class="method-arrow" aria-hidden="true"><i class="fa-solid fa-chevron-right"></i></span>' +
-      '</button>';
+  // Single "add account" modal: a method tab-bar switches the form below.
+  // Social login is intentionally excluded (known-broken upstream).
+  const ADD_METHODS = [
+    ['credentials', 'modal.credentialsTitle'],
+    ['apikey', 'modal.apiKeyTitle'],
+    ['sso', 'modal.iamTitle']
+  ];
+  function addMethodTabs(active) {
+    return '<div class="add-method-tabs">' + ADD_METHODS.map(m =>
+      '<button type="button" class="add-method-tab' + (m[0] === active ? ' active' : '') + '" data-modal-goto="' + m[0] + '">' +
+      escapeHtml(t(m[1])) + '</button>'
+    ).join('') + '</div>';
   }
   function showModal(type) {
     const modal = $('addModal');
     const title = $('modalTitle');
     const body = $('modalBody');
-    if (type === 'add') modalAdd(title, body);
-    else if (type === 'builderid') modalBuilderId(title, body);
-    else if (type === 'iam') modalIam(title, body);
+    if (type === 'apikey') modalApiKeyImport(title, body);
     else if (type === 'sso') modalSso(title, body);
-    else if (type === 'local') modalLocal(title, body);
-    else if (type === 'credentials') modalCredentials(title, body);
-    else if (type === 'cookie') modalCookie(title, body);
+    else modalCredentials(title, body); // 'add' / 'credentials' / default
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
   function closeModal() {
     closeDialog('addModal');
-    iamSession = '';
-    if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
-    builderIdSession = '';
-  }
-  function modalAdd(title, body) {
-    title.textContent = t('modal.addAccount');
-    body.innerHTML =
-      '<div class="method-list">' +
-      methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
-      methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
-      methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
-      methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
-      methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
-      methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
-      '</div>' +
-      '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
-  }
-  function modalBuilderId(title, body) {
-    title.textContent = t('modal.builderIdTitle');
-    body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.builderIdDesc')) + '</p>' +
-      '<div id="builderIdStep1">' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="builderIdRegion" value="us-east-1" /></div>' +
-      '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="startBuilderIdBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
-      '</div>' +
-      '</div>' +
-      '<div id="builderIdStep2" class="hidden">' +
-      '<div class="message message-info message-center"><p class="builder-code" id="builderIdUserCode"></p><p class="text-xs mt-2">' + escapeHtml(t('builderid.verifyCode')) + '</p></div>' +
-      '<div class="form-group mt-4"><label>' + escapeHtml(t('builderid.verifyUrl')) + '</label>' +
-      '<div class="endpoint"><span id="builderIdVerifyUrl" class="font-mono text-xs"></span></div>' +
-      '<div class="flex gap-2 mt-2">' +
-      '<button class="btn btn-sm btn-outline flex-1" id="builderIdOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
-      '<button class="btn btn-sm btn-outline flex-1" id="builderIdCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
-      '</div>' +
-      '</div>' +
-      '<p id="builderIdStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
-      '<div class="modal-footer"><button class="btn btn-secondary" id="builderIdCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
-      '</div>';
-    $('startBuilderIdBtn').addEventListener('click', startBuilderIdLogin);
-  }
-  function modalIam(title, body) {
-    title.textContent = t('modal.iamTitle');
-    body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + '</label><input type="text" id="iamStartUrl" placeholder="https://xxx.awsapps.com/start" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="iamRegion" value="us-east-1" /></div>' +
-      '<div id="iamStep2" class="hidden">' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
-      '<div class="endpoint"><span id="iamAuthUrl" class="font-mono text-xs"></span></div>' +
-      '<div class="flex gap-2 mt-2">' +
-      '<button class="btn btn-sm btn-outline flex-1" id="iamOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
-      '<button class="btn btn-sm btn-outline flex-1" id="iamCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
-      '</div>' +
-      '</div>' +
-      '<p class="text-sm mt-3 success-text">' + escapeHtml(t('iam.completeLogin')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('iam.callbackUrl')) + '</label><input type="text" id="iamCallback" placeholder="http://127.0.0.1:xxx/?code=..." /></div>' +
-      '</div>' +
-      '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="iamBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
-      '</div>';
-    $('iamBtn').addEventListener('click', startIamSso);
   }
   function modalSso(title, body) {
-    title.textContent = t('modal.ssoTitle');
+    title.textContent = t('modal.addAccount');
     body.innerHTML =
-      '<div class="help-block">' +
-      '<b>' + escapeHtml(t('sso.howToGet')) + '</b>' +
-      '<ol class="steps-list">' +
-      '<li>' + escapeHtml(t('sso.step1')) + ' <code class="code-inline">view.awsapps.com/start</code></li>' +
-      '<li>' + escapeHtml(t('sso.step2')) + '</li>' +
-      '<li>' + escapeHtml(t('sso.step3')) + ' <code class="code-inline">x-amz-sso_authn</code></li>' +
-      '</ol>' +
+      addMethodTabs('sso') +
+      '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('sso.nameLabel')) + '</label>' +
+      '<input type="text" id="ssoName" placeholder="' + escapeAttr(t('sso.namePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + ' <small>' + escapeHtml(t('sso.startUrlHint')) + '</small></label>' +
+      '<input type="text" id="ssoStartUrl" class="font-mono" placeholder="https://d-xxxxxxxxxx.awsapps.com/start" /></div>' +
+      '<div id="ssoStep2" class="hidden">' +
+      '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
+      '<div class="input-row"><input type="text" id="ssoAuthUrl" class="font-mono" readonly />' +
+      '<button class="btn btn-outline" id="ssoOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button></div></div>' +
+      '<p class="help-block">' + escapeHtml(t('iam.completeLogin')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('iam.callbackUrl')) + '</label>' +
+      '<textarea id="ssoCallback" class="font-mono" placeholder="http://127.0.0.1/oauth/callback?code=..."></textarea></div>' +
       '</div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('sso.tokenLabel')) + ' <small>' + escapeHtml(t('sso.tokenHint')) + '</small></label>' +
-      '<textarea id="ssoToken" placeholder="' + escapeAttr(t('sso.tokenPlaceholder')) + '"></textarea></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="ssoRegion" value="us-east-1" /></div>' +
       '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="importSsoBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '<button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="ssoStartBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
+      '<button class="btn btn-primary hidden" id="ssoCompleteBtn" type="button">' + escapeHtml(t('iam.complete')) + '</button>' +
       '</div>';
-    $('importSsoBtn').addEventListener('click', importSsoToken);
+    const ssoState = { sessionId: null, authUrl: null };
+    $('ssoStartBtn').addEventListener('click', () => startIamSso(ssoState));
+    $('ssoCompleteBtn').addEventListener('click', () => completeIamSso(ssoState));
+    $('ssoOpenBtn').addEventListener('click', () => { if (ssoState.authUrl) window.open(ssoState.authUrl, '_blank', 'noopener'); });
   }
 
-  function modalLocal(title, body) {
-    title.textContent = t('modal.localTitle');
-    body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.localDesc')) + '</p>' +
-      '<div class="help-block">' +
-      '<p><b>' + escapeHtml(t('local.fileLocation')) + '</b></p>' +
-      '<p>' + escapeHtml(t('local.windows')) + ': <code class="code-inline">%USERPROFILE%\\.aws\\sso\\cache\\</code></p>' +
-      '<p>' + escapeHtml(t('local.macosLinux')) + ': <code class="code-inline">~/.aws/sso/cache/</code></p>' +
-      '</div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('local.loginChannel')) + '</label>' +
-      '<select id="localProvider">' +
-      '<option value="BuilderId">' + escapeHtml(t('local.providerBuilderId')) + '</option>' +
-      '<option value="Enterprise">' + escapeHtml(t('local.providerEnterprise')) + '</option>' +
-      '<option value="Google">' + escapeHtml(t('local.providerGoogle')) + '</option>' +
-      '<option value="Github">' + escapeHtml(t('local.providerGithub')) + '</option>' +
-      '</select>' +
-      '</div>' +
-      '<div class="form-group">' +
-      '<label>' + escapeHtml(t('local.tokenFile')) + ' <small>' + escapeHtml(t('local.tokenRequired')) + '</small></label>' +
-      '<div class="input-row">' +
-      '<textarea id="localTokenJson" placeholder="' + escapeAttr(t('local.pasteOrUpload')) + '" class="font-mono"></textarea>' +
-      '<label class="btn btn-outline btn-sm">' + escapeHtml(t('local.upload')) +
-      '<input type="file" accept=".json" id="localTokenFile" class="file-input-hidden" />' +
-      '</label>' +
-      '</div>' +
-      '</div>' +
-      '<div id="localClientGroup" class="form-group">' +
-      '<label>' + escapeHtml(t('local.clientFile')) + ' <small>' + escapeHtml(t('local.clientRequired')) + '</small></label>' +
-      '<div class="input-row">' +
-      '<textarea id="localClientJson" placeholder="' + escapeAttr(t('local.pasteOrUpload')) + '" class="font-mono"></textarea>' +
-      '<label class="btn btn-outline btn-sm">' + escapeHtml(t('local.upload')) +
-      '<input type="file" accept=".json" id="localClientFile" class="file-input-hidden" />' +
-      '</label>' +
-      '</div>' +
-      '</div>' +
-      '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="importLocalBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
-      '</div>';
-    $('localProvider').addEventListener('change', updateLocalFields);
-    $('localTokenFile').addEventListener('change', e => loadLocalFile(e.target, 'localTokenJson'));
-    $('localClientFile').addEventListener('change', e => loadLocalFile(e.target, 'localClientJson'));
-    $('importLocalBtn').addEventListener('click', importLocalKiro);
-  }
   function modalCredentials(title, body) {
-    title.textContent = t('modal.credentialsTitle');
+    title.textContent = t('modal.addAccount');
     body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.credentialsDesc')) + '</p>' +
-      '<p class="help-block">' + escapeHtml(t('credentials.batchHint')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('credentials.label')) + '</label>' +
-      '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
+      addMethodTabs('credentials') +
+      '<p class="help-block">' + escapeHtml(t('credentials.jsonHint')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('credentials.label')) + ' <small>' + escapeHtml(t('credentials.dropHint')) + '</small></label>' +
+      '<textarea id="credJson" class="font-mono" placeholder=\'{"refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1"}\'></textarea>' +
       '</div>' +
       '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="importCredBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importCredBtn').addEventListener('click', importCredentials);
+    enableJsonFileDrop($('credJson'));
   }
-  function modalCookie(title, body) {
-    title.textContent = t('modal.cookieTitle');
+  function modalApiKeyImport(title, body) {
+    title.textContent = t('modal.addAccount');
     body.innerHTML =
-      '<div class="help-block">' +
-      '<p><b>' + escapeHtml(t('cookie.howToGet')) + '</b></p>' +
-      '<ol class="steps-list">' +
-      '<li>' + escapeHtml(t('cookie.step1')) + ' <a href="' + escapeAttr(t('cookie.link')) + '" target="_blank">' + escapeHtml(t('cookie.link')) + '</a></li>' +
-      '<li>' + escapeHtml(t('cookie.step2')) + '</li>' +
-      '<li>' + escapeHtml(t('cookie.step3')) + '</li>' +
-      '</ol>' +
-      '</div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('cookie.provider')) + '</label>' +
-      '<select id="cookieProvider">' +
-      '<option value="Google">' + escapeHtml(t('cookie.google')) + '</option>' +
-      '<option value="Github">' + escapeHtml(t('cookie.github')) + '</option>' +
-      '</select>' +
-      '</div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('cookie.refreshToken')) + '</label>' +
-      '<textarea id="cookieRefreshToken" class="font-mono" placeholder="' + escapeAttr(t('cookie.refreshTokenPlaceholder')) + '"></textarea>' +
-      '</div>' +
+      addMethodTabs('apikey') +
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apiKeyImport.keys')) + ' <small>' + escapeHtml(t('apiKeyImport.keysHint')) + '</small></label>' +
+      '<textarea id="apiKeyImportKeys" class="font-mono" placeholder="ksk_xxxxxxxx&#10;ksk_yyyyyyyy"></textarea></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apiKeyImport.region')) + '</label><input type="text" id="apiKeyImportRegion" value="us-east-1" /></div>' +
       '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="importCookieBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '<button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('apiKeyImport.submit')) + '</button>' +
       '</div>';
-    $('importCookieBtn').addEventListener('click', importFromCookie);
+    $('importApiKeyBtn').addEventListener('click', importKiroApiKey);
   }
-  function updateLocalFields() {
-    const p = $('localProvider').value;
-    $('localClientGroup').classList.toggle('hidden', p === 'Google' || p === 'Github');
-  }
-  function loadLocalFile(input, targetId) {
-    const file = input.files[0];
-    if (!file) return;
-    const r = new FileReader();
-    r.onload = e => { $(targetId).value = e.target.result; };
-    r.readAsText(file);
-  }
-
-  // Import handlers
-  async function importLocalKiro() {
-    const provider = $('localProvider').value;
-    const tokenJson = $('localTokenJson').value.trim();
-    const clientJson = $('localClientJson').value.trim();
-    const isSocial = provider === 'Google' || provider === 'Github';
-    if (!tokenJson) return toastWarning(t('local.tokenMissing'));
-    let tokenData, clientData;
-    try { tokenData = JSON.parse(tokenJson); } catch { return toastWarning(t('local.tokenInvalid')); }
-    if (!tokenData.refreshToken) return toastWarning(t('local.refreshTokenMissing'));
-    if (!isSocial) {
-      if (!clientJson) return toastWarning(t('local.clientMissing'));
-      try { clientData = JSON.parse(clientJson); } catch { return toastWarning(t('local.clientInvalid')); }
-      if (!clientData.clientId || !clientData.clientSecret) return toastWarning(t('local.clientSecretMissing'));
-    }
-    const authMethod = clientData ? 'idc' : 'social';
-    const payload = {
-      refreshToken: tokenData.refreshToken,
-      accessToken: tokenData.accessToken || '',
-      clientId: clientData?.clientId || '',
-      clientSecret: clientData?.clientSecret || '',
-      region: tokenData.region || '',
-      authMethod, provider
-    };
-    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
-    const d = await res.json();
-    if (d.success) {
-      closeModal(); loadAccounts(); loadStats();
-      toastPrimary(t('local.importSuccess') + ': ' + (d.account?.email || d.account?.id));
-      autoRefreshNewAccount(d.account?.id);
-    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  // Let users drag a .json credentials file (e.g. Kiro Account Manager export)
+  // straight onto a textarea instead of copy-pasting. The file text is read into
+  // the field; importCredentials already parses both kam ({accounts:[...]}) and
+  // line/array formats, so no extra format handling is needed here.
+  function enableJsonFileDrop(el) {
+    if (!el) return;
+    const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+    ['dragenter', 'dragover'].forEach(ev => el.addEventListener(ev, (e) => {
+      stop(e);
+      el.classList.add('is-dragover');
+    }));
+    ['dragleave', 'dragend'].forEach(ev => el.addEventListener(ev, (e) => {
+      stop(e);
+      el.classList.remove('is-dragover');
+    }));
+    el.addEventListener('drop', (e) => {
+      stop(e);
+      el.classList.remove('is-dragover');
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!file) return;
+      const r = new FileReader();
+      r.onload = (ev) => { el.value = ev.target.result; el.focus(); };
+      r.readAsText(file);
+    });
   }
   async function importCredentials() {
     const raw = $('credJson').value.trim();
     if (!raw) { toastWarning(t('credentials.jsonError')); return; }
     let items;
-    let skipped = 0;
     try {
       const json = JSON.parse(raw);
       if (json.accounts && Array.isArray(json.accounts)) {
@@ -2288,19 +3316,10 @@
         items = Array.isArray(json) ? json : [json];
       }
     } catch {
-      const parsed = parseLineCredentials(raw);
-      items = parsed.items;
-      skipped = parsed.skipped;
-      if (items.length === 0 && skipped === 0) {
-        toastWarning(t('credentials.jsonError'));
-        return;
-      }
-      if (items.length === 0) {
-        toastWarning(t('credentials.lineParseAllSkipped', skipped));
-        return;
-      }
+      toastWarning(t('credentials.jsonError'));
+      return;
     }
-    let ok = 0, fail = 0, newIds = [];
+    let ok = 0, fail = 0;
     for (const item of items) {
       if (!item.refreshToken) { fail++; continue; }
       let authMethod = item.authMethod || '';
@@ -2321,151 +3340,84 @@
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
         const d = await res.json();
-        if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+        if (d.success) { ok++; }
         else fail++;
       } catch { fail++; }
     }
     closeModal(); loadAccounts(); loadStats();
     let msg = t('sso.importSuccess', ok);
     if (fail > 0) msg += t('sso.importPartial', fail);
-    if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
-    newIds.forEach(autoRefreshNewAccount);
   }
-  function parseLineCredentials(text) {
-    const items = [];
-    let skipped = 0;
-    for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let parts;
-      if (trimmed.includes('----')) {
-        parts = trimmed.split('----').map(s => s.trim());
-      } else if (trimmed.includes('\t')) {
-        parts = trimmed.split(/\t+/).map(s => s.trim());
-      } else {
-        parts = trimmed.split(/\s+/).map(s => s.trim());
-      }
-      if (parts.length < 5) { skipped++; continue; }
-      const refreshToken = parts[2];
-      if (!refreshToken) { skipped++; continue; }
-      items.push({
-        refreshToken,
-        clientId: parts[3],
-        clientSecret: parts[4],
-      });
-    }
-    return { items, skipped };
-  }
-  async function importFromCookie() {
-    const refreshToken = $('cookieRefreshToken').value.trim();
-    if (!refreshToken) return toastWarning(t('cookie.refreshTokenMissing'));
-    const provider = $('cookieProvider').value;
-    const payload = { refreshToken, accessToken: '', clientId: '', clientSecret: '', authMethod: 'social', provider };
-    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
-    const d = await res.json();
-    if (d.success) {
+  async function importKiroApiKey() {
+    const apiKey = $('apiKeyImportKeys').value.trim();
+    if (!apiKey) return toastWarning(t('apiKeyImport.keysMissing'));
+    const region = $('apiKeyImportRegion').value.trim() || 'us-east-1';
+    const btn = $('importApiKeyBtn');
+    if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
+    try {
+      const res = await api('/auth/api-key', { method: 'POST', body: JSON.stringify({ apiKey, region }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
       closeModal(); loadAccounts(); loadStats();
-      toastPrimary(t('cookie.importSuccess') + ': ' + (d.account?.email || d.account?.id));
-      autoRefreshNewAccount(d.account?.id);
-    } else toastError(t('common.failed') + ': ' + (d.error || ''));
-  }
-  async function importSsoToken() {
-    const res = await api('/auth/sso-token', {
-      method: 'POST', body: JSON.stringify({
-        bearerToken: $('ssoToken').value,
-        region: $('ssoRegion').value
-      })
-    });
-    const d = await res.json();
-    if (d.success) {
-      closeModal(); loadAccounts(); loadStats();
-      const count = d.accounts?.length || 0;
-      const errs = d.errors?.length || 0;
-      let msg = t('sso.importSuccess', count);
-      if (errs > 0) msg += t('sso.importPartial', errs);
+      const okCount = (d.accounts && d.accounts.length) || 0;
+      const failCount = (d.errors && d.errors.length) || 0;
+      let msg = t('apiKeyImport.success', okCount);
+      if (failCount > 0) msg += t('apiKeyImport.partial', failCount);
       toastPrimary(msg, { duration: 5200 });
-      if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
-    } else toastError(t('common.failed') + ': ' + (d.error || ''));
-  }
-  async function startBuilderIdLogin() {
-    const region = $('builderIdRegion').value || 'us-east-1';
-    const res = await api('/auth/builderid/start', { method: 'POST', body: JSON.stringify({ region }) });
-    const d = await res.json();
-    if (d.sessionId) {
-      builderIdSession = d.sessionId;
-      $('builderIdUserCode').textContent = d.userCode;
-      $('builderIdVerifyUrl').textContent = d.verificationUri;
-      $('builderIdStep1').classList.add('hidden');
-      $('builderIdStep2').classList.remove('hidden');
-      $('builderIdOpenBtn').addEventListener('click', () => window.open($('builderIdVerifyUrl').textContent, '_blank'));
-      $('builderIdCopyBtn').addEventListener('click', async () => {
-        await copyText($('builderIdVerifyUrl').textContent);
-        toast(t('common.copied'), 'primary');
-      });
-      $('builderIdCancelBtn').addEventListener('click', cancelBuilderIdLogin);
-      pollBuilderIdAuth(d.interval || 5);
-    } else toastError(t('common.failed') + ': ' + (d.error || ''));
-  }
-  function pollBuilderIdAuth(interval) {
-    builderIdPollTimer = setTimeout(async () => {
-      const res = await api('/auth/builderid/poll', { method: 'POST', body: JSON.stringify({ sessionId: builderIdSession }) });
-      const d = await res.json();
-      if (d.completed) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
-        autoRefreshNewAccount(d.account?.id);
-      } else if (d.success && !d.completed) {
-        $('builderIdStatus').textContent = t('builderid.waiting');
-        pollBuilderIdAuth(d.interval || interval);
-      } else {
-        toastError(t('common.failed') + ': ' + (d.error || ''));
-        cancelBuilderIdLogin();
-      }
-    }, interval * 1000);
-  }
-  function cancelBuilderIdLogin() {
-    if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
-    builderIdSession = '';
-    showModal('add');
-  }
-  async function startIamSso() {
-    if (iamSession) {
-      const res = await api('/auth/iam-sso/complete', {
-        method: 'POST', body: JSON.stringify({
-          sessionId: iamSession, callbackUrl: $('iamCallback').value
-        })
-      });
-      const d = await res.json();
-      if (d.success) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
-        autoRefreshNewAccount(d.account?.id);
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
-    } else {
-      const res = await api('/auth/iam-sso/start', {
-        method: 'POST', body: JSON.stringify({
-          startUrl: $('iamStartUrl').value, region: $('iamRegion').value
-        })
-      });
-      const d = await res.json();
-      if (d.authorizeUrl) {
-        iamSession = d.sessionId;
-        $('iamAuthUrl').textContent = d.authorizeUrl;
-        $('iamStep2').classList.remove('hidden');
-        $('iamBtn').textContent = t('iam.complete');
-        $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
-        $('iamCopyBtn').addEventListener('click', async () => {
-          await copyText($('iamAuthUrl').textContent);
-          toast(t('common.copied'), 'primary');
-        });
-      } else toastError(t('common.failed') + ': ' + (d.error || ''));
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
+      toastError((e && e.message) || t('common.failed'));
     }
   }
-  async function autoRefreshNewAccount(id) {
-    if (!id) return;
-    try { await api('/accounts/' + id + '/refresh', { method: 'POST' }); } catch (e) { }
-    loadAccounts();
+  // Manual IAM Identity Center (企业 SSO) OOB flow: fill 备注(用户名) + Start URL →
+  // backend auto-detects the portal region and returns an AWS authorize URL → user
+  // logs in and pastes the 127.0.0.1 callback URL → backend exchanges it for tokens
+  // and hydrates quota/subscription server-side.
+  async function startIamSso(state) {
+    const name = $('ssoName').value.trim();
+    const startUrl = $('ssoStartUrl').value.trim();
+    if (!name) return toastWarning(t('sso.nameMissing'));
+    if (!startUrl) return toastWarning(t('sso.startUrlMissing'));
+    const btn = $('ssoStartBtn');
+    if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
+    try {
+      const res = await api('/auth/iam-sso/start', { method: 'POST', body: JSON.stringify({ startUrl, name }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.sessionId) throw new Error(d.error || t('common.failed'));
+      state.sessionId = d.sessionId;
+      state.authUrl = d.authorizeUrl || '';
+      const urlField = $('ssoAuthUrl');
+      if (urlField) urlField.value = state.authUrl;
+      const step2 = $('ssoStep2');
+      if (step2) step2.classList.remove('hidden');
+      if (btn) btn.classList.add('hidden');
+      const cbtn = $('ssoCompleteBtn');
+      if (cbtn) cbtn.classList.remove('hidden');
+      if (state.authUrl) window.open(state.authUrl, '_blank', 'noopener');
+      toastPrimary(t('iam.completeLogin'), { duration: 6000 });
+    } catch (e) {
+      toastError((e && e.message) || t('common.failed'));
+    } finally {
+      if (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
+    }
+  }
+  async function completeIamSso(state) {
+    const callbackUrl = $('ssoCallback').value.trim();
+    if (!callbackUrl) return toastWarning(t('sso.callbackMissing'));
+    if (!state.sessionId) return toastWarning(t('sso.startUrlMissing'));
+    const btn = $('ssoCompleteBtn');
+    if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
+    try {
+      const res = await api('/auth/iam-sso/complete', { method: 'POST', body: JSON.stringify({ sessionId: state.sessionId, callbackUrl }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.success) throw new Error(d.error || t('common.failed'));
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('sso.importSuccess', 1), { duration: 5200 });
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
+      toastError((e && e.message) || t('common.failed'));
+    }
   }
 
   // Export modal
@@ -2537,13 +3489,12 @@
   }
   async function exportCopyJson() {
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
+    // Copy the complete KAM structure (same as Download / Show), not a stripped
+    // 4-field subset — so region / authMethod / startUrl are preserved for IdC
+    // and enterprise accounts.
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
-      const filtered = (data.accounts || []).map(a => {
-        const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
-        return { clientId, clientSecret, accessToken, refreshToken };
-      });
-      return JSON.stringify(filtered, null, 2);
+      return JSON.stringify(data, null, 2);
     });
     try {
       await copyText(jsonPromise);
@@ -2577,118 +3528,26 @@
       renderVersionBadge();
     } catch (e) { }
   }
-  function compareVersions(a, b) {
-    const pa = a.split('.').map(Number);
-    const pb = b.split('.').map(Number);
-    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-      const na = pa[i] || 0, nb = pb[i] || 0;
-      if (na > nb) return 1;
-      if (na < nb) return -1;
-    }
-    return 0;
-  }
-  function setUpdateButtonLoading(loading) {
-    const btn = $('checkUpdateBtn');
-    if (!btn) return;
-    btn.disabled = loading;
-    if (loading) btn.setAttribute('aria-busy', 'true');
-    else btn.removeAttribute('aria-busy');
-    const label = btn.querySelector('[data-update-label]');
-    const icon = btn.querySelector('i');
-    if (label) label.textContent = t(loading ? 'update.checking' : 'update.check');
-    if (icon) icon.classList.toggle('fa-spin', loading);
-  }
-  async function checkUpdate(manual) {
-    if (manual) setUpdateButtonLoading(true);
-    try {
-      if (!currentVersion) await loadVersion();
-      const current = currentVersion.replace(/^v/i, '');
-      if (!current) throw new Error('Current version missing');
-      const res = await fetch('https://raw.githubusercontent.com/Quorinex/Kiro-Go/main/version.json?t=' + Date.now());
-      if (!res.ok) throw new Error('Fetch failed');
-      const d = await res.json();
-      const latest = (d.version || '').replace(/^v/i, '');
-      if (!latest) throw new Error('Latest version missing');
-      if (latest && latest !== current && compareVersions(latest, current) > 0) {
-        if (manual) showUpdateModal(latest, d.download, d.changelog);
-        else showUpdateToast('available', current, latest);
-      } else if (manual) {
-        showUpdateToast('current', current, latest || current);
-      }
-    } catch (e) {
-      if (manual) showUpdateToast('error', '', '');
-    } finally {
-      if (manual) setUpdateButtonLoading(false);
-    }
-  }
-  function showUpdateToast(status, current, latest) {
-    if (status === 'available') {
-      toast(t('update.availableToast') + (latest ? ': ' + latest : ''), 'warning', {
-        icon: 'fa-solid fa-arrow-up',
-        duration: 5200,
-        onClick: function () { checkUpdate(true); }
-      });
-      return;
-    }
-    if (status === 'current') {
-      toast(t('update.noUpdatesToast'), 'success', {
-        icon: 'fa-solid fa-circle-check',
-        duration: 3600
-      });
-      return;
-    }
-    toast(t('update.checkFailed'), 'error', {
-      icon: 'fa-solid fa-triangle-exclamation',
-      duration: 4200
-    });
-  }
-  function showUpdateModal(version, url, changelog) {
-    const current = currentVersion.replace(/^v/i, '');
-    $('updateBody').innerHTML =
-      '<div class="update-shell">' +
-      '<div class="update-hero">' +
-      '<div class="update-result-icon update-result-info"><i class="fa-solid fa-arrow-up"></i></div>' +
-      '<div>' +
-      '<h3 class="update-hero-title">' + escapeHtml(t('update.newVersion')) + '</h3>' +
-      '<p class="update-hero-copy">' + escapeHtml(t('update.newVersionMessage')) + '</p>' +
-      '</div>' +
-      '</div>' +
-      '<div class="update-version-grid">' +
-      '<div class="update-version-card update-version-card-current"><p class="update-version-label">' + escapeHtml(t('update.current')) + '</p><p class="update-version-value update-version-value-current">' + escapeHtml(current) + '</p></div>' +
-      '<div class="update-version-card update-version-card-latest"><p class="update-version-label">' + escapeHtml(t('update.latest')) + '</p><p class="update-version-value update-version-value-success">' + escapeHtml(version) + '</p></div>' +
-      '</div>' +
-      (changelog ? '<div class="update-notes"><p class="update-notes-title">' + escapeHtml(t('update.changelog')) + '</p><p class="update-notes-body">' + escapeHtml(changelog) + '</p></div>' : '') +
-      '<div class="update-actions"><a href="' + escapeAttr(url) + '" target="_blank" rel="noopener" class="btn btn-primary">' + escapeHtml(t('update.goDownload')) + '</a></div>' +
-      '</div>';
-    openDialog('updateModal');
-  }
-  function showUpdateStatusModal(status, title, message, latest) {
-    const current = currentVersion.replace(/^v/i, '');
-    const isError = status === 'error';
-    $('updateBody').innerHTML =
-      '<div class="update-shell">' +
-      '<div class="text-center mb-5">' +
-      '<div class="update-result-icon update-status-icon update-result-' + (isError ? 'error' : 'success') + '">' +
-      '<i class="fa-solid ' + (isError ? 'fa-triangle-exclamation' : 'fa-circle-check') + '"></i>' +
-      '</div>' +
-      '<p class="text-base font-semibold ' + (isError ? 'danger-text' : 'success-text') + '">' + escapeHtml(title) + '</p>' +
-      '<p class="text-sm mt-2 muted-text">' + escapeHtml(message) + '</p>' +
-      '</div>' +
-      '<div class="update-version-grid">' +
-      '<div class="update-version-card update-version-card-current"><p class="update-version-label">' + escapeHtml(t('update.current')) + '</p><p class="update-version-value update-version-value-current">' + escapeHtml(current || '-') + '</p></div>' +
-      '<div class="update-version-card' + (!isError ? ' update-version-card-latest' : '') + '"><p class="update-version-label">' + escapeHtml(t('update.latest')) + '</p><p class="update-version-value' + (!isError ? ' update-version-value-success' : '') + '">' + escapeHtml(latest || '-') + '</p></div>' +
-      '</div>' +
-      '</div>';
-    openDialog('updateModal');
-  }
-  function closeUpdateModal() { closeDialog('updateModal'); }
-
   // Tabs
+  const KNOWN_TABS = ['overview', 'accounts', 'keys', 'settings', 'logs'];
   function switchTab(tab) {
+    if (KNOWN_TABS.indexOf(tab) === -1) tab = 'overview';
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
-    qsa('.tab-content').forEach(c => c.classList.add('hidden'));
-    $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    qsa('.tab-content').forEach(c => { c.classList.add('hidden'); c.classList.remove('ng-fade-in'); });
+    const panel = $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1));
+    if (panel) {
+      panel.classList.remove('hidden');
+      void panel.offsetWidth; // reflow so the fade-in animation retriggers
+      panel.classList.add('ng-fade-in');
+    }
+    try { localStorage.setItem('kiro_tab', tab); } catch (e) { }
+    currentTab = tab;
+    // Load the freshly-shown tab immediately; the 1s auto-refresh loop keeps it
+    // live afterwards (overview also samples the RPM/token trend each tick).
+    if (tab === 'overview') { ovAnimated = false; loadOverview(); }
+    if (tab === 'accounts') loadAccounts();
     if (tab === 'logs') loadLogs();
+    if (tab === 'keys') { loadApiKeys(); loadConcurrency(); }
   }
 
   // Event wiring
@@ -2712,9 +3571,6 @@
   }
 
   function bindShellEvents() {
-    const checkUpdateBtn = $('checkUpdateBtn');
-    if (checkUpdateBtn) checkUpdateBtn.addEventListener('click', () => checkUpdate(true));
-
     document.body.addEventListener('click', e => {
       if (!e.target.closest('.custom-select')) closeAllCustomSelects();
       const lb = e.target.closest('.lang-btn');
@@ -2743,19 +3599,19 @@
       }
     }));
 
-    // API View buttons
-    $('viewModelsBtn').addEventListener('click', showModelsView);
-    $('viewStatsBtn').addEventListener('click', showStatsView);
-    $('apiViewModalClose').addEventListener('click', closeApiViewModal);
-    bindDialogBackdropClose('apiViewModal', closeApiViewModal);
+    // Auto-refresh: run one immediate tick when the page regains focus so
+    // coming back feels instant (the 1s loop handles the steady state).
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) autoRefreshTick(); });
 
-    // Logs tab
-    const logsRefreshBtn = $('logsRefreshBtn');
-    if (logsRefreshBtn) logsRefreshBtn.addEventListener('click', loadLogs);
+    // API View modal (guarded: its triggers were removed with the API tab)
+    const vmb = $('viewModelsBtn'); if (vmb) vmb.addEventListener('click', showModelsView);
+    const vsb = $('viewStatsBtn'); if (vsb) vsb.addEventListener('click', showStatsView);
+    const avc = $('apiViewModalClose'); if (avc) avc.addEventListener('click', closeApiViewModal);
+    if ($('apiViewModal')) bindDialogBackdropClose('apiViewModal', closeApiViewModal);
+
+    // Logs tab (manual refresh + auto-refresh checkbox removed; always live)
     const logsClearBtn = $('logsClearBtn');
     if (logsClearBtn) logsClearBtn.addEventListener('click', clearLogs);
-    const logsAuto = $('logsAutoRefresh');
-    if (logsAuto) logsAuto.addEventListener('change', toggleLogsAutoRefresh);
     const logsFilterSel = $('logsFilterSelect');
     if (logsFilterSel) logsFilterSel.addEventListener('change', e => {
       logsFilter = e.target.value;
@@ -2764,12 +3620,6 @@
   }
 
   function bindAccountEvents() {
-    $('privacyModeToggle').addEventListener('change', e => {
-      privacyModeEnabled = e.target.checked;
-      localStorage.setItem('privacyMode', privacyModeEnabled);
-      renderAccounts();
-    });
-
     $('exportBtn').addEventListener('click', showExportModal);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
@@ -2784,6 +3634,8 @@
 
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
+    const accountsSortSel = $('accountsSortSelect');
+    if (accountsSortSel) accountsSortSel.addEventListener('change', e => { accountsSortBy = e.target.value; renderAccounts(); });
 
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
@@ -2807,14 +3659,10 @@
   }
 
   function bindSettingsEvents() {
-    $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
-    $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
-    $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
-    $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
   }
 
@@ -2845,19 +3693,15 @@
     $('detailModalClose').addEventListener('click', closeDetailModal);
     $('exportModalClose').addEventListener('click', closeExportModal);
     $('testModalClose').addEventListener('click', closeTestModal);
-    $('updateModalClose').addEventListener('click', closeUpdateModal);
     [
       ['addModal', closeModal],
       ['detailModal', closeDetailModal],
       ['exportModal', closeExportModal],
       ['testModal', closeTestModal],
-      ['updateModal', closeUpdateModal],
       ['confirmModal', () => closeConfirm(false)],
     ].forEach(([id, fn]) => bindDialogBackdropClose(id, fn));
 
     $('modalBody').addEventListener('click', e => {
-      const m = e.target.closest('[data-method]');
-      if (m) { showModal(m.dataset.method); return; }
       const g = e.target.closest('[data-modal-goto]');
       if (g) { showModal(g.dataset.modalGoto); return; }
       if (e.target.dataset.closeAdd) closeModal();
@@ -3134,9 +3978,6 @@
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
     if (password) tryAutoLogin();
-    setInterval(() => {
-      if (!$('mainPage').classList.contains('hidden')) loadStats();
-    }, 10000);
   }
 
   if (document.readyState === 'loading') {

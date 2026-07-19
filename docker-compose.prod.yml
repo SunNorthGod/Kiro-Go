@@ -1,0 +1,47 @@
+# NorthGod Kiro-Go 生产部署(与旧 Rust kiro2cc-proxy 并存,先不切流量)
+# 容器名/卷名加 kirogo- 前缀,避免与现有 kiro2cc-proxy / sub2api 冲突。
+# app 只映射到 127.0.0.1:18080(本机可访问,不对公网暴露),验证无误后再决定是否接入 Caddy 切流量。
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kirogo-postgres
+    environment:
+      POSTGRES_USER: kiro
+      POSTGRES_PASSWORD: kiro_pg_NG2026_x9f3q
+      POSTGRES_DB: kiro
+    volumes:
+      - kirogo-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kiro -d kiro"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  kirogo:
+    build: .
+    container_name: kirogo-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18080:8080"
+    environment:
+      DATABASE_URL: postgres://kiro:kiro_pg_NG2026_x9f3q@postgres:5432/kiro?sslmode=disable
+      ADMIN_PASSWORD: northgod2026
+      CONFIG_PATH: /app/data/config.json
+    volumes:
+      - ./data:/app/data
+    networks:
+      - default
+      - sub2api-network
+    restart: unless-stopped
+
+volumes:
+  kirogo-pgdata:
+
+networks:
+  # 复用现有共享网络,使 kiro2cc-caddy 能按容器名解析到 kirogo-app 做反代。
+  sub2api-network:
+    external: true
+    name: sub2api_sub2api-network

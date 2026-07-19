@@ -183,3 +183,38 @@ func PersistOverageSnapshot(accountID string, snap *OverageSnapshot) error {
 		snap.CheckedAt,
 	)
 }
+
+// maybeAutoEnableOverage turns the upstream Overages switch ON for a freshly
+// added, overage-capable account. It acts only while the account's OverageStatus
+// is still undetermined (""), so it triggers once per new account and never
+// re-flips a status an operator later set by hand. Best-effort: all failures are
+// logged and swallowed. Requires a valid token + resolvable profileArn, so it is
+// invoked from the post-add model-cache path.
+func (h *Handler) maybeAutoEnableOverage(account *config.Account) {
+	if account == nil || strings.TrimSpace(account.OverageStatus) != "" {
+		return
+	}
+	snap, err := FetchOverageStatus(account)
+	if err != nil {
+		logger.Warnf("[Overage] auto-check failed for %s: %v", account.Email, err)
+		return
+	}
+	// Persist whatever we learned so the ""-guard won't re-check next refresh.
+	if !strings.EqualFold(snap.Capability, "OVERAGE_CAPABLE") || strings.EqualFold(snap.Status, "ENABLED") {
+		_ = PersistOverageSnapshot(account.ID, snap)
+		account.OverageStatus = snap.Status
+		return
+	}
+	// Capable + currently off → enable it.
+	enabled, err := SetOverageStatus(account, true)
+	if err != nil {
+		logger.Warnf("[Overage] auto-enable failed for %s: %v", account.Email, err)
+		_ = PersistOverageSnapshot(account.ID, snap)
+		account.OverageStatus = snap.Status
+		return
+	}
+	_ = PersistOverageSnapshot(account.ID, enabled)
+	account.OverageStatus = enabled.Status
+	h.pool.Reload()
+	logger.Infof("[Overage] auto-enabled overage for capable account %s", account.Email)
+}

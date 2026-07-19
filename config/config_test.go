@@ -30,7 +30,10 @@ func TestUpdateSettingsPatchPreservesOmittedAPIKeyFields(t *testing.T) {
 	}
 }
 
-func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
+// Auth enforcement is mandatory now: even after explicitly requesting
+// requireApiKey=false, IsApiKeyRequired must stay true. The legacy apiKey field
+// can still be cleared independently.
+func TestAuthAlwaysRequiredEvenWhenPatchedOff(t *testing.T) {
 	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("init config: %v", err)
 	}
@@ -45,10 +48,10 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 	}
 
 	if got := GetApiKey(); got != "" {
-		t.Fatalf("expected API key to be cleared, got %q", got)
+		t.Fatalf("expected legacy API key to be cleared, got %q", got)
 	}
-	if IsApiKeyRequired() {
-		t.Fatalf("expected requireApiKey to be disabled")
+	if !IsApiKeyRequired() {
+		t.Fatalf("expected auth to remain required regardless of the patch")
 	}
 	if got := GetPassword(); got != "admin-password" {
 		t.Fatalf("expected password to be preserved, got %q", got)
@@ -125,5 +128,99 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		if _, ok := a["allowOverage"]; ok {
 			t.Fatalf("expected allowOverage to be omitted from persisted file, got %+v", a)
 		}
+	}
+}
+
+// TestAddOrReplaceAccountDedup verifies that (re-)adding an account with the same
+// identity refreshes it in place (stable ID, preserved CreatedAt) instead of
+// piling up duplicates, while genuinely different identities still append.
+func TestAddOrReplaceAccountDedup(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	// First insert: a fresh account keyed by UserId.
+	first := Account{
+		ID:           "id-first",
+		Email:        "alice@example.com",
+		UserId:       "user-alice",
+		RefreshToken: "refresh-v1",
+		AccessToken:  "access-v1",
+		AuthMethod:   "social",
+		Region:       "us-east-1",
+		Enabled:      true,
+		CreatedAt:    1000,
+	}
+	if err := AddOrReplaceAccount(&first); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	if got := len(GetAccounts()); got != 1 {
+		t.Fatalf("expected 1 account after first add, got %d", got)
+	}
+
+	// Re-import the SAME identity (same UserId) with rotated credentials and a
+	// different incoming ID: must update in place, not append.
+	reimport := Account{
+		ID:           "id-second-ignored",
+		Email:        "alice@example.com",
+		UserId:       "user-alice",
+		RefreshToken: "refresh-v2",
+		AccessToken:  "access-v2",
+		AuthMethod:   "social",
+		Region:       "us-east-1",
+		Enabled:      true,
+		CreatedAt:    2000,
+	}
+	if err := AddOrReplaceAccount(&reimport); err != nil {
+		t.Fatalf("re-import: %v", err)
+	}
+	accounts := GetAccounts()
+	if got := len(accounts); got != 1 {
+		t.Fatalf("expected re-import to dedupe to 1 account, got %d", got)
+	}
+	a := accounts[0]
+	if a.ID != "id-first" {
+		t.Fatalf("expected stable ID id-first after re-import, got %q", a.ID)
+	}
+	if a.RefreshToken != "refresh-v2" || a.AccessToken != "access-v2" {
+		t.Fatalf("expected credentials to be refreshed, got refresh=%q access=%q", a.RefreshToken, a.AccessToken)
+	}
+	if a.CreatedAt != 1000 {
+		t.Fatalf("expected original CreatedAt=1000 to be preserved, got %d", a.CreatedAt)
+	}
+	// The caller's struct should reflect the effective stored ID.
+	if reimport.ID != "id-first" {
+		t.Fatalf("expected reimport.ID rewritten to id-first, got %q", reimport.ID)
+	}
+
+	// A different identity must still append.
+	second := Account{
+		ID:           "id-bob",
+		Email:        "bob@example.com",
+		UserId:       "user-bob",
+		RefreshToken: "refresh-bob",
+		AuthMethod:   "social",
+		Enabled:      true,
+	}
+	if err := AddOrReplaceAccount(&second); err != nil {
+		t.Fatalf("add second: %v", err)
+	}
+	if got := len(GetAccounts()); got != 2 {
+		t.Fatalf("expected 2 accounts after distinct add, got %d", got)
+	}
+
+	// Dedup by Email when UserId is absent on the incoming record.
+	byEmail := Account{
+		ID:           "id-bob-nouser",
+		Email:        "bob@example.com",
+		RefreshToken: "refresh-bob-v2",
+		AuthMethod:   "social",
+		Enabled:      true,
+	}
+	if err := AddOrReplaceAccount(&byEmail); err != nil {
+		t.Fatalf("add byEmail: %v", err)
+	}
+	if got := len(GetAccounts()); got != 2 {
+		t.Fatalf("expected email dedupe to keep 2 accounts, got %d", got)
 	}
 }

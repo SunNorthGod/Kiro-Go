@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -48,9 +49,13 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 	if entry.Key == "" {
 		return ApiKeyEntry{}, errors.New("api key value must not be empty")
 	}
+	entry.Name = strings.TrimSpace(entry.Name)
 	for _, existing := range cfg.ApiKeys {
 		if existing.Key == entry.Key {
 			return ApiKeyEntry{}, errors.New("api key already exists")
+		}
+		if entry.Name != "" && strings.EqualFold(strings.TrimSpace(existing.Name), entry.Name) {
+			return ApiKeyEntry{}, errors.New("api key name already exists")
 		}
 	}
 	if entry.ID == "" {
@@ -60,7 +65,7 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 		entry.CreatedAt = time.Now().Unix()
 	}
 	cfg.ApiKeys = append(cfg.ApiKeys, entry)
-	if err := saveLocked(); err != nil {
+	if err := persistApiKeyLocked(entry); err != nil {
 		// Roll back the in-memory append so we don't leave inconsistent state.
 		cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
 		return ApiKeyEntry{}, err
@@ -91,7 +96,14 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 		return errors.New("api key not found")
 	}
 	if patch.Name != "" {
-		cfg.ApiKeys[idx].Name = patch.Name
+		newName := strings.TrimSpace(patch.Name)
+		// Reject a rename that collides (case-insensitively) with any other entry.
+		for j := range cfg.ApiKeys {
+			if j != idx && newName != "" && strings.EqualFold(strings.TrimSpace(cfg.ApiKeys[j].Name), newName) {
+				return errors.New("api key name already exists")
+			}
+		}
+		cfg.ApiKeys[idx].Name = newName
 	}
 	if patch.Key != "" {
 		newKey := strings.TrimSpace(patch.Key)
@@ -106,10 +118,17 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
+	// Card-key fields (always overwritten; caller builds patch from existing).
+	// CreditsGranted/CreditsUsed are ledger state — never set via UpdateApiKey
+	// (use RechargeApiKey / RecordApiKeyUsage / ResetApiKeyUsage).
+	cfg.ApiKeys[idx].ExpiresAt = patch.ExpiresAt
+	cfg.ApiKeys[idx].MaxConcurrency = patch.MaxConcurrency
+	cfg.ApiKeys[idx].BoundAccountIDs = patch.BoundAccountIDs
+	cfg.ApiKeys[idx].ParentKeyID = patch.ParentKeyID
 	if patch.Migrated {
 		cfg.ApiKeys[idx].Migrated = true
 	}
-	return saveLocked()
+	return persistApiKeyLocked(cfg.ApiKeys[idx])
 }
 
 // DeleteApiKey removes the API key entry with the given ID. Returns nil even if
@@ -123,7 +142,7 @@ func DeleteApiKey(id string) error {
 	for i, e := range cfg.ApiKeys {
 		if e.ID == id {
 			cfg.ApiKeys = append(cfg.ApiKeys[:i], cfg.ApiKeys[i+1:]...)
-			return saveLocked()
+			return persistApiKeyDeleteLocked(id)
 		}
 	}
 	return nil
@@ -138,7 +157,7 @@ func FindApiKeyByValue(key string) *ApiKeyEntry {
 		return nil
 	}
 	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].Key == key {
+		if subtle.ConstantTimeCompare([]byte(cfg.ApiKeys[i].Key), []byte(key)) == 1 {
 			cp := cfg.ApiKeys[i]
 			return &cp
 		}
@@ -156,28 +175,165 @@ func HasApiKeys() bool {
 	return len(cfg.ApiKeys) > 0
 }
 
-// RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, increments RequestsCount, and persists.
-func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+// RecordApiKeyUsage records one billable request against the key. It folds the
+// deltas into the in-memory mirror (TokensUsed += inputTokens+outputTokens,
+// CreditsUsed += credits, RequestsCount++, LastUsedAt = now) and persists.
+//
+// When the PostgreSQL backend is active the write goes through the authoritative
+// ledger + detail log (db.RecordUsageWithDetail → usage_counters + usage_records)
+// plus the per-key mirror (db.TouchAPIKeyUsage), carrying the model through for
+// per-model attribution. Otherwise it rewrites the JSON config.
+//
+// Negative token/credit deltas are clamped to zero so every ledger stays
+// monotonic.
+func RecordApiKeyUsage(id, model string, inputTokens, outputTokens int64, credits float64) error {
+	return recordApiKeyUsage(id, model, inputTokens, outputTokens, 0, 0, credits)
+}
+
+// RecordApiKeyUsageWithCache is RecordApiKeyUsage plus prompt-cache token
+// attribution (cache read / cache creation input tokens) for the DISPLAY-ONLY
+// detail log. Billing totals (usage_counters, credits, tokens) are unaffected —
+// only usage_records carries the cache columns, which the usage panels read to
+// compute cache hit rate. Negative deltas are clamped to zero.
+func RecordApiKeyUsageWithCache(id, model string, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int64, credits float64) error {
+	return recordApiKeyUsage(id, model, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, credits)
+}
+
+func recordApiKeyUsage(id, model string, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int64, credits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
+	// Clamp negative deltas up front so the in-memory mirror and the DB ledgers
+	// agree and neither can roll backward.
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	if cacheReadTokens < 0 {
+		cacheReadTokens = 0
+	}
+	if cacheCreationTokens < 0 {
+		cacheCreationTokens = 0
+	}
+	if credits < 0 {
+		credits = 0
+	}
+	totalTokens := inputTokens + outputTokens
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
-			if tokens > 0 {
-				cfg.ApiKeys[i].TokensUsed += tokens
+			if totalTokens > 0 {
+				cfg.ApiKeys[i].TokensUsed += totalTokens
 			}
 			if credits > 0 {
 				cfg.ApiKeys[i].CreditsUsed += credits
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
+			if dbEnabled {
+				// Hot path: fold into the authoritative monotonic ledger + detail
+				// log + per-key mirror directly (no full JSON rewrite).
+				return dbRecordApiKeyUsage(id, model, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, credits, cfg.ApiKeys[i].LastUsedAt)
+			}
 			return saveLocked()
 		}
 	}
 	return errors.New("api key not found")
+}
+
+// RechargeApiKey credits `amount` onto the key's unified ledger (CreditsGranted),
+// growing its spendable balance (CreditsGranted - CreditsUsed).
+//
+// When the PostgreSQL backend is active it delegates to db.RechargeAPIKey, which
+// atomically increments credits_granted and appends a recharge_records row, then
+// writes the returned running total back into the in-memory mirror. Otherwise it
+// bumps the in-memory CreditsGranted and persists the JSON config.
+//
+// amount must be strictly positive and the id must exist; both are errors.
+func RechargeApiKey(id string, amount float64, operator, note string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	if amount <= 0 {
+		return errors.New("recharge amount must be positive")
+	}
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].ID == id {
+			if dbEnabled {
+				balanceAfter, err := dbRechargeApiKey(id, amount, operator, note)
+				if err != nil {
+					return err
+				}
+				// balance_after is the authoritative post-recharge grant total.
+				cfg.ApiKeys[i].CreditsGranted = balanceAfter
+				return nil
+			}
+			cfg.ApiKeys[i].CreditsGranted += amount
+			return saveLocked()
+		}
+	}
+	return errors.New("api key not found")
+}
+
+// SetApiKeyGrant sets the key's total credit grant (CreditsGranted) to an
+// absolute value. This is the admin "set quota / 额度" operation, distinct from
+// RechargeApiKey which *adds* to the running grant. The card's displayed balance
+// and its quota enforcement (ApiKeyOverLimit) are both driven by CreditsGranted,
+// so this is how an operator dials a card's spendable ceiling up or down.
+//
+// It writes the credits_granted mirror through the normal full-row persist path
+// (DB upsert when Postgres is active, JSON otherwise). The recharge_records audit
+// trail is intentionally left untouched: a manual quota edit is not a top-up
+// event. Negative totals are clamped to zero. The id must exist.
+func SetApiKeyGrant(id string, total float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	if total < 0 {
+		total = 0
+	}
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].ID == id {
+			cfg.ApiKeys[i].CreditsGranted = total
+			return persistApiKeyLocked(cfg.ApiKeys[i])
+		}
+	}
+	return errors.New("api key not found")
+}
+
+// GetApiKeyBalanceByID returns the key's unified-ledger balance: granted
+// (CreditsGranted), used (CreditsUsed) and balance (granted - used). When the
+// PostgreSQL backend is active it reads the authoritative api_keys mirror via
+// db.GetKeyBalance; otherwise it computes from the in-memory entry. ok is false
+// when the id is unknown (or, in DB mode, when the read fails).
+func GetApiKeyBalanceByID(id string) (granted, used, balance float64, ok bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return 0, 0, 0, false
+	}
+	if dbEnabled {
+		g, u, b, err := dbGetApiKeyBalance(id)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		return g, u, b, true
+	}
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].ID == id {
+			g := cfg.ApiKeys[i].CreditsGranted
+			u := cfg.ApiKeys[i].CreditsUsed
+			return g, u, g - u, true
+		}
+	}
+	return 0, 0, 0, false
 }
 
 // ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
@@ -193,6 +349,9 @@ func ResetApiKeyUsage(id string) error {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
+			if dbEnabled {
+				return dbResetApiKeyUsage(id)
+			}
 			return saveLocked()
 		}
 	}
@@ -219,14 +378,38 @@ func MaskApiKey(key string) string {
 	return key[:6] + "****" + key[len(key)-4:]
 }
 
-// ApiKeyOverLimit returns (overToken, overCredit) for the entry. Limits with value 0
-// are ignored. The function does not lock; callers should pass a copied entry.
+// IsApiKeyExpired reports whether the key has a positive ExpiresAt that lies in
+// the past. Keys with ExpiresAt == 0 never expire. Does not lock; pass a copy.
+func IsApiKeyExpired(e ApiKeyEntry) bool {
+	return e.ExpiresAt > 0 && time.Now().Unix() > e.ExpiresAt
+}
+
+// ApiKeyOverLimit returns (overToken, overCredit) for the entry under the unified
+// balance model, staying backward compatible with the legacy fixed-limit fields.
+// Limits/grants with value 0 are ignored. The function does not lock; callers
+// should pass a copied entry.
+//
+// Token: over when TokenLimit > 0 && TokensUsed >= TokenLimit (unchanged).
+//
+// Credit (in priority order):
+//   - An expired key (see IsApiKeyExpired) is always reported over on credit, so
+//     it stops serving regardless of remaining balance.
+//   - Unified balance model: if CreditsGranted > 0, over when the balance is
+//     exhausted, i.e. CreditsUsed >= CreditsGranted.
+//   - Legacy fallback: else if CreditLimit > 0, over when CreditsUsed >= CreditLimit.
+//   - Otherwise (no grant, no limit, not expired): never over on credit.
 func ApiKeyOverLimit(e ApiKeyEntry) (overToken bool, overCredit bool) {
 	if e.TokenLimit > 0 && e.TokensUsed >= e.TokenLimit {
 		overToken = true
 	}
-	if e.CreditLimit > 0 && e.CreditsUsed >= e.CreditLimit {
+
+	switch {
+	case IsApiKeyExpired(e):
 		overCredit = true
+	case e.CreditsGranted > 0:
+		overCredit = e.CreditsUsed >= e.CreditsGranted
+	case e.CreditLimit > 0:
+		overCredit = e.CreditsUsed >= e.CreditLimit
 	}
 	return
 }

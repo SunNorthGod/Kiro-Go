@@ -302,13 +302,20 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	}
 
 	payload := OpenAIToKiro(req, false)
-	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 
-	if !strings.Contains(content, toolResultsContinuationPrefix) {
-		t.Fatalf("expected tool continuation prefix, got %q", content)
+	// Active tool turn (last assistant issued call_1, the current message answers
+	// it): the tool output rides the STRUCTURED ToolResults channel and Content is
+	// the minimal placeholder. It must NOT also be narrated into Content, which
+	// would duplicate the output in the context window (dedup contract).
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected one structured tool result, got %+v", cur.UserInputMessageContext)
 	}
-	if !strings.Contains(content, "result-1") {
-		t.Fatalf("expected tool result text in continuation content, got %q", content)
+	if got := cur.UserInputMessageContext.ToolResults[0].Content[0].Text; got != "result-1" {
+		t.Fatalf("expected tool result text in structured channel, got %q", got)
+	}
+	if strings.Contains(cur.Content, "result-1") {
+		t.Fatalf("tool result text must not be duplicated into Content, got %q", cur.Content)
 	}
 }
 
@@ -554,12 +561,17 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
+	// This is an ORPHAN tool_result: the only message, no preceding assistant
+	// tool_use. Kiro rejects a lone structured tool_result as "improperly formed",
+	// so it is NOT attached structurally (upstream-safety); the image — the payload
+	// that matters — is carried, and Content is a safe non-empty placeholder. Real
+	// clients always send the assistant tool_use turn first, which keeps the result
+	// structured (see TestClaudeToKiroKeepsActiveToolTurnStructured).
+	if strings.TrimSpace(cur.Content) == "" {
+		t.Fatalf("expected non-empty content alongside the carried image, got %q", cur.Content)
 	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) != 0 {
+		t.Fatalf("orphan tool_result must not be attached structurally (upstream 400 risk)")
 	}
 }
 
@@ -624,15 +636,18 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
+	// The completed tool cycle is flattened into a history text turn for
+	// compaction-safety (structured ToolResults are narrated into Content and the
+	// context is cleared), but the tool's image must ride along on that history
+	// entry — neither dropped nor leaked into the later user turn.
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}
 	if toolHistImages != 1 {
-		t.Fatalf("expected tool image carried on the flushed tool-result history entry, got %d", toolHistImages)
+		t.Fatalf("expected tool image carried on a history entry, got %d", toolHistImages)
 	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage

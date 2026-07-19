@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/pool"
 	"net/http"
 	"strings"
 	"time"
@@ -132,15 +133,26 @@ func (h *Handler) handleResponsesNonStream(
 	var lastErr error
 	reqStart := time.Now()
 
+	conversationID := payload.ConversationState.AgentContinuationId
+	bypassFairness := apiKeyID == ""
+	keyFloor := 0
+	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
+		keyFloor = e.MaxConcurrency
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		if aerr == pool.ErrTooBusy {
+			h.sendOpenAIError(w, 429, "rate_limit_exceeded", "Too many concurrent requests for this key; retry shortly")
+			return
+		}
+		if aerr != nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidToken(&account); err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 
@@ -166,11 +178,12 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroWithSelfHeal(&account, payload, callback)
 		if err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 
@@ -186,9 +199,10 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		releaseSlot()
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
@@ -317,15 +331,38 @@ func (h *Handler) handleResponsesStream(
 	responseStarted := false
 	reqStart := time.Now()
 
+	conversationID := payload.ConversationState.AgentContinuationId
+	bypassFairness := apiKeyID == ""
+	keyFloor := 0
+	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
+		keyFloor = e.MaxConcurrency
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		if aerr == pool.ErrTooBusy {
+			send("response.failed", map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id":     respID,
+					"status": "failed",
+					"error": map[string]string{
+						"type":    "rate_limit_exceeded",
+						"message": "Too many concurrent requests for this key; retry shortly",
+					},
+				},
+			})
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		if aerr != nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidToken(&account); err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 
@@ -470,14 +507,16 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroWithSelfHeal(&account, payload, callback)
 		if err != nil {
 			if !responseStarted {
+				releaseSlot()
 				lastErr = err
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
+				h.handleAccountFailure(&account, err)
 				continue
 			}
+			releaseSlot()
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
@@ -533,9 +572,10 @@ func (h *Handler) handleResponsesStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		releaseSlot()
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)

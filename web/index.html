@@ -4,9 +4,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kiro-Go</title>
-  <link rel="icon" type="image/x-icon" href="/admin/favicon.ico" />
+  <title>NorthGod Kiro-Go</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/admin/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="64x64" href="/admin/favicon-64.png" />
+  <link rel="icon" type="image/png" sizes="128x128" href="/admin/favicon-128.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/admin/favicon-180.png" />
   <script src="/admin/vendor/tailwindcss-browser/index.global.js"></script>
+  <script src="/admin/vendor/chartjs/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/admin/vendor/fontawesome/css/all.min.css" />
   <link rel="stylesheet" href="/admin/styles.css" id="__cssAsset" />
   <link rel="stylesheet" href="/admin/toast.css" id="__toastCss" />
@@ -20,6 +24,64 @@
       if (tcss) tcss.href = '/admin/toast.css?v=' + v;
     })();
   </script>
+  <style>
+    /* Component-level styles owned by index.html (never edit styles.css).
+       Everything below reuses design tokens so both themes stay in sync. */
+
+    /* Overview chart cards */
+    .ov-chart-card .card-header { margin-bottom: 0.85rem; }
+    .ov-chart-card .card-title-icon { color: var(--muted-foreground); margin-right: 0.45rem; font-size: 0.8125rem; }
+    /* ng-stat value doubling as an RPM badge */
+    .ng-stat-value.ng-rpm { font-size: 1.7rem; }
+    .ng-stat-value.ng-rpm .ng-rpm-dot { width: 9px; height: 9px; }
+    /* RPM figures are intentionally neutral: no green, no pulse. Safety net in
+       case the live-pulse class ever lands on an RPM badge. */
+    .ng-rpm-live .ng-rpm-dot { background: var(--muted-foreground); animation: none; }
+
+    /* Collapsible advanced settings */
+    details.ng-advanced { border: 0; background: transparent; padding: 0; }
+    details.ng-advanced > summary {
+      list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+      gap: 0.75rem; padding: 1rem 1.5rem; border: 1px solid var(--border); border-radius: var(--radius-lg);
+      background: var(--card); font-size: 0.9375rem; font-weight: 600; color: var(--foreground); user-select: none;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    details.ng-advanced > summary::-webkit-details-marker { display: none; }
+    details.ng-advanced > summary:hover { background: var(--muted); border-color: var(--border-focus); }
+    details.ng-advanced[open] > summary { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+    .ng-advanced-title { display: inline-flex; align-items: center; gap: 0.5rem; }
+    .ng-advanced-title i { color: var(--muted-foreground); font-size: 0.8125rem; }
+    .ng-advanced-chevron { transition: transform 0.18s ease; color: var(--muted-foreground); font-size: 0.8125rem; }
+    details.ng-advanced[open] .ng-advanced-chevron { transform: rotate(180deg); }
+    .ng-advanced-body { display: flex; flex-direction: column; gap: 1rem; padding-top: 1rem; }
+
+    /* Add-account single modal: method tabs */
+    .add-method-tabs { display: flex; flex-wrap: wrap; gap: 0.375rem; padding-bottom: 1rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); }
+    .add-method-tab {
+      appearance: none; border: 1px solid var(--border); background: var(--card); color: var(--muted-foreground);
+      font: inherit; font-size: 0.8125rem; font-weight: 500; padding: 0.4rem 0.75rem; border-radius: var(--radius-md);
+      cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+    .add-method-tab:hover { border-color: var(--border-focus); color: var(--foreground); }
+    .add-method-tab.active { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+
+    /* Keys: full key + one-click copy row */
+    .ng-key-copyrow { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.7rem; }
+    .ng-key-full {
+      flex: 1 1 12rem; min-width: 0; font-family: var(--font-mono); font-size: 0.75rem; color: var(--foreground);
+      background: var(--muted); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 0.34rem 0.5rem; overflow-x: auto; white-space: nowrap; scrollbar-width: thin;
+    }
+    /* Keys per-row RPM chip sits inline with meta */
+    .key-meta.ng-rpm { gap: 0.3rem; }
+
+    /* Selects inside ng-toolbar: the native <select> is visually hidden after
+       enhancement, so size the custom-select wrapper explicitly. */
+    .ng-toolbar > .custom-select { flex: 0 0 auto; width: 11rem; }
+    @media (max-width: 640px) {
+      .ng-toolbar > .custom-select { flex: 1 1 100%; width: 100%; }
+    }
+  </style>
 </head>
 
 <body>
@@ -41,9 +103,9 @@
     </div>
     <header class="login-topbar">
       <div class="login-topbar-inner">
-        <div class="brand" aria-label="Kiro-Go" data-i18n-aria-label="app.title">
-          <img class="brand-icon" src="/admin/favicon.ico" alt="" />
-          <span class="brand-text">Kiro-Go</span>
+        <div class="brand" aria-label="NorthGod Kiro-Go" data-i18n-aria-label="app.title">
+          <img class="brand-icon brand-logo" src="/admin/logo.png" alt="" />
+          <span class="brand-text">NorthGod Kiro-Go</span>
         </div>
         <div class="topbar-actions">
           <div class="lang-switch" id="loginLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
@@ -95,18 +157,20 @@
       <div class="app-header-inner">
         <div class="brand-wrap">
           <div class="brand">
-            <img class="brand-icon" src="/admin/favicon.ico" alt="" />
-            <span class="brand-text">Kiro-Go</span>
+            <img class="brand-icon brand-logo" src="/admin/logo.png" alt="" />
+            <span class="brand-text">NorthGod Kiro-Go</span>
           </div>
         </div>
         <nav class="header-nav" aria-label="" data-i18n-aria-label="aria.sections">
           <div class="tabs" id="tabBar">
-            <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
+            <button type="button" class="tab active" data-tab="overview"><i
+                class="fa-solid fa-gauge-high tab-icon"></i><span data-i18n="tabs.overview"></span></button>
+            <button type="button" class="tab" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
                 data-i18n="tabs.accounts"></span></button>
+            <button type="button" class="tab" data-tab="keys"><i class="fa-solid fa-ticket tab-icon"></i><span
+                data-i18n="tabs.keys"></span></button>
             <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
                 data-i18n="tabs.settings"></span></button>
-            <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
-                data-i18n="tabs.api"></span></button>
             <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
                 data-i18n="tabs.logs"></span></button>
           </div>
@@ -132,70 +196,43 @@
     </header>
 
     <div class="container">
-      <!-- Stats summary -->
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-card-title" data-i18n="stats.accounts"></div>
-          <div class="stat-body">
-            <div class="stat-main">
-              <div class="stat-value" id="statAccounts">0</div>
-              <div class="stat-sub">
-                <span class="stat-sub-sec"><span class="stat-value-sm" id="statCredits">0</span> <span
-                    class="stat-label" data-i18n="stats.credits"></span></span>
-              </div>
-            </div>
-            <i class="fa-solid fa-users stat-icon" aria-hidden="true"></i>
+      <!-- Overview tab -->
+      <div id="tabOverview" class="tab-content">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fa-solid fa-gauge-high card-title-icon"></i><span
+                data-i18n="overview.title"></span></span>
+          </div>
+          <div id="ovStatGrid" class="ov-sections"></div>
+        </div>
+
+        <div class="ng-grid ng-grid-2">
+          <div class="card ov-chart-card">
+            <div class="card-header"><span class="card-title"><i class="fa-solid fa-wave-square card-title-icon"></i><span
+                  data-i18n="overview.rpmTrend"></span></span></div>
+            <div class="ng-chart"><canvas id="ovRpmChart"></canvas></div>
+          </div>
+          <div class="card ov-chart-card">
+            <div class="card-header"><span class="card-title"><i class="fa-solid fa-chart-line card-title-icon"></i><span
+                  data-i18n="overview.tokenTrend"></span></span></div>
+            <div class="ng-chart"><canvas id="ovTokenChart"></canvas></div>
           </div>
         </div>
-        <div class="stat-card">
-          <div class="stat-card-title" data-i18n="stats.requests"></div>
-          <div class="stat-body">
-            <div class="stat-main">
-              <div class="stat-value" id="statRequests">0</div>
-              <div class="stat-sub">
-                <span class="stat-sub-sec"><span class="stat-value-sm" id="statTokens">0</span> <span class="stat-label"
-                    data-i18n="stats.tokens"></span></span>
-              </div>
-            </div>
-            <i class="fa-solid fa-route stat-icon" aria-hidden="true"></i>
-          </div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-card-title" data-i18n="stats.success"></div>
-          <div class="stat-body">
-            <div class="stat-main">
-              <div class="stat-value" id="statSuccess">0</div>
-              <div class="stat-sub"><span class="stat-label" data-i18n="stats.completed"></span></div>
-            </div>
-            <i class="fa-solid fa-circle-check stat-icon" aria-hidden="true"></i>
-          </div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-card-title" data-i18n="stats.failed"></div>
-          <div class="stat-body">
-            <div class="stat-main">
-              <div class="stat-value stat-value--danger" id="statFailed">0</div>
-              <div class="stat-sub">
-                <span class="stat-label" data-i18n="stats.errors"></span>
-              </div>
-            </div>
-            <i class="fa-solid fa-circle-xmark stat-icon stat-icon--danger" aria-hidden="true"></i>
-          </div>
+
+        <div class="card ov-daily-card">
+          <div class="card-header"><span class="card-title"><i class="fa-solid fa-table-list card-title-icon"></i><span
+                data-i18n="overview.dailyTable"></span></span></div>
+          <div id="ovDailyTable" class="ov-daily-table"></div>
         </div>
       </div>
 
       <!-- Accounts tab -->
-      <div id="tabAccounts" class="tab-content">
+      <div id="tabAccounts" class="tab-content hidden">
+        <div class="ng-grid" id="accountsStats"></div>
         <div class="card">
           <div class="card-header">
             <span class="card-title" data-i18n="accounts.title"></span>
             <div class="card-actions">
-              <label class="flex items-center gap-2 cursor-pointer select-none" title=""
-                data-i18n-title="privacy.tooltip">
-                <span class="text-xs font-medium" data-i18n="privacy.label"></span>
-                <span class="switch"><input type="checkbox" id="privacyModeToggle" checked /><span
-                    class="slider"></span></span>
-              </label>
               <button class="btn btn-outline btn-sm" id="exportBtn"><i class="fa-solid fa-file-export"
                   aria-hidden="true"></i><span class="btn-text" data-i18n="accounts.export"></span></button>
               <button class="btn btn-outline btn-sm" id="refreshAllModelsBtn"><i class="fa-solid fa-arrows-rotate"
@@ -219,110 +256,76 @@
                 data-i18n="batch.refreshModels"></button>
               <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>
             </div>
-            <div class="toolbar-spacer"></div>
-            <input type="text" id="filterSearch" class="w-56!" data-i18n-placeholder="filter.search" />
-            <select id="filterStatusSelect" class="w-32!" data-i18n-aria-label="filter.status">
-              <option value="all" data-i18n="filter.all"></option>
-              <option value="enabled" data-i18n="filter.enabled"></option>
-              <option value="disabled" data-i18n="filter.disabled"></option>
-              <option value="banned" data-i18n="filter.banned"></option>
-            </select>
           </div>
 
-          <div id="accountsList"></div>
+          <div class="ng-toolbar ng-filter-toolbar">
+            <input type="text" id="filterSearch" class="ng-toolbar-grow" data-i18n-placeholder="filter.search" />
+            <div class="ng-field">
+              <span class="ng-field-label"><i class="fa-solid fa-filter" aria-hidden="true"></i><span
+                  data-i18n="filter.status"></span></span>
+              <select id="filterStatusSelect" data-i18n-aria-label="filter.status">
+                <option value="all" data-i18n="filter.all"></option>
+                <option value="enabled" data-i18n="filter.enabled"></option>
+                <option value="disabled" data-i18n="filter.disabled"></option>
+                <option value="banned" data-i18n="filter.banned"></option>
+              </select>
+            </div>
+            <div class="ng-field">
+              <span class="ng-field-label"><i class="fa-solid fa-arrow-down-wide-short" aria-hidden="true"></i><span
+                  data-i18n="accounts.sortLabel"></span></span>
+              <select id="accountsSortSelect" data-i18n-aria-label="accounts.sortLabel">
+                <option value="priority" data-i18n="accounts.sortPriority"></option>
+                <option value="rpm" data-i18n="accounts.sortRpm"></option>
+                <option value="usage" data-i18n="accounts.sortUsage"></option>
+              </select>
+            </div>
+          </div>
+
+          <div id="accountsList" class="ng-list"></div>
+        </div>
+      </div>
+
+      <!-- Keys (card billing) tab -->
+      <div id="tabKeys" class="tab-content hidden">
+        <div class="ng-grid" id="keysStats"></div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="keys.title"></span>
+            <div class="card-actions">
+              <button class="btn btn-primary btn-sm" id="keysAddBtn"><i class="fa-solid fa-plus"
+                  aria-hidden="true"></i><span class="btn-text" data-i18n="keys.add"></span></button>
+            </div>
+          </div>
+          <p class="card-subtitle" data-i18n="keys.subtitle"></p>
+          <div class="ng-toolbar keys-toolbar ng-filter-toolbar">
+            <input type="text" id="keysSearch" class="ng-toolbar-grow" data-i18n-placeholder="keys.search" />
+            <div class="ng-field">
+              <span class="ng-field-label"><i class="fa-solid fa-filter" aria-hidden="true"></i><span
+                  data-i18n="keys.filterLabel"></span></span>
+              <select id="keysFilterSelect" data-i18n-aria-label="keys.filterAll">
+                <option value="all" data-i18n="keys.filterAll"></option>
+                <option value="active" data-i18n="keys.filterActive"></option>
+                <option value="disabled" data-i18n="keys.filterDisabled"></option>
+                <option value="expired" data-i18n="keys.filterExpired"></option>
+                <option value="sub" data-i18n="keys.filterSub"></option>
+              </select>
+            </div>
+            <div class="ng-field">
+              <span class="ng-field-label"><i class="fa-solid fa-arrow-down-wide-short" aria-hidden="true"></i><span
+                  data-i18n="keys.sortLabel"></span></span>
+              <select id="keysSortSelect" data-i18n-aria-label="keys.sortLabel">
+                <option value="balance" data-i18n="keys.sortBalance"></option>
+                <option value="rpm" data-i18n="keys.sortRpm"></option>
+                <option value="createdDesc" data-i18n="keys.sortCreatedDesc"></option>
+              </select>
+            </div>
+          </div>
+          <div id="keysList" class="ng-list"></div>
         </div>
       </div>
 
       <!-- Settings tab -->
       <div id="tabSettings" class="tab-content hidden">
-        <!-- API settings -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.apiSettings"></span></div>
-          <div class="form-group">
-            <label class="flex items-center gap-2">
-              <span class="switch"><input type="checkbox" id="requireApiKey" /><span class="slider"></span></span>
-              <span data-i18n="settings.enableApiKey"></span>
-            </label>
-            <small data-i18n="apiKeys.requireHint"></small>
-          </div>
-          <button class="btn btn-primary btn-sm" id="saveRequireApiKeyBtn" data-i18n="settings.saveApiKey"></button>
-
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="apiKeys.listTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addApiKeyBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="apiKeys.add"></span>
-              </button>
-            </div>
-            <small data-i18n="apiKeys.listHint"></small>
-          </div>
-          <div id="apiKeysList"></div>
-        </div>
-
-        <!-- Usage settings -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.usageSettings"></span></div>
-          <div class="form-group">
-            <label class="flex items-center gap-2">
-              <span class="switch"><input type="checkbox" id="allowOverUsage" /><span class="slider"></span></span>
-              <span data-i18n="settings.allowOverUsage"></span>
-            </label>
-            <small data-i18n="settings.allowOverUsageHint"></small>
-          </div>
-          <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
-        </div>
-
-        <!-- Thinking settings -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
-          <div class="form-group">
-            <label data-i18n="settings.thinkingSuffix"></label>
-            <input type="text" id="thinkingSuffix" placeholder="-thinking" />
-            <small data-i18n="settings.thinkingSuffixHint"></small>
-          </div>
-          <div class="form-group">
-            <label data-i18n="settings.openaiFormat"></label>
-            <select id="openaiThinkingFormat">
-              <option value="reasoning_content" data-i18n="settings.formatReasoningContent"></option>
-              <option value="thinking" data-i18n="settings.formatThinkingClaude"></option>
-              <option value="think" data-i18n="settings.formatThinkOpenAI"></option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label data-i18n="settings.claudeFormat"></label>
-            <select id="claudeThinkingFormat">
-              <option value="thinking" data-i18n="settings.formatThinkingClaude"></option>
-              <option value="think" data-i18n="settings.formatThinkOpenAI"></option>
-            </select>
-          </div>
-          <button class="btn btn-primary" id="saveThinkingBtn" data-i18n="settings.saveThinking"></button>
-        </div>
-
-        <!-- Endpoint settings -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.endpointSettings"></span></div>
-          <div class="form-group">
-            <label data-i18n="settings.preferredEndpoint"></label>
-            <select id="preferredEndpoint">
-              <option value="auto" data-i18n="settings.endpointAuto"></option>
-              <option value="kiro" data-i18n="settings.endpointKiro"></option>
-              <option value="codewhisperer" data-i18n="settings.endpointCodeWhisperer"></option>
-              <option value="amazonq" data-i18n="settings.endpointAmazonQ"></option>
-            </select>
-            <small data-i18n="settings.endpointHint"></small>
-          </div>
-          <div class="form-group">
-            <label class="flex items-center gap-2">
-              <span class="switch"><input type="checkbox" id="endpointFallback" checked /><span
-                  class="slider"></span></span>
-              <span data-i18n="settings.endpointFallback"></span>
-            </label>
-            <small data-i18n="settings.endpointFallbackHint"></small>
-          </div>
-          <button class="btn btn-primary" id="saveEndpointBtn" data-i18n="settings.saveEndpoint"></button>
-        </div>
-
         <!-- Admin password -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.adminPassword"></span></div>
@@ -365,11 +368,43 @@
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
         </div>
 
-        <!-- Prompt filter -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.promptFilter"></span></div>
-          <div class="form-group">
-            <label class="font-semibold pb-2 block" data-i18n="settings.builtinFilters"></label>
+        <!-- Advanced settings (collapsed) -->
+        <details class="ng-advanced" id="advancedSettings">
+          <summary>
+            <span class="ng-advanced-title"><i class="fa-solid fa-gears"></i><span
+                data-i18n="settings.advanced"></span></span>
+            <i class="fa-solid fa-chevron-down ng-advanced-chevron" aria-hidden="true"></i>
+          </summary>
+          <div class="ng-advanced-body">
+            <!-- Endpoint settings -->
+            <div class="card">
+              <div class="card-header"><span class="card-title" data-i18n="settings.endpointSettings"></span></div>
+              <div class="form-group">
+                <label data-i18n="settings.preferredEndpoint"></label>
+                <select id="preferredEndpoint">
+                  <option value="auto" data-i18n="settings.endpointAuto"></option>
+                  <option value="kiro" data-i18n="settings.endpointKiro"></option>
+                  <option value="codewhisperer" data-i18n="settings.endpointCodeWhisperer"></option>
+                  <option value="amazonq" data-i18n="settings.endpointAmazonQ"></option>
+                </select>
+                <small data-i18n="settings.endpointHint"></small>
+              </div>
+              <div class="form-group">
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="endpointFallback" checked /><span
+                      class="slider"></span></span>
+                  <span data-i18n="settings.endpointFallback"></span>
+                </label>
+                <small data-i18n="settings.endpointFallbackHint"></small>
+              </div>
+              <button class="btn btn-primary" id="saveEndpointBtn" data-i18n="settings.saveEndpoint"></button>
+            </div>
+
+            <!-- Prompt filter -->
+            <div class="card">
+              <div class="card-header"><span class="card-title" data-i18n="settings.promptFilter"></span></div>
+              <div class="form-group">
+                <label class="font-semibold pb-2 block" data-i18n="settings.builtinFilters"></label>
             <div class="flex flex-col gap-3">
               <div>
                 <label class="flex items-center gap-2">
@@ -407,90 +442,9 @@
                 data-i18n="settings.savePromptFilter"></button>
             </div>
           </div>
-        </div>
-
-        <!-- Statistics reset -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
-          <button class="btn btn-danger" id="resetStatsBtn" data-i18n="settings.resetStats"></button>
-        </div>
-      </div>
-
-      <!-- API tab -->
-      <div id="tabApi" class="tab-content hidden">
-        <section class="api-card" aria-labelledby="apiEndpointsTitle">
-          <div class="card-header api-card-header">
-            <span class="card-title" id="apiEndpointsTitle" data-i18n="api.endpoints"></span>
-            <span class="api-pill" data-i18n="api.protocolHttp"></span>
+            </div>
           </div>
-          <div class="api-endpoint-list">
-            <section class="api-endpoint-item">
-              <div class="api-endpoint-meta">
-                <span class="api-endpoint-icon"><i class="fa-solid fa-message"></i></span>
-                <div>
-                  <p class="api-endpoint-title" data-i18n="api.claude"></p>
-                  <p class="api-endpoint-method" data-i18n="api.methodPost"></p>
-                </div>
-              </div>
-              <div class="endpoint api-code-row"><span class="api-code" id="claudeEndpoint"></span><button
-                  class="api-copy-btn" type="button" data-copy="claudeEndpoint" aria-label=""
-                  data-i18n-aria-label="api.copyClaude"><i class="fa-regular fa-copy"></i></button></div>
-            </section>
-            <section class="api-endpoint-item">
-              <div class="api-endpoint-meta">
-                <span class="api-endpoint-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></span>
-                <div>
-                  <p class="api-endpoint-title" data-i18n="api.openai"></p>
-                  <p class="api-endpoint-method" data-i18n="api.methodPost"></p>
-                </div>
-              </div>
-              <div class="endpoint api-code-row"><span class="api-code" id="openaiEndpoint"></span><button
-                  class="api-copy-btn" type="button" data-copy="openaiEndpoint" aria-label=""
-                  data-i18n-aria-label="api.copyOpenAI"><i class="fa-regular fa-copy"></i></button></div>
-            </section>
-            <section class="api-endpoint-item">
-              <div class="api-endpoint-meta">
-                <span class="api-endpoint-icon"><i class="fa-solid fa-comments"></i></span>
-                <div>
-                  <p class="api-endpoint-title" data-i18n="api.openaiResponses"></p>
-                  <p class="api-endpoint-method" data-i18n="api.methodPost"></p>
-                </div>
-              </div>
-              <div class="endpoint api-code-row"><span class="api-code" id="openaiResponsesEndpoint"></span><button
-                  class="api-copy-btn" type="button" data-copy="openaiResponsesEndpoint" aria-label=""
-                  data-i18n-aria-label="api.copyOpenAIResponses"><i class="fa-regular fa-copy"></i></button></div>
-            </section>
-            <section class="api-endpoint-item">
-              <div class="api-endpoint-meta">
-                <span class="api-endpoint-icon"><i class="fa-solid fa-layer-group"></i></span>
-                <div>
-                  <p class="api-endpoint-title" data-i18n="api.modelList"></p>
-                  <p class="api-endpoint-method" data-i18n="api.methodGet"></p>
-                </div>
-              </div>
-              <div class="endpoint api-code-row"><span class="api-code" id="modelsEndpoint"></span><button
-                  class="api-view-btn" type="button" id="viewModelsBtn" aria-label=""
-                  data-i18n-aria-label="api.viewModels"><i class="fa-solid fa-eye"></i></button><button
-                  class="api-copy-btn" type="button" data-copy="modelsEndpoint" aria-label=""
-                  data-i18n-aria-label="api.copyModels"><i class="fa-regular fa-copy"></i></button></div>
-            </section>
-            <section class="api-endpoint-item">
-              <div class="api-endpoint-meta">
-                <span class="api-endpoint-icon"><i class="fa-solid fa-chart-simple"></i></span>
-                <div>
-                  <p class="api-endpoint-title" data-i18n="api.stats"></p>
-                  <p class="api-endpoint-method" data-i18n="api.methodGet"></p>
-                </div>
-              </div>
-              <div class="endpoint api-code-row"><span class="api-code" id="statsEndpoint"></span><button
-                  class="api-view-btn" type="button" id="viewStatsBtn" aria-label=""
-                  data-i18n-aria-label="api.viewStats"><i class="fa-solid fa-eye"></i></button><button
-                  class="api-copy-btn" type="button" data-copy="statsEndpoint" aria-label=""
-                  data-i18n-aria-label="api.copyStats"><i class="fa-regular fa-copy"></i></button></div>
-            </section>
-          </div>
-          <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.statsHint"></span></p>
-        </section>
+        </details>
       </div>
 
       <!-- Logs tab -->
@@ -498,14 +452,12 @@
         <div class="card">
           <div class="card-header logs-header">
             <span class="card-title" data-i18n="logs.title"></span>
-            <div class="logs-actions">
+            <div class="ng-toolbar logs-actions">
               <select id="logsFilterSelect" class="w-40!" data-i18n-aria-label="logs.filter">
                 <option value="all" data-i18n="logs.filterAll"></option>
                 <option value="success" data-i18n="logs.filterSuccess"></option>
                 <option value="error" data-i18n="logs.filterError"></option>
               </select>
-              <button class="btn btn-outline btn-sm" id="logsRefreshBtn"><i class="fa-solid fa-rotate"></i><span class="btn-text" data-i18n="logs.refresh"></span></button>
-              <label class="logs-auto-toggle"><input type="checkbox" id="logsAutoRefresh" /> <span data-i18n="logs.autoRefresh"></span></label>
               <button class="btn btn-danger btn-sm" id="logsClearBtn"><i class="fa-solid fa-trash"></i><span class="btn-text" data-i18n="logs.clear"></span></button>
             </div>
           </div>
@@ -522,10 +474,10 @@
       <div class="app-footer-inner">
         <div class="footer-panel">
           <div class="footer-identity">
-            <img class="footer-icon" src="/admin/favicon.ico" alt="" />
+            <img class="footer-icon footer-logo" src="/admin/logo.png" alt="" />
             <div class="footer-copy">
               <div class="footer-title-row">
-                <span class="footer-title">Kiro-Go</span>
+                <span class="footer-title">NorthGod Kiro-Go</span>
                 <span class="footer-version" id="versionBadge" aria-label=""
                   data-i18n-aria-label="aria.currentVersion"></span>
                 <span class="footer-version-status" id="statusBadge" data-i18n-title="status.running" title="">
@@ -537,19 +489,15 @@
           </div>
           <div class="footer-actions">
             <nav class="footer-links" aria-label="" data-i18n-aria-label="aria.resources">
-              <button class="footer-link" id="checkUpdateBtn" type="button">
-                <i class="fa-solid fa-rotate" aria-hidden="true"></i>
-                <span data-i18n="update.check" data-update-label></span>
-              </button>
-              <a class="footer-link" href="https://github.com/Quorinex/Kiro-Go" target="_blank" rel="noopener">
-                <i class="fa-brands fa-github" aria-hidden="true"></i>
-                <span data-i18n="footer.github"></span>
+              <a class="footer-link" href="/user" target="_blank" rel="noopener">
+                <i class="fa-solid fa-user" aria-hidden="true"></i>
+                <span data-i18n="footer.userPortal"></span>
               </a>
             </nav>
           </div>
         </div>
         <div class="footer-meta">
-          <span>© <span id="footerYear"></span> Kiro-Go</span>
+          <span>© <span id="footerYear"></span> NorthGod Kiro-Go</span>
         </div>
       </div>
     </footer>
@@ -585,13 +533,6 @@
       <div class="modal-body" id="testBody"></div>
     </div>
   </div>
-  <div id="updateModal" class="modal">
-    <div class="modal-content">
-      <div class="modal-header"><span class="modal-title" data-i18n="update.title"></span><button class="modal-close"
-          id="updateModalClose" type="button" aria-label="" data-i18n-aria-label="common.close">&times;</button></div>
-      <div class="modal-body" id="updateBody"></div>
-    </div>
-  </div>
   <div id="confirmModal" class="modal">
     <div class="modal-content confirm-modal-content">
       <div class="modal-header"><span class="modal-title" id="confirmTitle"></span><button class="modal-close"
@@ -614,6 +555,7 @@
           data-i18n-aria-label="common.close">&times;</button>
       </div>
       <div class="modal-body">
+        <div class="form-section-title" data-i18n="apiKeys.sectionBasic"></div>
         <div class="form-group">
           <label data-i18n="apiKeys.formName"></label>
           <input type="text" id="apiKeyForm_name" data-i18n-placeholder="apiKeys.formNamePlaceholder" />
@@ -628,16 +570,48 @@
             <span data-i18n="apiKeys.formEnabled"></span>
           </label>
         </div>
+
+        <div class="form-section-title" data-i18n="apiKeys.sectionBilling"></div>
+        <div class="form-grid-2">
+          <div class="form-group">
+            <label data-i18n="apiKeys.limitCredits"></label>
+            <input type="number" id="apiKeyForm_creditLimit" min="0" step="0.01" value="0" />
+            <small data-i18n="apiKeys.limitHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="apiKeys.limitTokens"></label>
+            <input type="number" id="apiKeyForm_tokenLimit" min="0" step="1" value="0" />
+            <small data-i18n="apiKeys.limitHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="apiKeys.formMaxConcurrency"></label>
+            <select id="apiKeyForm_maxConcurrencyMode">
+              <option value="0" data-i18n="apiKeys.concurrencyModeDefault"></option>
+              <option value="custom" data-i18n="apiKeys.concurrencyModeCustom"></option>
+              <option value="-1" data-i18n="apiKeys.concurrencyModeUnlimited"></option>
+            </select>
+            <input type="number" id="apiKeyForm_maxConcurrency" min="1" step="1" value="0" class="hidden mt-2" />
+            <small data-i18n="apiKeys.formMaxConcurrencyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="apiKeys.formExpiresAt"></label>
+            <input type="datetime-local" id="apiKeyForm_expiresAt" />
+            <small data-i18n="apiKeys.formExpiresAtHint"></small>
+          </div>
+        </div>
+
+        <div class="form-section-title" data-i18n="apiKeys.sectionBinding"></div>
         <div class="form-group">
-          <label data-i18n="apiKeys.limitTokens"></label>
-          <input type="number" id="apiKeyForm_tokenLimit" min="0" step="1" value="0" />
-          <small data-i18n="apiKeys.limitHint"></small>
+          <label data-i18n="apiKeys.formParentKey"></label>
+          <select id="apiKeyForm_parentKey"></select>
+          <small data-i18n="apiKeys.formParentKeyHint"></small>
         </div>
         <div class="form-group">
-          <label data-i18n="apiKeys.limitCredits"></label>
-          <input type="number" id="apiKeyForm_creditLimit" min="0" step="0.01" value="0" />
-          <small data-i18n="apiKeys.limitHint"></small>
+          <label data-i18n="apiKeys.formBoundAccounts"></label>
+          <div id="apiKeyForm_boundAccounts" class="bound-accounts-list"></div>
+          <small data-i18n="apiKeys.formBoundAccountsHint"></small>
         </div>
+
         <div class="modal-footer">
           <button class="btn btn-secondary" id="apiKeyModalCancelBtn" type="button" data-i18n="apiKeys.cancelBtn"></button>
           <button class="btn btn-primary" id="apiKeyModalSaveBtn" type="button" data-i18n="apiKeys.saveBtn"></button>
@@ -646,22 +620,52 @@
     </div>
   </div>
 
-  <div id="apiKeyShowModal" class="modal">
-    <div class="modal-content">
+  <!-- Top-up modal -->
+  <div id="topupModal" class="modal">
+    <div class="modal-content confirm-modal-content">
       <div class="modal-header">
-        <span class="modal-title" data-i18n="apiKeys.showTitle"></span>
-        <button class="modal-close" id="apiKeyShowClose" type="button" aria-label=""
+        <span class="modal-title" data-i18n="topup.title"></span>
+        <button class="modal-close" id="topupModalClose" type="button" aria-label=""
           data-i18n-aria-label="common.close">&times;</button>
       </div>
       <div class="modal-body">
-        <p class="confirm-message" data-i18n="apiKeys.showWarning"></p>
+        <div class="topup-card-label">
+          <span class="text-xs muted-text" data-i18n="topup.card"></span>
+          <span class="font-semibold" id="topupCardName"></span>
+        </div>
         <div class="form-group">
-          <input type="text" id="apiKeyShowValue" readonly />
+          <label data-i18n="topup.amount"></label>
+          <input type="number" id="topupAmount" min="0" step="0.01" data-i18n-placeholder="topup.amountPlaceholder" />
+        </div>
+        <div class="form-group">
+          <label data-i18n="topup.note"></label>
+          <input type="text" id="topupNote" data-i18n-placeholder="topup.notePlaceholder" />
         </div>
         <div class="modal-footer">
-          <button class="btn btn-outline" id="apiKeyShowCopyBtn" type="button" data-i18n="apiKeys.copyBtn"></button>
-          <button class="btn btn-primary" id="apiKeyShowCloseBtn" type="button" data-i18n="apiKeys.closeBtn"></button>
+          <button class="btn btn-secondary" id="topupCancelBtn" type="button" data-i18n="common.cancel"></button>
+          <button class="btn btn-primary" id="topupSubmitBtn" type="button" data-i18n="topup.submit"></button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Card detail modal -->
+  <div id="keyDetailModal" class="modal">
+    <div class="modal-content key-detail-modal-content">
+      <div class="modal-header">
+        <span class="modal-title"><span data-i18n="keyDetail.title"></span><span class="key-detail-name"
+            id="keyDetailName"></span></span>
+        <button class="modal-close" id="keyDetailModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="key-detail-subtabs" id="keyDetailSubtabs" role="tablist">
+          <button type="button" class="key-subtab active" data-subtab="summary" data-i18n="keyDetail.tabSummary"></button>
+          <button type="button" class="key-subtab" data-subtab="recharges" data-i18n="keyDetail.tabRecharges"></button>
+          <button type="button" class="key-subtab" data-subtab="usage" data-i18n="keyDetail.tabUsage"></button>
+          <button type="button" class="key-subtab" data-subtab="children" data-i18n="keyDetail.tabChildren"></button>
+        </div>
+        <div class="key-detail-content" id="keyDetailContent"></div>
       </div>
     </div>
   </div>

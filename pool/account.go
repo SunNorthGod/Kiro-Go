@@ -18,9 +18,33 @@ type AccountPool struct {
 	accounts      []config.Account
 	totalAccounts int
 	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
+	cooldowns     map[string]time.Time       // 账号冷却时间(含 429 短退避)
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+
+	// ---- 调度层:软并发公平 + 会话粘性(见 scheduler.go)----
+	// 独立的 schedMu 保护以下并发/粘性状态,与 mu(保护账号列表)解耦:
+	// 选号先在 mu.RLock 下拍快照,再在 schedMu 下做准入+计数,两锁从不同时持有。
+	schedMu      sync.Mutex
+	schedCond    *sync.Cond           // 公平准入等待(工作保持:空载不等待)
+	inflightAcct map[string]int       // accountID → 在途请求数(负载均衡用)
+	inflightKey  map[string]int       // apiKeyID → 在途请求数(每卡密公平用)
+	inflightAll  int                  // 全局在途总数
+	sticky       map[string]stickyRef // conversationID → 绑定账号(永久,除非账号失效)
+	stickyHits   atomic.Uint64
+	stickyMisses atomic.Uint64
+
+	// ---- 实时 RPM(最近 60 秒滚动请求数,由 schedMu 保护)----
+	// 在 Acquire 派发时打点,dashboard/账号/卡密视图读取。
+	rpmAcct map[string]*rpmRing // accountID → 60 秒环形计数
+	rpmKey  map[string]*rpmRing // apiKeyID  → 60 秒环形计数
+	rpmAll  *rpmRing            // 全局 60 秒环形计数
+}
+
+// stickyRef 记录一个会话绑定到的账号及最近使用时间(诊断用)。
+type stickyRef struct {
+	accountID string
+	lastSeen  int64
 }
 
 var (
@@ -32,10 +56,17 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:    make(map[string]time.Time),
+			errorCounts:  make(map[string]int),
+			modelLists:   make(map[string]map[string]bool),
+			inflightAcct: make(map[string]int),
+			inflightKey:  make(map[string]int),
+			sticky:       make(map[string]stickyRef),
+			rpmAcct:      make(map[string]*rpmRing),
+			rpmKey:       make(map[string]*rpmRing),
+			rpmAll:       &rpmRing{},
 		}
+		pool.schedCond = sync.NewCond(&pool.schedMu)
 		pool.Reload()
 	})
 	return pool

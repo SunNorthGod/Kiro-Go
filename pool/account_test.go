@@ -279,28 +279,29 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 // Reload over-usage filtering
 // ---------------------------------------------------------------------------
 
-func TestReloadKeepsOverQuotaAccountWhenAllowOverUsage(t *testing.T) {
+// Over-quota accounts stay routable only via the per-account upstream Overages
+// switch (OverageStatus=ENABLED). The former global allowOverUsage override was
+// removed, so overage is now strictly account-level.
+func TestReloadKeepsOverQuotaAccountWhenOverageEnabled(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
 	if err := config.AddAccount(config.Account{
-		ID:           "over",
-		Enabled:      true,
-		UsageCurrent: 10,
-		UsageLimit:   10,
+		ID:            "over",
+		Enabled:       true,
+		UsageCurrent:  10,
+		UsageLimit:    10,
+		OverageStatus: "ENABLED",
 	}); err != nil {
 		t.Fatalf("AddAccount: %v", err)
-	}
-	if err := config.UpdateAllowOverUsage(true); err != nil {
-		t.Fatalf("UpdateAllowOverUsage: %v", err)
 	}
 
 	p := newTestPool()
 	p.Reload()
 
 	if got := p.GetNext(); got == nil || got.ID != "over" {
-		t.Fatalf("expected over-quota account to remain routable when allowOverUsage=true, got %#v", got)
+		t.Fatalf("expected over-quota account to remain routable when OverageStatus=ENABLED, got %#v", got)
 	}
 }
 

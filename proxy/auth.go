@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"kiro-go/config"
 	"net/http"
 	"strings"
@@ -85,7 +86,7 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		// Auth required but nothing configured → fail closed.
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key authentication is required but no keys are configured")
 	}
-	if provided == "" || provided != expected {
+	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 	}
 	return nil, nil

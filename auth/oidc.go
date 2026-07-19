@@ -7,6 +7,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,13 @@ var socialTokenURL = func() string {
 // RefreshToken 刷新 access token
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	// API Key 账号（authMethod=api_key）直接用 kiroApiKey 作 Bearer，不刷新。
+	// 契约级拦截：正常路径不会调到这里（api_key 账号 ExpiresAt=0、RefreshToken 为空），此处兜底
+	// 防止误刷新覆盖凭证。返回明确错误，调用方（如 ResolveProfileArn 兜底）会忽略。
+	if IsApiKeyAccount(account) {
+		return "", "", 0, "", fmt.Errorf("api_key account does not support token refresh")
+	}
+
 	// Resolve per-account proxy: account.ProxyURL > global config
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
@@ -30,10 +38,15 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	}
 	client := GetAuthClientForProxy(proxyURL)
 
-	if account.AuthMethod == "social" {
+	switch strings.ToLower(strings.TrimSpace(account.AuthMethod)) {
+	case "social":
 		return refreshSocialToken(account.RefreshToken, client)
+	case ExternalIdpAuthMethod: // "external_idp": Microsoft Entra / Kiro 企业版
+		return refreshExternalIdpToken(account, client)
+	default:
+		// idc / builder-id / iam 以及未指定但带 clientId/clientSecret 的账号
+		return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 	}
-	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 }
 
 // refreshOIDCToken IdC/Builder ID token 刷新

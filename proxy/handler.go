@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,10 @@ import (
 )
 
 const tokenRefreshSkewSeconds int64 = 120
+
+// maxAPIBodyBytes caps request-body size on public API endpoints (32 MiB) to
+// prevent memory exhaustion from oversized payloads.
+const maxAPIBodyBytes = 32 << 20
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
@@ -57,6 +62,10 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	// 每日统计 (最近 ~30 天;JSON 模式落盘 daily_stats.json 持久化,DB 模式从 usage_records 聚合;零值可用,惰性初始化)
+	dailyMu      sync.Mutex
+	dailyStats   map[string]*dayBucket // "2006-01-02"(CST) → 当日累计
+	dailySavedAt int64                 // 上次落盘的 unix 秒(节流用)
 }
 
 type thinkingStreamSource int
@@ -357,8 +366,9 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// Debug-level request trace for fine-grained visibility
-	logger.Debugf("[HTTP] %s %s from %s", r.Method, path, r.RemoteAddr)
+	// Debug-level request trace for fine-grained visibility. Use the real client
+	// IP (behind Cloudflare/Caddy) rather than the proxy's RemoteAddr.
+	logger.Debugf("[HTTP] %s %s from %s", r.Method, path, clientIP(r))
 
 	// CORS - 完整的头部支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -366,9 +376,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
 	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
 
+	// Behind a CDN (Cloudflare): dynamic / auth-scoped responses are keyed only by
+	// URL at the edge, so they must never be cached or shared across API keys.
+	// Static assets and /__down are excluded so they stay cacheable. SSE/HTML
+	// handlers set their own (no-cache) which harmlessly overrides this.
+	if isEdgeUncacheablePath(path) {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
 		return
+	}
+
+	// 对读取请求体的公共 API 端点限制体积,防止超大负载导致内存耗尽。
+	// 管理端点/Web 路径豁免(凭证导入可能更大,且单独鉴权)。
+	switch path {
+	case "/v1/messages", "/messages", "/anthropic/v1/messages",
+		"/v1/messages/count_tokens", "/messages/count_tokens",
+		"/v1/chat/completions", "/chat/completions",
+		"/v1/responses", "/responses":
+		r.Body = http.MaxBytesReader(w, r.Body, maxAPIBodyBytes)
 	}
 
 	// 路由
@@ -413,9 +441,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/admin/"):
 		h.serveStaticFile(w, r)
 
+	// 用户自助门户(客户用自己的 API Key 查看用量/余额/充值记录,只读且只能看自己)
+	case path == "/user" || path == "/user/":
+		h.serveUserPage(w, r)
+	case strings.HasPrefix(path, "/user/api/"):
+		h.handleUserAPI(w, r)
+
 	// 健康检查
 	case path == "/health" || path == "/":
 		h.handleHealth(w, r)
+
+	// 轻量存活探针：CloudflareSpeedTest 优选 exe 在筛选候选 IP 时会对
+	// https://<域名>:<端口>/v1/ping 发 HTTPS 请求，要求返回 200 才认定该 CF 边缘 IP
+	// 真正能服务本域名(借此排除 TLS 握手失败 / Edge IP Restricted 1034 的坏 IP)。
+	// 必须无鉴权、恒定 200、可被 CF 缓存,否则所有候选 IP 都会被误判为不可用。
+	case path == "/v1/ping" || path == "/ping":
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Write([]byte(`{"status":"ok"}`))
+
+	// CDN 测速下载端点（无鉴权、可被 CF 边缘缓存）——给 CloudflareSpeedTest 等
+	// 工具一个稳定的自建测速 URL，替代不可靠的默认 cf.xiu2.xyz/url。
+	case path == "/__down":
+		h.handleSpeedTestDownload(w, r)
 
 	// 统计端点（需要 API Key 鉴权）
 	case path == "/v1/stats":
@@ -479,12 +527,29 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = fallbackAnthropicModels(thinkingSuffix)
 	}
 
-	// 添加别名模型
-	models = append(models,
-		buildModelInfo("auto", "kiro-proxy", true),
+	// 添加别名模型（仅当官方模型列表里没有同名 id 时才补，避免与 Kiro
+	// ListAvailableModels 已返回的模型重复。auto 官方已提供，通常不会再追加）。
+	existingIDs := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			existingIDs[id] = true
+		}
+	}
+	autoModel := buildModelInfo("auto", "kiro-proxy", true)
+	autoModel["display_name"] = "Auto"
+	autoModel["description"] = "Automatically selects the best available model."
+	for _, alias := range []map[string]interface{}{
+		autoModel,
 		buildModelInfo("gpt-4o", "kiro-proxy", true),
 		buildModelInfo("gpt-4", "kiro-proxy", true),
-	)
+	} {
+		id, _ := alias["id"].(string)
+		if id == "" || existingIDs[id] {
+			continue
+		}
+		existingIDs[id] = true
+		models = append(models, alias)
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -500,15 +565,72 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	}
 
 	models := make([]map[string]interface{}, 0, len(cached)*2)
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
+	for i := range cached {
+		m := cached[i]
+		supportsImage := modelSupportsImage(m.InputTypes)
+		// Base model carries Kiro's full metadata (effort/reasoning schema, token
+		// limits, description) so the list faithfully mirrors ListAvailableModels.
+		base := buildModelInfo(m.ModelId, "anthropic", supportsImage)
+		enrichModelInfo(base, &m, true)
+		models = append(models, base)
+		// Auto-generated thinking variant: same token limits/description, but no
+		// effort schema (thinking is budget-driven for the variant).
+		variant := buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage)
+		enrichModelInfo(variant, &m, false)
+		models = append(models, variant)
 	}
 	return models
+}
+
+// enrichModelInfo augments a /v1/models entry with Kiro's per-model metadata so
+// the relay list mirrors ListAvailableModels. When includeEffort is true and the
+// model exposes an effort schema, the effort levels / reasoning modes / schema
+// path / defaults are attached (plus the raw schema) so clients (and the plugin's
+// CPS) can reconstruct Kiro's exact per-model thinking options.
+func enrichModelInfo(info map[string]interface{}, m *ModelInfo, includeEffort bool) {
+	if m.ModelName != "" {
+		info["display_name"] = m.ModelName
+	}
+	if m.Description != "" {
+		info["description"] = m.Description
+	}
+	if m.RateMultiplier > 0 {
+		info["rate_multiplier"] = m.RateMultiplier
+	}
+	if m.TokenLimits != nil {
+		if m.TokenLimits.MaxInputTokens > 0 {
+			info["context_window"] = m.TokenLimits.MaxInputTokens
+			info["max_input_tokens"] = m.TokenLimits.MaxInputTokens
+		}
+		if m.TokenLimits.MaxOutputTokens > 0 {
+			info["max_output_tokens"] = m.TokenLimits.MaxOutputTokens
+		}
+	}
+	if !includeEffort {
+		return
+	}
+	eff := m.EffortInfo()
+	if eff == nil {
+		return
+	}
+	if len(eff.Levels) > 0 {
+		info["effort_levels"] = eff.Levels
+	}
+	if eff.SchemaPath != "" {
+		info["effort_schema_path"] = eff.SchemaPath
+	}
+	if eff.DefaultLevel != "" {
+		info["default_effort_level"] = eff.DefaultLevel
+	}
+	if len(eff.Modes) > 0 {
+		info["reasoning_modes"] = eff.Modes
+	}
+	if eff.DefaultMode != "" {
+		info["default_reasoning_mode"] = eff.DefaultMode
+	}
+	if len(m.AdditionalModelRequestFieldsSchema) > 0 {
+		info["additionalModelRequestFieldsSchema"] = m.AdditionalModelRequestFieldsSchema
+	}
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
@@ -636,6 +758,8 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	h.modelsCacheMu.Unlock()
 
 	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
+	// Auto-enable the upstream Overages switch for freshly added, capable accounts.
+	h.maybeAutoEnableOverage(account)
 	return nil
 }
 
@@ -834,12 +958,19 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
+	// 响应侧推理门:是否把 AWS 的 reasoningContentEvent 转发给客户端。
+	// 请求侧的 thinking(系统 <thinking_mode> 标签注入)只认后缀/thinking字段;
+	// 但响应门必须**额外**认 output_config.effort —— 原生 Kiro/插件默认 auto 档只发 effort,
+	// 若响应门只看 thinking,后端产出的思考会被整个丢弃(实测 effort-only=0 段思考)。
+	// 对齐旧 Rust 反代 `thinking_enabled = thinking.is_enabled() || output_config.is_some()`。
+	forwardReasoning := thinking || claudeEffortRequested(&req)
+
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
@@ -886,15 +1017,30 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		messageStarted = true
 	}
 
+	// conversationID(确定性 agentContinuationId)= 会话粘性缓存键,让同一会话稳定命中同一账号。
+	conversationID := payload.ConversationState.AgentContinuationId
+	// 无 API Key(公网/无鉴权模式)时不施加每卡密公平限制。
+	bypassFairness := apiKeyID == ""
+	// 每卡密并发下限(公平准入基线):取该卡密配置的 MaxConcurrency,未配置则 0(用池默认)。
+	keyFloor := 0
+	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
+		keyFloor = e.MaxConcurrency
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		if aerr == pool.ErrTooBusy {
+			// 本卡密并发已达公平上限且池子饱和 → 429(软限制:空载时不会到这里)。
+			h.sendClaudeError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
+			return
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if aerr != nil {
+			break // ErrNoAccount → 无可用账号
+		}
+		if err := h.ensureValidToken(&account); err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -903,6 +1049,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var contextFull bool
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -910,9 +1057,40 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		activeBlockIndex := -1
 		activeBlockType := ""
 
+		// 原生推理签名:reasoningContentEvent.signature 收集到这里,thinking 块关闭前
+		// 作为 signature_delta 注入(优先真实签名,缺失则兜底伪造)。签名只发一次。
+		var nativeSignature string
+		signatureSent := false
+		emitSignatureDelta := func(thinkingIdx int) {
+			if signatureSent {
+				return
+			}
+			signatureSent = true
+			sig := nativeSignature
+			if sig == "" {
+				sig = generateFakeSignature()
+			}
+			// 按 40 字节切块发送 signature_delta(对齐 Anthropic 分块惯例)
+			for i := 0; i < len(sig); i += 40 {
+				end := i + 40
+				if end > len(sig) {
+					end = len(sig)
+				}
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": thinkingIdx,
+					"delta": map[string]string{"type": "signature_delta", "signature": sig[i:end]},
+				})
+			}
+		}
+
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
 				return
+			}
+			// thinking 块关闭前必须先发 signature_delta(Anthropic 协议:签名在 content_block_stop 之前)
+			if activeBlockType == "thinking" {
+				emitSignatureDelta(activeBlockIndex)
 			}
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
@@ -1212,14 +1390,23 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				if pct >= 100 {
+					contextFull = true
+				}
+			},
+			OnReasoningSignature: func(sig string) {
+				if sig != "" {
+					nativeSignature = sig
+				}
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroWithSelfHeal(&account, payload, callback)
 		if err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			if !messageStarted {
 				continue
 			}
@@ -1252,16 +1439,29 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// 空响应检测: 上游成功但零内容零工具(或近空且上下文过大) → 不静默发 end_turn,
+		// 而是给客户端一个 error 事件(过大→提示压缩、偏小→可重试),避免 agentic 客户端卡死。
+		if isEmptyKiroResponse(outputContent, thinkingOutput, len(toolUses), outputTokens, inputTokens, model) {
+			h.pool.RecordSuccess(account.ID)
+			releaseSlot()
+			errType, errMsg := emptyResponseErrorInfo(emptyResponseIsOversizedContext(inputTokens, model))
+			h.recordFailureWithDetails("claude", model, account.ID, fmt.Errorf("empty upstream response"))
+			ensureMessageStart()
+			h.sendSSE(w, flusher, "error", map[string]interface{}{
+				"type":  "error",
+				"error": map[string]string{"type": errType, "message": errMsg},
+			})
+			return
+		}
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		releaseSlot()
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
-		}
+		stopReason := resolveClaudeStopReason(len(toolUses) > 0, contextFull, inputTokens, model)
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1340,17 +1540,35 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
+	h.recordDaily(inputTokens+outputTokens, credits)
 }
 
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
-func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+func (h *Handler) recordSuccessForApiKey(apiKeyID, model string, inputTokens, outputTokens int, credits float64) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+	// Carry the model through so usage_counters/usage_records get per-model
+	// attribution, and split input/output so both ledgers are accurate.
+	if err := config.RecordApiKeyUsage(apiKeyID, model, int64(inputTokens), int64(outputTokens), credits); err != nil {
+		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+	}
+}
+
+// recordSuccessForApiKeyWithCache is recordSuccessForApiKey plus prompt-cache
+// token attribution (cache read / creation input tokens) for the display-only
+// detail log — the Claude paths know these, and the usage panels use them to
+// compute cache hit rate. Billing is unaffected (cache tokens never touch the
+// authoritative counter).
+func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID, model string, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int, credits float64) {
+	h.recordSuccess(inputTokens, outputTokens, credits)
+	if apiKeyID == "" {
+		return
+	}
+	if err := config.RecordApiKeyUsageWithCache(apiKeyID, model, int64(inputTokens), int64(outputTokens), int64(cacheReadTokens), int64(cacheCreationTokens), credits); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
 }
@@ -1406,6 +1624,8 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 	}
 	h.requestLogs = append(h.requestLogs, entry)
 	h.requestLogsMu.Unlock()
+	// Persist to the DB audit trail (async, no-op in JSON mode).
+	enqueueRequestLogDB(entry)
 }
 
 // classifyError categorizes an error message into a type for display.
@@ -1426,8 +1646,12 @@ func classifyError(msg string) string {
 	}
 }
 
-// getRequestLogs returns a copy of request logs (newest first).
+// getRequestLogs returns request logs (newest first). Prefers the durable DB audit
+// trail when the PostgreSQL backend is active; falls back to the in-memory ring.
 func (h *Handler) getRequestLogs() []RequestLog {
+	if logs, ok := listRequestLogsDB(1000); ok {
+		return logs
+	}
 	h.requestLogsMu.RLock()
 	defer h.requestLogsMu.RUnlock()
 	if len(h.requestLogs) == 0 {
@@ -1446,15 +1670,26 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	var lastErr error
 	reqStart := time.Now()
 
+	conversationID := payload.ConversationState.AgentContinuationId
+	bypassFairness := apiKeyID == ""
+	keyFloor := 0
+	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
+		keyFloor = e.MaxConcurrency
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		if aerr == pool.ErrTooBusy {
+			h.sendClaudeError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
+			return
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if aerr != nil {
+			break // ErrNoAccount → 无可用账号
+		}
+		if err := h.ensureValidToken(&account); err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1489,11 +1724,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroWithSelfHeal(&account, payload, callback)
 		if err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 
@@ -1514,9 +1750,25 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// 空响应检测: 零内容零工具(或近空且上下文过大) → 回错误而非静默的空 end_turn。
+		if isEmptyKiroResponse(finalContent, rawThinkingContent, len(toolUses), outputTokens, inputTokens, model) {
+			h.pool.RecordSuccess(account.ID)
+			releaseSlot()
+			oversized := emptyResponseIsOversizedContext(inputTokens, model)
+			errType, errMsg := emptyResponseErrorInfo(oversized)
+			h.recordFailureWithDetails("claude", model, account.ID, fmt.Errorf("empty upstream response"))
+			status := 503
+			if oversized {
+				status = 400
+			}
+			h.sendClaudeError(w, status, errType, errMsg)
+			return
+		}
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		releaseSlot()
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -1539,6 +1791,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		// 上下文写满时用更准确的 stop_reason(否则恒 end_turn/tool_use)。
+		resp.StopReason = resolveClaudeStopReason(len(toolUses) > 0, false, inputTokens, model)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -1633,15 +1887,26 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	var lastErr error
 	reqStart := time.Now()
 
+	conversationID := payload.ConversationState.AgentContinuationId
+	bypassFairness := apiKeyID == ""
+	keyFloor := 0
+	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
+		keyFloor = e.MaxConcurrency
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		if aerr == pool.ErrTooBusy {
+			h.sendOpenAIError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
+			return
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if aerr != nil {
+			break // ErrNoAccount → 无可用账号
+		}
+		if err := h.ensureValidToken(&account); err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 
@@ -1926,11 +2191,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroWithSelfHeal(&account, payload, callback)
 		if err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			if !responseStarted {
 				continue
 			}
@@ -1962,15 +2228,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		finishReason := "stop"
-		if len(toolCalls) > 0 {
-			finishReason = "tool_calls"
-		}
+		finishReason := openAIFinishReason(len(toolCalls) > 0, false, inputTokens, model)
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -2067,7 +2330,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, model, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -2154,7 +2417,7 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	if stored := config.GetPassword(); stored == "" || subtle.ConstantTimeCompare([]byte(password), []byte(stored)) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
@@ -2215,6 +2478,17 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	// Social 登录(app.kiro.dev,Google/GitHub/Microsoft/Amazon/邮箱):复用 Builder ID 授权码流程,
+	// 产出 idc 账号,后续走标准 OIDC 刷新与 AWS 数据面。
+	case path == "/auth/social/start" && r.Method == "POST":
+		h.apiStartSocialLogin(w, r)
+	case path == "/auth/social/complete" && r.Method == "POST":
+		h.apiCompleteSocialLogin(w, r)
+	// Kiro API Key(ksk_)headless 账号:直接作 Bearer,不刷新。
+	case path == "/auth/api-key" && r.Method == "POST":
+		h.apiImportApiKey(w, r)
+	case path == "/overview" && r.Method == "GET":
+		h.apiGetOverview(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -2223,8 +2497,6 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateSettings(w, r)
 	case path == "/stats" && r.Method == "GET":
 		h.apiGetStats(w, r)
-	case path == "/stats/reset" && r.Method == "POST":
-		h.apiResetStats(w, r)
 	case path == "/logs" && r.Method == "GET":
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
@@ -2258,6 +2530,23 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/reset-usage") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/reset-usage")
 		h.apiResetApiKeyUsage(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/topup") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/topup")
+		h.apiTopupApiKey(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/recharges") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/recharges")
+		h.apiApiKeyRecharges(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/usage/records") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/usage/records")
+		h.apiApiKeyUsageRecords(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/usage") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/usage")
+		h.apiApiKeyUsage(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/children") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/children")
+		h.apiApiKeyChildren(w, r, id)
+	case path == "/concurrency" && r.Method == "GET":
+		h.apiConcurrency(w, r)
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "GET":
 		h.apiGetApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "PUT":
@@ -2279,8 +2568,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	for _, a := range poolAccounts {
 		statsMap[a.ID] = a
 	}
+	rpmByAcct, _, _ := h.pool.RPMSnapshot()
 
-	// 隐藏敏感信息
+	// 运行时统计 + 实时 RPM
 	result := make([]map[string]interface{}, len(accounts))
 	for i, a := range accounts {
 		// 获取运行时统计
@@ -2294,12 +2584,19 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"authMethod":        a.AuthMethod,
 			"provider":          a.Provider,
 			"region":            a.Region,
+			"createdAt":         a.CreatedAt,
 			"enabled":           a.Enabled,
 			"banStatus":         a.BanStatus,
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
 			"hasToken":          a.AccessToken != "",
+			// canRefresh: an expired access token is normal and self-healing for
+			// accounts that can renew it — OAuth/IdC accounts with a refresh token,
+			// and api_key (ksk_) accounts whose key is itself the long-lived bearer
+			// (never expires). The UI uses this to avoid flashing a false "expired"
+			// badge in the brief window between token TTL and the next refresh.
+			"canRefresh":        a.RefreshToken != "" || auth.IsApiKeyAccount(&accounts[i]),
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -2327,6 +2624,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			"rpm":               rpmByAcct[a.ID],
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -2347,7 +2645,7 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.Region = "us-east-1"
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	if err := config.AddOrReplaceAccount(&account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -2634,6 +2932,7 @@ func (h *Handler) apiStartIamSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		StartUrl string `json:"startUrl"`
 		Region   string `json:"region"`
+		Name     string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2647,7 +2946,8 @@ func (h *Handler) apiStartIamSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID, authorizeUrl, expiresIn, err := auth.StartIamSsoLogin(req.StartUrl, req.Region)
+	// region 留空时后端自动探测门户所属区域（含跨区门户）。name 为用户填写的备注/用户名。
+	sessionID, authorizeUrl, expiresIn, err := auth.StartIamSsoLogin(req.StartUrl, req.Region, req.Name)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -2672,37 +2972,44 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, refreshToken, clientID, clientSecret, region, expiresIn, err := auth.CompleteIamSsoLogin(req.SessionID, req.CallbackUrl)
+	accessToken, refreshToken, clientID, clientSecret, region, label, expiresIn, err := auth.CompleteIamSsoLogin(req.SessionID, req.CallbackUrl)
 	if err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 获取用户信息
+	// 账号标签：备注/用户名(label) 作为 nickname；列表主展示优先真实 email，取不到则回退 label。
 	email, _, _ := auth.GetUserInfo(accessToken)
+	if email == "" {
+		email = label
+	}
 
 	// 创建账号
 	account := config.Account{
 		ID:           auth.GenerateAccountID(),
 		Email:        email,
+		Nickname:     label,
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		AuthMethod:   "idc",
+		Provider:     "Enterprise",
 		Region:       region,
 		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
 		Enabled:      true,
 		MachineId:    config.GenerateMachineId(),
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	if err := config.AddOrReplaceAccount(&account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
+	// 服务端同步拉取额度/订阅并自动开 Overages（取代前端建完再调 /refresh）。
+	h.hydrateNewAccount(&account)
 	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -2788,7 +3095,7 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 		MachineId:    config.GenerateMachineId(),
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	if err := config.AddOrReplaceAccount(&account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -2857,7 +3164,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 			MachineId:    config.GenerateMachineId(),
 		}
 
-		if err := config.AddAccount(account); err != nil {
+		if err := config.AddOrReplaceAccount(&account); err != nil {
 			errors = append(errors, err.Error())
 			continue
 		}
@@ -2973,7 +3280,243 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		ProfileArn:   newProfileArn,
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	if err := config.AddOrReplaceAccount(&account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.hydrateNewAccount(&account)
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"account": map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		},
+	})
+}
+
+// apiStartSocialLogin 发起 Social 登录(app.kiro.dev:Google/GitHub/Microsoft/Amazon/邮箱)。
+// 底层复用 AWS Builder ID 授权码流程(PKCE),返回 authorizeUrl 供用户浏览器打开授权。
+func (h *Handler) apiStartSocialLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Region string `json:"region"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	sessionID, authorizeUrl, expiresIn, err := auth.StartSocialLogin(req.Region)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":    sessionID,
+		"authorizeUrl": authorizeUrl,
+		"expiresIn":    expiresIn,
+	})
+}
+
+// apiCompleteSocialLogin 用回调 URL(含授权码)换取 token,完成 Social 登录建号。
+// 产出账号 AuthMethod=idc(后续走标准 OIDC 刷新)、Provider=Social(便于前端区分来源)。
+func (h *Handler) apiCompleteSocialLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		CallbackUrl string `json:"callbackUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	accessToken, refreshToken, clientID, clientSecret, region, expiresIn, err := auth.CompleteSocialLogin(req.SessionID, req.CallbackUrl)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	email, _, _ := auth.GetUserInfo(accessToken)
+
+	account := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Email:        email,
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		AuthMethod:   auth.SocialAuthMethod, // "idc"
+		Provider:     auth.SocialProvider,   // "Social"
+		Region:       region,
+		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+		Enabled:      true,
+		MachineId:    config.GenerateMachineId(),
+	}
+
+	if err := config.AddOrReplaceAccount(&account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.hydrateNewAccount(&account)
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"account": map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		},
+	})
+}
+
+// apiImportApiKey 导入 Kiro API Key(ksk_)账号(headless,authMethod=api_key,不刷新)。
+// 支持批量:按行分割多个 key。key 直接作 Bearer,调用后端时带 tokentype: API_KEY 头。
+func (h *Handler) apiImportApiKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ApiKey   string `json:"apiKey"`
+		Region   string `json:"region"`
+		Nickname string `json:"nickname"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	if strings.TrimSpace(req.ApiKey) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "apiKey is required"})
+		return
+	}
+
+	keys := strings.Split(strings.TrimSpace(req.ApiKey), "\n")
+	var imported []map[string]interface{}
+	var errors []string
+
+	for _, k := range keys {
+		k = auth.NormalizeKiroApiKey(k)
+		if k == "" {
+			continue
+		}
+		if !strings.HasPrefix(k, auth.KiroApiKeyPrefix) {
+			errors = append(errors, fmt.Sprintf("invalid key (expect %s prefix): %s", auth.KiroApiKeyPrefix, auth.MaskKiroApiKey(k)))
+			continue
+		}
+
+		// 备注/标签直接用完整 API Key（不脱敏、无需手填），同时作为列表主展示。
+		account := auth.NewApiKeyAccount(k, req.Region, k)
+		account.Email = k
+		if err := config.AddOrReplaceAccount(&account); err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+		h.hydrateNewAccount(&account)
+		imported = append(imported, map[string]interface{}{
+			"id":     account.ID,
+			"apiKey": k,
+		})
+	}
+
+	h.pool.Reload()
+
+	if len(imported) == 0 && len(errors) > 0 {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   strings.Join(errors, "; "),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"accounts": imported,
+		"errors":   errors,
+	})
+}
+
+// apiImportExternalIdp 导入 External IdP(Microsoft Entra / Kiro 企业版)账号。
+// 客户 IdP 直签 token,数据面走 runtime.{region}.kiro.dev、控制面走 management.{region}.kiro.dev,
+// 调用后端时带 tokentype: EXTERNAL_IDP 头。导入以一次成功刷新为前提(校验凭证有效)。
+func (h *Handler) apiImportExternalIdp(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RefreshToken  string `json:"refreshToken"`
+		ClientID      string `json:"clientId"`
+		TokenEndpoint string `json:"tokenEndpoint"`
+		IssuerUrl     string `json:"issuerUrl"`
+		Scopes        string `json:"scopes"`
+		Region        string `json:"region"`
+		ProfileArn    string `json:"profileArn"`
+		Nickname      string `json:"nickname"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	if strings.TrimSpace(req.RefreshToken) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken is required"})
+		return
+	}
+	if strings.TrimSpace(req.ClientID) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "clientId is required"})
+		return
+	}
+	if strings.TrimSpace(req.TokenEndpoint) == "" && strings.TrimSpace(req.IssuerUrl) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "tokenEndpoint or issuerUrl is required"})
+		return
+	}
+	if req.Region == "" {
+		req.Region = "us-east-1"
+	}
+
+	// 以一次成功刷新校验凭证:本地 accessToken 无可信过期时间,盲存会让账号选号时被永远跳过。
+	tempAccount := &config.Account{
+		AuthMethod:    auth.ExternalIdpAuthMethod,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerUrl:     req.IssuerUrl,
+		Scopes:        req.Scopes,
+		Region:        req.Region,
+	}
+	accessToken, newRefreshToken, expiresAt, _, err := auth.RefreshToken(tempAccount)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		return
+	}
+	if newRefreshToken != "" {
+		req.RefreshToken = newRefreshToken
+	}
+
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Nickname:      req.Nickname,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		AuthMethod:    auth.ExternalIdpAuthMethod,
+		Provider:      "ExternalIdP",
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerUrl:     req.IssuerUrl,
+		Scopes:        req.Scopes,
+		ProfileArn:    strings.TrimSpace(req.ProfileArn),
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+	}
+
+	if err := config.AddOrReplaceAccount(&account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -2983,8 +3526,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"account": map[string]interface{}{
-			"id":    account.ID,
-			"email": account.Email,
+			"id":       account.ID,
+			"nickname": account.Nickname,
 		},
 	})
 }
@@ -3009,7 +3552,6 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"requireApiKey":  config.IsApiKeyRequired(),
 		"port":           config.GetPort(),
 		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
 	})
 }
 
@@ -3061,7 +3603,6 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		ApiKey         *string `json:"apiKey,omitempty"`
 		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
 		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3073,17 +3614,6 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
-	}
-
-	// 更新超额使用设置
-	if req.AllowOverUsage != nil {
-		if err := config.UpdateAllowOverUsage(*req.AllowOverUsage); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
-		h.pool.Reload()
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -3100,18 +3630,6 @@ func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
-	atomic.StoreInt64(&h.totalRequests, 0)
-	atomic.StoreInt64(&h.successRequests, 0)
-	atomic.StoreInt64(&h.failedRequests, 0)
-	atomic.StoreInt64(&h.totalTokens, 0)
-	h.creditsMu.Lock()
-	h.totalCredits = 0
-	h.creditsMu.Unlock()
-	config.UpdateStats(0, 0, 0, 0, 0)
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
-}
-
 func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"logs": h.getRequestLogs(),
@@ -3122,6 +3640,7 @@ func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
 	h.requestLogs = h.requestLogs[:0]
 	h.requestLogsMu.Unlock()
+	clearRequestLogsDB()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -3196,6 +3715,24 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		"reply":   content,
 		"model":   req.Model,
 	})
+}
+
+// hydrateNewAccount 在新账号建好后，服务端同步拉取一次额度/订阅信息并写回，
+// 同时对 overage-capable 账号自动打开上游 Overages 开关。best-effort：失败仅记日志，
+// 不影响建号结果。取代旧的「前端建完再调 /accounts/{id}/refresh」链路。
+func (h *Handler) hydrateNewAccount(account *config.Account) {
+	if account == nil {
+		return
+	}
+	if info, err := RefreshAccountInfo(account); err != nil {
+		logger.Warnf("[NewAccount] 拉取额度/订阅失败 %s: %v", account.Email, err)
+	} else if info != nil {
+		if err := config.UpdateAccountInfo(account.ID, *info); err != nil {
+			logger.Warnf("[NewAccount] 写回账号信息失败 %s: %v", account.ID, err)
+		}
+	}
+	// 对 capable 且未设置过 Overages 的账号自动开启（内部自带能力/状态判断）。
+	h.maybeAutoEnableOverage(account)
 }
 
 // apiRefreshAccount 刷新账户信息（使用量、订阅等）
@@ -3432,11 +3969,19 @@ func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Reque
 // ==================== 静态文件服务 ====================
 
 func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
+	// HTML must always revalidate: it carries the current page structure and the
+	// ?v-busted <script>/<link> loader. JS/CSS themselves stay cacheable via ?v.
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	http.ServeFile(w, r, "web/index.html")
 }
 
 func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/admin/")
+	// Never let the browser serve stale HTML (structure changes must land
+	// immediately); versioned JS/CSS keep their heuristic/?v caching.
+	if strings.HasSuffix(path, ".html") {
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	}
 	http.ServeFile(w, r, "web/"+path)
 }
 
@@ -3618,6 +4163,14 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt    int64  `json:"expiresAt"`
 		AuthMethod   string `json:"authMethod,omitempty"`
 		Provider     string `json:"provider,omitempty"`
+		// Auth-method-specific fields so every account type round-trips: idc (AWS
+		// IdC / IAM Identity Center) needs StartUrl; external_idp (Entra / Kiro
+		// Enterprise) needs TokenEndpoint + IssuerUrl; api_key needs KiroApiKey.
+		StartUrl      string `json:"startUrl,omitempty"`
+		ProfileArn    string `json:"profileArn,omitempty"`
+		TokenEndpoint string `json:"tokenEndpoint,omitempty"`
+		IssuerUrl     string `json:"issuerUrl,omitempty"`
+		KiroApiKey    string `json:"kiroApiKey,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -3693,15 +4246,20 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 			UserId:    a.UserId,
 			MachineId: a.MachineId,
 			Credentials: ExportCredentials{
-				AccessToken:  a.AccessToken,
-				CsrfToken:    "",
-				RefreshToken: a.RefreshToken,
-				ClientID:     a.ClientID,
-				ClientSecret: a.ClientSecret,
-				Region:       a.Region,
-				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
-				AuthMethod:   authMethod,
-				Provider:     a.Provider,
+				AccessToken:   a.AccessToken,
+				CsrfToken:     "",
+				RefreshToken:  a.RefreshToken,
+				ClientID:      a.ClientID,
+				ClientSecret:  a.ClientSecret,
+				Region:        a.Region,
+				ExpiresAt:     a.ExpiresAt * 1000, // 转为毫秒时间戳
+				AuthMethod:    authMethod,
+				Provider:      a.Provider,
+				StartUrl:      a.StartUrl,
+				ProfileArn:    a.ProfileArn,
+				TokenEndpoint: a.TokenEndpoint,
+				IssuerUrl:     a.IssuerUrl,
+				KiroApiKey:    a.KiroApiKey,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

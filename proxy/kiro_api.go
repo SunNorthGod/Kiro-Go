@@ -21,6 +21,17 @@ const (
 
 var profileArnResolutionCooldowns sync.Map
 
+// kiroRestBaseFor 返回账号控制面(getUsageLimits / ListAvailableModels / ListAvailableProfiles /
+// GetUserInfo)的 REST base URL。external_idp(Microsoft Entra / Kiro 企业版)账号走
+// management.{region}.kiro.dev;其余账号(idc/social/api_key)走 AWS codewhisperer.us-east-1,
+// 再由 regionalizeURL 按 profileArn 区域改写为 q.{region}(management.kiro.dev 不匹配改写规则,天然 no-op)。
+func kiroRestBaseFor(account *config.Account) string {
+	if auth.IsExternalIdpAccount(account) {
+		return "https://" + auth.ExternalIdpManagementHost(account.Region)
+	}
+	return kiroRestAPIBase
+}
+
 func regionFromProfileArn(profileArn string) string {
 	parts := strings.SplitN(strings.TrimSpace(profileArn), ":", 6)
 	if len(parts) < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
@@ -78,7 +89,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
+	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestBaseFor(account))
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
 
@@ -109,7 +120,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 
 // GetUserInfo 获取用户信息
 func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
-	url := regionalizeURL(fmt.Sprintf("%s/GetUserInfo", kiroRestAPIBase), account)
+	url := regionalizeURL(fmt.Sprintf("%s/GetUserInfo", kiroRestBaseFor(account)), account)
 
 	payload := `{"origin":"KIRO_IDE"}`
 	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
@@ -144,7 +155,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
+	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestBaseFor(account))
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
 
@@ -299,6 +310,16 @@ func ensureRestProfileArn(account *config.Account) error {
 			logger.Debugf("[ProfileArn] Continuing REST request without profile ARN for %s: %v", accountEmailForLog(account), err)
 			return nil
 		}
+		// API Key (ksk_) accounts are headless: no refresh token and no listable
+		// profile, so ResolveProfileArn always fails with "no available Kiro
+		// profile". The ksk_ key already scopes the profile server-side (the chat
+		// path in CallKiroAPI also proceeds without a resolved ARN), so treat this
+		// as soft here too — otherwise getUsageLimits / ListAvailableModels hard-fail
+		// on refresh even though chat works fine.
+		if auth.IsApiKeyAccount(account) {
+			logger.Debugf("[ProfileArn] Continuing REST request without profile ARN for API key account %s: %v", accountEmailForLog(account), err)
+			return nil
+		}
 		return err
 	}
 	account.ProfileArn = profileArn
@@ -349,7 +370,7 @@ func isTransientProfileFetchError(err error) bool {
 }
 
 func listAvailableProfiles(account *config.Account) (string, error) {
-	req, err := http.NewRequest("POST", regionalizeURL(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), account), strings.NewReader(`{"maxResults":10}`))
+	req, err := http.NewRequest("POST", regionalizeURL(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestBaseFor(account)), account), strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return "", err
 	}
@@ -620,4 +641,84 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	// AdditionalModelRequestFieldsSchema is Kiro's per-model request-fields JSON
+	// schema. It carries the effort/reasoning options each model supports, under
+	// properties.output_config.properties.effort (Claude) or
+	// properties.reasoning.properties.{effort,mode} (GPT 5.6). Preserved verbatim
+	// so /v1/models can faithfully mirror Kiro's ListAvailableModels.
+	AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema,omitempty"`
+}
+
+// EffortInfo is the effort/reasoning capability extracted from a model's
+// additionalModelRequestFieldsSchema, aligned to Kiro's official
+// output_config.effort / reasoning.{effort,mode}.
+type EffortInfo struct {
+	SchemaPath   string   // "output_config" or "reasoning"
+	Levels       []string // e.g. [low, medium, high, xhigh, max]
+	DefaultLevel string   // default effort level
+	Modes        []string // reasoning.mode values (GPT 5.6: [standard, pro]); empty otherwise
+	DefaultMode  string   // default reasoning.mode; empty when no mode
+}
+
+// EffortInfo parses the model's request-fields schema to discover which effort
+// levels (and, for GPT reasoning models, which reasoning modes) it supports.
+// Returns nil when the model exposes no effort schema (i.e. it does not support
+// thinking levels). Mirrors the Kiro client probe order: output_config first,
+// then reasoning.
+func (m *ModelInfo) EffortInfo() *EffortInfo {
+	if len(m.AdditionalModelRequestFieldsSchema) == 0 {
+		return nil
+	}
+	var schema map[string]interface{}
+	if err := json.Unmarshal(m.AdditionalModelRequestFieldsSchema, &schema); err != nil {
+		return nil
+	}
+	props, _ := schema["properties"].(map[string]interface{})
+	if props == nil {
+		return nil
+	}
+	strList := func(v interface{}) []string {
+		arr, ok := v.([]interface{})
+		if !ok {
+			return nil
+		}
+		out := make([]string, 0, len(arr))
+		for _, e := range arr {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	for _, path := range []string{"output_config", "reasoning"} {
+		pathObj, _ := props[path].(map[string]interface{})
+		if pathObj == nil {
+			continue
+		}
+		pathProps, _ := pathObj["properties"].(map[string]interface{})
+		if pathProps == nil {
+			continue
+		}
+		effort, _ := pathProps["effort"].(map[string]interface{})
+		if effort == nil {
+			continue
+		}
+		levels := strList(effort["enum"])
+		if len(levels) == 0 {
+			continue
+		}
+		info := &EffortInfo{SchemaPath: path, Levels: levels}
+		if dl, ok := effort["default"].(string); ok {
+			info.DefaultLevel = dl
+		}
+		// reasoning.mode (GPT 5.6: [standard, pro]); Claude's output_config has none.
+		if mode, ok := pathProps["mode"].(map[string]interface{}); ok {
+			info.Modes = strList(mode["enum"])
+			if dm, ok := mode["default"].(string); ok {
+				info.DefaultMode = dm
+			}
+		}
+		return info
+	}
+	return nil
 }

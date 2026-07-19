@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,13 +47,20 @@ type Account struct {
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC) or "social" (GitHub/Google)
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (Microsoft Entra / Kiro Enterprise), or "api_key" (Kiro API Key)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub")
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
 	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+
+	// [login] 新增字段: 为扩展登录方式 (external_idp 企业 SSO / api_key Kiro API Key) 补充的凭证字段。
+	// 这些字段为纯追加，向后兼容旧配置文件 (omitempty 保证未使用时不写盘)。
+	KiroApiKey    string `json:"kiroApiKey,omitempty"`    // [login] 新增字段: Kiro API Key (ksk_ 前缀); authMethod=api_key 时直接作为 Bearer 使用, 无 refreshToken 也不刷新
+	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // [login] 新增字段: external_idp 的 OIDC token endpoint, 用于 refresh_token 刷新
+	IssuerUrl     string `json:"issuerUrl,omitempty"`     // [login] 新增字段: external_idp 的 OIDC issuer, 供 discovery 兜底解析 tokenEndpoint
+	Scopes        string `json:"scopes,omitempty"`        // [login] 新增字段: external_idp 的 OAuth scopes (空格分隔), 刷新时作为 scope 参数
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -107,6 +116,11 @@ type Account struct {
 	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+
+	// CreatedAt is the account creation time (Unix seconds). Primarily used to
+	// give the PostgreSQL backend a stable ordering key so the account pool order
+	// is deterministic across restarts. Set on AddAccount when unset.
+	CreatedAt int64 `json:"createdAt,omitempty"`
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -141,6 +155,29 @@ type ApiKeyEntry struct {
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
+
+	// Unified ledger + card-key ("卡密") fields. All are pure additions with
+	// omitempty, so older config files that lack them load unchanged.
+	//
+	// CreditsGranted is the "进账" side of the unified ledger: the running total of
+	// credits ever recharged onto this key. The spendable balance is
+	// CreditsGranted - CreditsUsed. Like CreditsUsed it is monotonic; when >0 it
+	// takes precedence over the legacy CreditLimit in ApiKeyOverLimit.
+	CreditsGranted float64 `json:"creditsGranted,omitempty"`
+	// ExpiresAt is the key's hard expiry (Unix seconds); 0 == never expires.
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
+	// BoundAccountIDs restricts which accounts this key may use; empty == any.
+	BoundAccountIDs []string `json:"boundAccountIds,omitempty"`
+	// ParentKeyID is the id of the key that minted this one; "" == root.
+	ParentKeyID string `json:"parentKeyId,omitempty"`
+	// MaxConcurrency is this key's per-key fairness baseline under contention
+	// (a soft floor, not a hard ceiling — idle pool capacity is always lent out):
+	//   0  → use the pool default (5)
+	//   N  → guarantee at least N concurrent slots for this key under contention
+	//   -1 → unlimited (bypass the fairness gate, like an admin/master key)
+	// In-memory/JSON only — there is no DB column for it yet, so it is not
+	// persisted when the PostgreSQL backend is active.
+	MaxConcurrency int `json:"maxConcurrency,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -232,7 +269,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.2"
+const Version = "1.1.3"
 
 var (
 	cfg     *Config
@@ -341,6 +378,16 @@ func Save() error {
 	return os.WriteFile(cfgPath, data, 0600)
 }
 
+// ConfigDir returns the directory holding the config file, so sibling runtime
+// data files (e.g. daily_stats.json) can live alongside it. Returns "." until
+// Init has run.
+func ConfigDir() string {
+	if cfgPath == "" {
+		return "."
+	}
+	return filepath.Dir(cfgPath)
+}
+
 // SetPassword updates the admin password.
 // Primarily used for environment variable override in containerized deployments.
 func SetPassword(password string) {
@@ -420,8 +467,106 @@ func GetEnabledAccounts() []Account {
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if account.CreatedAt == 0 {
+		account.CreatedAt = time.Now().Unix()
+	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := persistAccountLocked(account); err != nil {
+		// Roll back the in-memory append so we don't drift from the store.
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
+}
+
+// accountIdentityMatch reports whether two accounts refer to the same underlying
+// Kiro identity: same non-empty UserId, or (when UserId is unknown on either
+// side) same non-empty Email. This is the dedupe key used on (re-)import so the
+// same account refreshed with new tokens updates in place instead of piling up
+// duplicate rows.
+func accountIdentityMatch(a, b *Account) bool {
+	// Kiro API-key (ksk_) accounts carry no email/userId; the key itself is the
+	// stable identity, so dedupe on it first.
+	if strings.TrimSpace(a.KiroApiKey) != "" && strings.TrimSpace(b.KiroApiKey) != "" {
+		return strings.TrimSpace(a.KiroApiKey) == strings.TrimSpace(b.KiroApiKey)
+	}
+	if a.UserId != "" && b.UserId != "" {
+		return strings.EqualFold(strings.TrimSpace(a.UserId), strings.TrimSpace(b.UserId))
+	}
+	if a.Email != "" && b.Email != "" {
+		return strings.EqualFold(strings.TrimSpace(a.Email), strings.TrimSpace(b.Email))
+	}
+	return false
+}
+
+// AddOrReplaceAccount adds a new account, or — when one with the same identity
+// (UserId, else Email) already exists — refreshes that account's credentials in
+// place instead of creating a duplicate. On a match the existing ID, CreatedAt,
+// accumulated runtime stats and operator preferences (weight / proxy / nickname /
+// subscription cache) are preserved, while the auth credentials, region and
+// enabled state are updated from `account` (and any prior ban is cleared, since
+// the fresh credentials were just validated). The effective stored account —
+// including its stable ID — is written back into *account so callers report the
+// ID actually used. When `account` carries no identity (empty UserId AND Email)
+// it cannot be deduped and is appended like AddAccount.
+func AddOrReplaceAccount(account *Account) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	pick := func(next, cur string) string {
+		if strings.TrimSpace(next) != "" {
+			return next
+		}
+		return cur
+	}
+	for i := range cfg.Accounts {
+		existing := &cfg.Accounts[i]
+		if !accountIdentityMatch(account, existing) {
+			continue
+		}
+		existing.Email = pick(account.Email, existing.Email)
+		if account.Nickname != "" {
+			existing.Nickname = account.Nickname
+		}
+		if account.UserId != "" {
+			existing.UserId = account.UserId
+		}
+		existing.AccessToken = account.AccessToken
+		existing.RefreshToken = account.RefreshToken
+		existing.ClientID = account.ClientID
+		existing.ClientSecret = account.ClientSecret
+		existing.AuthMethod = pick(account.AuthMethod, existing.AuthMethod)
+		existing.Provider = pick(account.Provider, existing.Provider)
+		existing.Region = pick(account.Region, existing.Region)
+		existing.StartUrl = pick(account.StartUrl, existing.StartUrl)
+		existing.ExpiresAt = account.ExpiresAt
+		if account.ProfileArn != "" {
+			existing.ProfileArn = account.ProfileArn
+		}
+		existing.KiroApiKey = pick(account.KiroApiKey, existing.KiroApiKey)
+		existing.TokenEndpoint = pick(account.TokenEndpoint, existing.TokenEndpoint)
+		existing.IssuerUrl = pick(account.IssuerUrl, existing.IssuerUrl)
+		existing.Scopes = pick(account.Scopes, existing.Scopes)
+		if existing.MachineId == "" {
+			existing.MachineId = account.MachineId
+		}
+		// Fresh, just-validated credentials: re-enable and clear any prior ban.
+		existing.Enabled = true
+		existing.BanStatus = ""
+		existing.BanReason = ""
+		existing.BanTime = 0
+		snapshot := *existing
+		*account = snapshot
+		return persistAccountLocked(snapshot)
+	}
+	if account.CreatedAt == 0 {
+		account.CreatedAt = time.Now().Unix()
+	}
+	cfg.Accounts = append(cfg.Accounts, *account)
+	if err := persistAccountLocked(*account); err != nil {
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -429,8 +574,13 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			// Preserve the original CreatedAt when the incoming copy lacks one,
+			// keeping the DB ordering key stable across updates.
+			if account.CreatedAt == 0 {
+				account.CreatedAt = cfg.Accounts[i].CreatedAt
+			}
 			cfg.Accounts[i] = account
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -455,7 +605,7 @@ func UpdateAccountOverageStatus(id, status, capability string, cap, rate, curren
 			if checkedAt > 0 {
 				cfg.Accounts[i].OverageCheckedAt = checkedAt
 			}
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -474,7 +624,7 @@ func SetAccountEnabled(id string, enabled bool) error {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -493,7 +643,7 @@ func SetAccountBanStatus(id, status, reason string) error {
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -505,7 +655,7 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -517,7 +667,7 @@ func DeleteAccount(id string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+			return persistAccountDeleteLocked(id)
 		}
 	}
 	return nil
@@ -533,7 +683,7 @@ func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) e
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -545,10 +695,13 @@ func GetApiKey() string {
 	return cfg.ApiKey
 }
 
+// IsApiKeyRequired always returns true: API-key authentication is mandatory and
+// cannot be turned off. NorthGod Kiro-Go never runs open — when no keys are
+// configured, authenticate() fails closed. The legacy cfg.RequireApiKey flag is
+// retained only for backward-compatible JSON loading and is no longer consulted
+// for enforcement.
 func IsApiKeyRequired() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	return cfg.RequireApiKey
+	return true
 }
 
 func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
@@ -604,7 +757,7 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].TotalTokens = totalTokens
 			cfg.Accounts[i].TotalCredits = totalCredits
 			cfg.Accounts[i].LastUsed = lastUsed
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -636,7 +789,7 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			return Save()
+			return persistAccountLocked(cfg.Accounts[i])
 		}
 	}
 	return nil
@@ -819,15 +972,15 @@ func UpdateProxySettings(proxyURL string) error {
 	return Save()
 }
 
-// GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
+// GetAllowOverUsage is deprecated and always returns false. Over-quota routing is
+// now strictly per-account — only the upstream Overages switch (OverageStatus=
+// ENABLED) keeps an over-quota account routable. The former global override was
+// removed; this stub is kept so pool callers compile unchanged.
 func GetAllowOverUsage() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.AllowOverUsage
+	return false
 }
+
+
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.
 func UpdateAllowOverUsage(allow bool) error {

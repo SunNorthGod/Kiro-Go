@@ -121,7 +121,7 @@ func TestAuthenticateRejectsOverTokenLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 100, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, "", 100, 0, 0); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -152,7 +152,7 @@ func TestAuthenticateRejectsOverCreditLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, "", 0, 0, 1.0); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -202,20 +202,6 @@ func TestAuthenticateLegacyFallback(t *testing.T) {
 	}
 }
 
-func TestAuthenticateNoAuthRequired(t *testing.T) {
-	mustInitConfig(t)
-	// No keys configured, RequireApiKey defaults to false.
-	h := &Handler{}
-	r := newAuthTestRequest(t, "", "")
-	entry, err := h.authenticate(r)
-	if err != nil {
-		t.Fatalf("expected open access when no keys configured: %v", err)
-	}
-	if entry != nil {
-		t.Fatalf("expected nil entry when no key configured, got %v", entry)
-	}
-}
-
 func TestRouteWritesUnauthorizedClaude(t *testing.T) {
 	mustInitConfig(t)
 	if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "main", Key: "sk-claude", Enabled: true}); err != nil {
@@ -243,7 +229,7 @@ func TestRouteWritesTooManyRequestsOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 50, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, "", 50, 0, 0); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	requireAuth(t)
@@ -273,7 +259,7 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75)
+	h.recordSuccessForApiKey(created.ID, "", 25, 30, 0.75)
 
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
@@ -298,7 +284,7 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey("", 100, 100, 1)
+	h.recordSuccessForApiKey("", "", 100, 100, 1)
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
 		t.Fatalf("entry missing")
@@ -308,23 +294,26 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 }
 
-// Public deployments (RequireApiKey=false) must keep accepting all requests
-// even after keys exist in the config — e.g. an operator drafted some keys
-// but hasn't flipped the gate yet, or the legacy migration left a disabled
-// entry behind.
-func TestAuthenticateMasterSwitchOffPassesThrough(t *testing.T) {
+// Auth is mandatory and cannot be turned off: even if an operator never flips
+// the (now-vestigial) requireApiKey gate, requests are still enforced against
+// the configured keys — a missing/unknown key is rejected, a valid key passes.
+func TestAuthenticateAlwaysEnforcedRegardlessOfGate(t *testing.T) {
 	mustInitConfig(t)
 	if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "drafted", Key: "sk-drafted", Enabled: true}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	// RequireApiKey defaults to false — do not flip it on.
+	// Do NOT flip requireApiKey on — enforcement must happen anyway.
 
 	h := &Handler{}
-	if entry, err := h.authenticate(newAuthTestRequest(t, "", "")); err != nil || entry != nil {
-		t.Fatalf("expected open access without entry, got entry=%v err=%v", entry, err)
+	if _, err := h.authenticate(newAuthTestRequest(t, "", "")); err == nil {
+		t.Fatalf("expected missing key to be rejected even without flipping the gate")
 	}
-	if entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-anything")); err != nil || entry != nil {
-		t.Fatalf("expected provided key to be ignored when gate is off, got entry=%v err=%v", entry, err)
+	if _, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-unknown")); err == nil {
+		t.Fatalf("expected unknown key to be rejected")
+	}
+	entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-drafted"))
+	if err != nil || entry == nil {
+		t.Fatalf("expected valid key to authenticate, got entry=%v err=%v", entry, err)
 	}
 }
 

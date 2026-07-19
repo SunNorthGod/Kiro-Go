@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
@@ -158,6 +159,11 @@ type KiroPayload struct {
 	ProfileArn      string           `json:"profileArn,omitempty"`
 	InferenceConfig *InferenceConfig `json:"inferenceConfig,omitempty"`
 
+	// AdditionalModelRequestFields 承载 reasoning/output_config 的 effort 档位透传
+	// (按模型家族 schema 驱动)。为空则不序列化——空 schema 模型(sonnet-4.5/haiku 等)
+	// 发了会被上游 400 "additionalModelRequestFields is not supported for this model"。
+	AdditionalModelRequestFields map[string]interface{} `json:"additionalModelRequestFields,omitempty"`
+
 	// ToolNameMap maps sanitized tool names (sent to Kiro) back to the
 	// original names supplied by the client. Used to restore original names
 	// in tool_use responses so the client can match them to its tool registry.
@@ -215,6 +221,21 @@ type KiroHistoryMessage struct {
 type KiroAssistantResponseMessage struct {
 	Content  string        `json:"content"`
 	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+	// ReasoningContent 回传历史带签名的思考(延续工具循环的 interleaved thinking)。
+	// 嵌套 wire format {reasoningText:{text,signature}};仅当带模型真实签名时才发,
+	// 无签名/伪造签名一律省略(否则 Kiro 400 REQUEST_BODY_INVALID / THINKING_SIGNATURE_INVALID)。
+	ReasoningContent *KiroReasoningContent `json:"reasoningContent,omitempty"`
+}
+
+// KiroReasoningContent 是 Kiro 后端接受的历史推理 wire 格式(嵌套,非扁平;扁平会 400)。
+type KiroReasoningContent struct {
+	ReasoningText KiroReasoningText `json:"reasoningText"`
+}
+
+// KiroReasoningText 承载一段历史推理文本及其签名。
+type KiroReasoningText struct {
+	Text      string `json:"text"`
+	Signature string `json:"signature"`
 }
 
 type KiroToolUse struct {
@@ -239,6 +260,11 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnReasoningSignature fires when the model emits a native reasoning
+	// signature (reasoningContentEvent.signature, usually once at reasoning end).
+	// The signature must be relayed to the client as a signature_delta so the
+	// client can send it back on the next turn; Kiro rejects unsigned thinking.
+	OnReasoningSignature func(signature string)
 }
 
 // ==================== API Call ====================
@@ -332,8 +358,19 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	// Build endpoint list. external_idp(Microsoft Entra / Kiro 企业版)账号走 Kiro 数据面
+	// runtime.{region}.kiro.dev 单端点(其 Bearer 是客户 IdP 直签 token,不能走 AWS 直连,
+	// 也无 AWS 三端点回退);其余账号(idc/social/api_key)走 AWS q.{region}.amazonaws.com 并按配置回退。
+	var endpoints []kiroEndpoint
+	if auth.IsExternalIdpAccount(account) {
+		endpoints = []kiroEndpoint{{
+			URL:    "https://" + auth.ExternalIdpRuntimeHost(account.Region) + "/generateAssistantResponse",
+			Origin: "AI_EDITOR",
+			Name:   "ExternalIdP",
+		}}
+	} else {
+		endpoints = getSortedEndpoints(config.GetPreferredEndpoint())
+	}
 
 	var lastErr error
 	for _, ep := range endpoints {
@@ -483,6 +520,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
+				}
+			}
+			// Native reasoning signature (opus-4.8 等原生思考模型在推理结束时下发一次)。
+			// 必须收集并透传给客户端,否则思考签名丢失、下一轮无法带回、Kiro 拒收。
+			if sig, ok := event["signature"].(string); ok && sig != "" {
+				if callback.OnReasoningSignature != nil {
+					callback.OnReasoningSignature(sig)
 				}
 			}
 		case "toolUseEvent":
@@ -775,6 +819,41 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 		Name:      state.Name,
 		Input:     input,
 	})
+}
+
+// FakeSignatureMarker 是兜底伪造签名的前缀标记。
+// 当模型未下发真实签名但流中产生了 thinking 块时,用带此标记的伪造签名占位透传给客户端。
+// 下一轮请求把历史 thinking 带回时,请求侧据此前缀识别并剥离伪造签名——绝不能把伪造签名
+// 发回 Kiro,否则触发 THINKING_SIGNATURE_INVALID(400)。真实签名不带此标记,正常回传。
+const FakeSignatureMarker = "kirogofakesig"
+
+// LegacyRustFakeSignatureMarker 是旧 Rust 反代(kiro2cc-proxy)兜底伪造签名的前缀。
+// 从 Rust 反代迁移过来的老会话,历史 thinking 块里带的正是这个前缀的假签名。走 kirogo 时
+// 若不识别,会被当真签名发回 AWS → THINKING_SIGNATURE_INVALID(400) → SelfHeal 触发,把
+// reasoningContent + additionalModelRequestFields(含 effort)一并剥掉重试,导致该轮不思考。
+// 必须一并识别并剥离。来源:Rust stream.rs FAKE_SIGNATURE_MARKER。
+const LegacyRustFakeSignatureMarker = "FAKESIGk2ccPROXY"
+
+// generateFakeSignature 生成兜底思考签名(带 FakeSignatureMarker 前缀)。
+// Anthropic 客户端要求 thinking 块的 signature_delta 总长度 >= 100 字符才通过校验;
+// 当模型未下发真实签名(native_signature 缺失)但流中确实产生了 thinking 块时,
+// 用此兜底签名占位,避免客户端因签名缺失/过短而报错。
+func generateFakeSignature() string {
+	var sb strings.Builder
+	sb.WriteString(FakeSignatureMarker)
+	for sb.Len() < 120 {
+		sb.WriteString(strings.ReplaceAll(uuid.New().String(), "-", ""))
+	}
+	return sb.String()
+}
+
+// isFakeSignature 判断签名是否为兜底伪造(本代理 FakeSignatureMarker 前缀,或旧 Rust
+// 反代 LegacyRustFakeSignatureMarker 前缀)。请求侧回传历史推理时用它剥离伪造签名,
+// 避免把无效签名发回 Kiro 触发 THINKING_SIGNATURE_INVALID(400)。真实模型签名不带任何
+// 已知前缀,正常回传。
+func isFakeSignature(sig string) bool {
+	return strings.HasPrefix(sig, FakeSignatureMarker) ||
+		strings.HasPrefix(sig, LegacyRustFakeSignatureMarker)
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {

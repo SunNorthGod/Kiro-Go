@@ -1,4 +1,4 @@
-/* Kiro-Go admin stylesheet. Keep selector order stable. */
+/* NorthGod Kiro-Go admin stylesheet. Keep selector order stable. */
 
 @import url("https://fonts.googleapis.com/css2?family=Geist:wght@100;200;300;400;500;600;700;800;900&family=Geist+Mono:wght@100;200;300;400;500;600;700;800;900&display=swap");
 
@@ -387,22 +387,22 @@ input[type="tel"],
 textarea,
 select {
   font-family: inherit;
-  font-size: 0.875rem;
+  font-size: 0.9375rem;
   background: var(--background);
   color: var(--foreground);
   border: 1px solid var(--input);
   border-radius: var(--radius-md);
-  padding: 0.5rem 0.75rem;
-  height: 2.25rem;
+  padding: 0.625rem 0.875rem;
+  height: 2.625rem;
   width: 100%;
   outline: none;
   transition: border-color 0.15s;
 }
 textarea {
   height: auto;
-  min-height: 5rem;
-  resize: none;
-  line-height: 1.5;
+  min-height: 6.5rem;
+  resize: vertical;
+  line-height: 1.55;
 }
 .input:focus,
 input:not([type="checkbox"]):not([type="radio"]):focus,
@@ -413,6 +413,12 @@ select:focus {
 input::placeholder,
 textarea::placeholder {
   color: var(--muted-foreground);
+}
+/* Drag-over state for textareas that accept a dropped credentials file. */
+textarea.is-dragover {
+  border-color: var(--border-focus);
+  border-style: dashed;
+  background: color-mix(in oklab, var(--brand-purple) 8%, var(--background));
 }
 input[disabled],
 select[disabled],
@@ -564,7 +570,7 @@ select.custom-select-native {
 
 /* Form groups */
 .form-group {
-  margin-bottom: 1rem;
+  margin-bottom: 1.15rem;
 }
 .form-group-lg {
   margin-bottom: 1.75rem;
@@ -624,10 +630,10 @@ select.custom-select-native {
 }
 .form-group label {
   display: block;
-  font-size: 0.8125rem;
+  font-size: 0.875rem;
   font-weight: 500;
   color: var(--foreground);
-  margin-bottom: 0.375rem;
+  margin-bottom: 0.5rem;
 }
 .form-group small {
   display: block;
@@ -856,6 +862,13 @@ label:has(> .switch) > span {
   filter: var(--kiro-icon-filter);
   flex: none;
 }
+/* Footer logo: colored image, circular crop, no theme invert. */
+img.footer-icon.footer-logo {
+  border-radius: 50%;
+  object-fit: cover;
+  filter: none;
+  background: var(--card);
+}
 .footer-copy {
   min-width: 0;
 }
@@ -1081,6 +1094,13 @@ img.brand-icon {
   filter: var(--kiro-icon-filter);
   display: block;
 }
+/* Brand logo: colored image, circular crop, no theme invert. */
+img.brand-icon.brand-logo {
+  border-radius: 50%;
+  object-fit: cover;
+  filter: none;
+  background: var(--card);
+}
 .topbar-actions {
   display: inline-flex;
   align-items: center;
@@ -1161,7 +1181,7 @@ img.brand-icon {
   padding: 0.875rem 1rem;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 0.625rem;
   min-width: 0;
 }
@@ -1300,13 +1320,24 @@ img.brand-icon {
 .logs-list {
   max-height: 60vh;
   overflow-y: auto;
+  overflow-x: hidden; /* fixed-layout table fits the container: no horizontal scrollbar */
   border-top: 1px solid var(--border);
 }
 .logs-table {
   width: 100%;
   font-size: 0.75rem;
   border-collapse: collapse;
+  table-layout: fixed; /* honour the colgroup widths so the table never overflows */
 }
+/* Column widths (8 cols): time status endpoint model account tokens duration detail = 100% */
+.logs-table col.lc-time { width: 9%; }
+.logs-table col.lc-status { width: 7%; }
+.logs-table col.lc-endpoint { width: 12%; }
+.logs-table col.lc-model { width: 15%; }
+.logs-table col.lc-account { width: 13%; }
+.logs-table col.lc-tokens { width: 8%; }
+.logs-table col.lc-duration { width: 8%; }
+.logs-table col.lc-detail { width: 28%; }
 .logs-table th {
   text-align: left;
   padding: 0.5rem;
@@ -1314,6 +1345,8 @@ img.brand-icon {
   font-weight: 500;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   position: sticky;
   top: 0;
   background: var(--card);
@@ -1323,20 +1356,19 @@ img.brand-icon {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap; /* truncate long single-line cells (endpoint/model/account) */
 }
 .logs-table tr:last-child td {
   border-bottom: none;
 }
-.logs-table .log-msg {
-  max-width: 360px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--destructive);
-}
-.logs-table .log-msg:hover {
+.logs-table td.log-cell-wrap {
   white-space: normal;
-  word-break: break-all;
+  word-break: break-word; /* error/detail column wraps instead of forcing width */
+}
+.logs-table .log-msg {
+  color: var(--destructive);
 }
 .log-status {
   display: inline-block;
@@ -1724,157 +1756,23 @@ img.brand-icon {
 }
 
 /* Account cards */
+/* Account rows (dense Rust-style list). Row = one account; shares .ng-row-*
+   internals defined in the ng- component section. .account-card class is kept
+   so existing JS hooks (selected/loading/checkbox delegation) still work. */
 .account-card {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.7rem 1rem;
   background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 1rem 1.25rem;
-  margin-bottom: 0.75rem;
-  transition:
-    border-color 0.15s,
-    background-color 0.15s;
+  border-bottom: 1px solid var(--border);
+  transition: background-color 0.15s ease;
 }
-.account-card:hover {
-  border-color: var(--border-focus);
-}
-.account-card.selected {
-  border-color: var(--border-focus);
-  background: color-mix(in oklab, var(--primary) 6%, var(--card));
-}
-.account-card.loading {
-  opacity: 0.6;
-  pointer-events: none;
-}
-.account-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
-  flex-wrap: wrap;
-}
-.account-info {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  min-width: 0;
-  flex: 1;
-}
-.account-email {
-  font-size: 0.9375rem;
-  font-weight: 600;
-  color: var(--foreground);
-  word-break: break-all;
-  line-height: 1.4;
-}
-.account-meta {
-  display: flex;
-  gap: 0.25rem;
-  flex-wrap: wrap;
-  margin-top: 0.375rem;
-}
-.account-actions {
-  display: flex;
-  gap: 0.375rem;
-  flex-wrap: wrap;
-  align-items: center;
-}
-.account-actions .btn-icon,
-.account-actions .btn-icon:hover,
-.account-actions .btn-icon:active {
-  background: transparent;
-  border-color: transparent;
-}
-.account-actions .btn-icon svg {
-  transition:
-    filter 0.15s ease,
-    transform 0.12s ease;
-}
-.account-actions .btn-icon:hover svg {
-  transform: scale(1.14);
-  animation: account-action-icon-flash 0.7s ease-in-out infinite;
-}
-.account-actions .btn-icon:active svg {
-  transform: scale(1.04);
-}
-.account-actions .btn-icon.btn-success {
-  background: transparent;
-  border-color: transparent;
-}
-@keyframes account-action-icon-flash {
-  0% {
-    filter: brightness(1);
-  }
-  50% {
-    filter: brightness(1.8);
-  }
-  100% {
-    filter: brightness(1);
-  }
-}
-.account-stats {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  justify-items: center;
-  gap: 0.5rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border);
-}
-@media (max-width: 640px) {
-  .account-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-@media (max-width: 720px) {
-  .account-header {
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .account-actions {
-    width: 100%;
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 0.5rem;
-  }
-  .account-actions .btn {
-    width: 100%;
-    min-width: 0;
-    height: 2.625rem;
-    padding: 0 0.5rem;
-  }
-  .account-actions .btn-icon,
-  .account-actions .btn-icon:hover,
-  .account-actions .btn-icon:active,
-  .account-actions .btn-icon.btn-success {
-    background: var(--background);
-    border-color: var(--border);
-  }
-  .account-actions .btn-icon:hover svg,
-  .account-actions .btn-icon:active svg {
-    transform: none;
-    animation: none;
-  }
-}
-.account-stat {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  width: 100%;
-  gap: 0.125rem;
-  text-align: center;
-}
-.account-stat-value {
-  font-size: 0.875rem;
-  font-weight: 600;
-  font-feature-settings: "tnum";
-  color: var(--foreground);
-}
-.account-stat-label {
-  font-size: 0.6875rem;
-  color: var(--muted-foreground);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
+.account-card:last-child { border-bottom: none; }
+.account-card:hover { background: color-mix(in oklab, var(--muted) 45%, var(--card)); }
+.account-card.selected { background: color-mix(in oklab, var(--primary) 8%, var(--card)); }
+.account-card.loading { opacity: 0.6; pointer-events: none; }
+.account-checkbox { flex: none; margin: 0; width: 1rem; height: 1rem; accent-color: var(--primary); cursor: pointer; }
 
 /* Usage bars */
 .account-usage {
@@ -3658,4 +3556,743 @@ img.brand-icon {
   .stats-view-grid {
     grid-template-columns: repeat(2, 1fr);
   }
+}
+
+/* ============================================================
+   Card billing (Keys tab), login imports, account added-time,
+   concurrency board, and card-detail modal. Flat, token-driven.
+   ============================================================ */
+
+/* Card subtitle + title icon */
+.card-subtitle {
+  margin: -0.35rem 0 1rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+}
+.card-title-icon {
+  margin-right: 0.45rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+
+/* Account added-at / uptime subline */
+.account-subline {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+  font-size: 0.6875rem;
+  color: var(--muted-foreground);
+  flex-wrap: wrap;
+  font-feature-settings: "tnum";
+}
+.account-subline-icon {
+  font-size: 0.6875rem;
+  opacity: 0.75;
+}
+.account-subline-sep {
+  display: inline-block;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+/* Settings → Keys link row */
+.settings-keys-link small {
+  display: block;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  margin-top: 0.375rem;
+  line-height: 1.5;
+}
+
+/* Form section titles + two-column grid (used in card modal) */
+.form-section-title {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted-foreground);
+  margin: 1.25rem 0 0.75rem;
+  padding-bottom: 0.375rem;
+  border-bottom: 1px solid var(--border);
+}
+.form-section-title:first-child {
+  margin-top: 0;
+}
+.form-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 1rem;
+}
+.form-group-inline {
+  flex: 1 1 8rem;
+  min-width: 8rem;
+}
+.ext-idp-hint {
+  display: block;
+  margin-top: -0.5rem;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+@media (max-width: 560px) {
+  .form-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Bound-accounts checklist (card modal) */
+.bound-accounts-list {
+  max-height: 11rem;
+  overflow-y: auto;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-md);
+  padding: 0.375rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.25rem;
+  background: var(--background);
+}
+.bound-account-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  min-width: 0;
+  user-select: none;
+}
+.bound-account-item:hover {
+  background: var(--muted);
+}
+.bound-account-item input {
+  flex: none;
+  width: 1rem;
+  accent-color: var(--primary);
+}
+.bound-account-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bound-accounts-empty {
+  padding: 0.5rem;
+}
+@media (max-width: 560px) {
+  .bound-accounts-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Keys tab list */
+.keys-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.keys-toolbar {
+  padding-bottom: 1rem;
+}
+/* Key rows (dense Rust-style list). .key-card kept as the JS/state hook
+   (is-disabled/is-sub/is-parent/is-expired); internals use .ng-row-*. */
+.key-card {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.7rem 1rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  transition: background-color 0.15s ease;
+}
+.key-card:last-child { border-bottom: none; }
+.key-card:hover { background: color-mix(in oklab, var(--muted) 45%, var(--card)); }
+.key-card.is-disabled { opacity: 0.62; }
+.key-card.is-sub { border-left: 3px solid color-mix(in oklab, var(--brand-purple) 60%, var(--border)); }
+.key-card.is-parent { border-left: 3px solid color-mix(in oklab, var(--info) 55%, var(--border)); }
+.key-card.is-expired { background: color-mix(in oklab, var(--destructive) 6%, var(--card)); }
+/* Child (sub-card) rows sit indented under their parent, joined by a purple
+   spine running down the indent gutter to a ↳ connector. Consecutive children
+   share one continuous line, so a parent + its sub-cards read as one group. */
+.key-card.key-child-row { padding-left: 2.6rem; position: relative; }
+.key-card.key-child-row::before {
+  content: ""; position: absolute; left: 1.2rem; top: 0; bottom: 0;
+  width: 2px; background: color-mix(in oklab, var(--brand-purple) 42%, var(--border));
+}
+/* Indented children lean on the spine, so drop their own edge border to avoid a
+   double purple line. Standalone sub-cards (parent filtered out) keep the edge. */
+.key-card.key-child-row.is-sub { border-left-color: transparent; }
+.key-child-connector {
+  color: color-mix(in oklab, var(--brand-purple) 70%, var(--muted-foreground));
+  flex: none; font-size: 0.8rem; position: relative; z-index: 1; margin-left: -0.5rem;
+}
+.key-tags {
+  display: inline-flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+.key-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.625rem;
+  font-weight: 700;
+  padding: 0.0625rem 0.4375rem;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+}
+.key-tag-sub {
+  background: color-mix(in oklab, var(--brand-purple) 16%, transparent);
+  color: var(--brand-purple);
+  border-color: color-mix(in oklab, var(--brand-purple) 40%, transparent);
+}
+.key-tag-migrated {
+  background: color-mix(in oklab, var(--info) 15%, transparent);
+  color: var(--info);
+  border-color: color-mix(in oklab, var(--info) 38%, transparent);
+}
+.key-tag-disabled {
+  background: var(--muted);
+  color: var(--muted-foreground);
+  border-color: var(--border);
+}
+.key-tag-expired {
+  background: color-mix(in oklab, var(--destructive) 15%, transparent);
+  color: var(--destructive);
+  border-color: color-mix(in oklab, var(--destructive) 38%, transparent);
+}
+/* Key value inline chip (shown in the row subline; copy buttons follow it) */
+.key-inline {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+  max-width: 15rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.08rem 0.4rem;
+}
+.ng-copy-btn.ng-copy-xs { padding: 0.12rem 0.4rem; font-size: 0.7rem; }
+
+/* Concurrency board */
+.concurrency-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.625rem;
+}
+.concurrency-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted);
+  padding: 0.75rem 0.875rem;
+  text-align: center;
+}
+.concurrency-value {
+  font-size: 1.375rem;
+  font-weight: 700;
+  color: var(--foreground);
+  letter-spacing: -0.02em;
+  font-feature-settings: "tnum";
+  line-height: 1.1;
+}
+.concurrency-item--success .concurrency-value {
+  color: var(--success);
+}
+.concurrency-item--info .concurrency-value {
+  color: var(--info);
+}
+.concurrency-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.25rem;
+}
+@media (max-width: 640px) {
+  .concurrency-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Top-up modal */
+.topup-card-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.75rem 0.875rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted);
+}
+
+/* Card detail modal */
+.key-detail-modal-content {
+  width: min(56rem, 94vw);
+}
+.key-detail-name {
+  margin-left: 0.5rem;
+  color: var(--muted-foreground);
+  font-weight: 500;
+  font-size: 0.8125rem;
+}
+.key-detail-subtabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+.key-subtab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  padding: 0.5rem 0.875rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.key-subtab:hover {
+  color: var(--foreground);
+}
+.key-subtab.active {
+  color: var(--foreground);
+  border-bottom-color: var(--primary);
+}
+.key-detail-content {
+  min-height: 12rem;
+}
+.key-detail-subheading {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 1.25rem 0 0.625rem;
+}
+.key-detail-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.625rem;
+}
+.key-detail-unavailable i {
+  font-size: 1.5rem;
+  opacity: 0.5;
+}
+.key-children-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.75rem;
+}
+
+/* Card summary grid (detail modal) */
+.key-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.625rem;
+}
+.key-summary-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted);
+  padding: 0.875rem 0.75rem;
+  text-align: center;
+}
+.key-summary-value {
+  font-size: 1.375rem;
+  font-weight: 700;
+  color: var(--foreground);
+  letter-spacing: -0.02em;
+  font-feature-settings: "tnum";
+  line-height: 1.15;
+}
+.key-summary-item--balance .key-summary-value {
+  color: var(--success);
+}
+.key-summary-item--used .key-summary-value {
+  color: var(--info);
+}
+.key-summary-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.3125rem;
+}
+@media (max-width: 640px) {
+  .key-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Generic data table + pager (recharges / usage / children) */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.data-table th {
+  text-align: left;
+  padding: 0.5rem 0.625rem;
+  color: var(--muted-foreground);
+  font-weight: 500;
+  font-size: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.data-table td {
+  padding: 0.5rem 0.625rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  color: var(--foreground);
+}
+.data-table tr:last-child td {
+  border-bottom: none;
+}
+.data-table .ta-right {
+  text-align: right;
+  font-feature-settings: "tnum";
+}
+.data-table .data-pos {
+  color: var(--success);
+  font-weight: 600;
+}
+.data-table .data-note {
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-foreground);
+}
+.data-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.875rem;
+  flex-wrap: wrap;
+}
+.data-pager-total {
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+}
+.data-pager-ctrl {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.data-pager-info {
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+  font-feature-settings: "tnum";
+  min-width: 5rem;
+  text-align: center;
+}
+
+/* ================================================================
+   NorthGod 概览 / 图表 / 工具条 共享基础组件 (ng- 前缀, 管理台与用户门户共用)
+   扁平 UI: 不用阴影, 悬停走边框/背景过渡; 深浅色均通过 var() token 自适应。
+   约定: 子 Agent 不改本文件, 直接复用这些 class; 组件级特例写各自 HTML 的 <style>。
+   ================================================================ */
+
+/* 面板 / 标签切换淡入 */
+@keyframes ngFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ng-fade-in { animation: ngFadeIn 0.22s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .ng-fade-in { animation: none; }
+}
+
+/* 统计卡片网格: 自动换行 + 等高 (子项拉伸铺满, 解决高度参差) */
+.ng-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  align-items: stretch;
+}
+.ng-grid > * { height: 100%; }
+.ng-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ng-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.ng-grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 760px) {
+  .ng-grid-2, .ng-grid-3, .ng-grid-4 { grid-template-columns: 1fr; }
+}
+
+/* 统计小卡 (分发到各页的指标块) */
+.ng-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.ng-stat:hover { border-color: var(--border-focus); }
+.ng-stat-label { font-size: 0.8rem; color: var(--muted-foreground); display: flex; align-items: center; gap: 0.4rem; }
+.ng-stat-value { font-size: 1.7rem; font-weight: 700; line-height: 1.1; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.ng-stat-sub { font-size: 0.75rem; color: var(--muted-foreground); }
+
+/* 交互卡片悬停 (扁平: 仅边框过渡, 不用阴影) */
+.ng-hover { transition: border-color 0.18s ease, background 0.18s ease; }
+.ng-hover:hover { border-color: var(--border-focus); }
+
+/* 图表容器: 必须给固定高度, canvas 才能响应式收缩而不无限撑高 */
+.ng-chart { position: relative; width: 100%; height: 280px; }
+.ng-chart-sm { height: 200px; }
+
+/* 工具条: 搜索 + 筛选 + 排序 同一行对齐, 窄屏自动换行 */
+.ng-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; }
+.ng-toolbar-grow { flex: 1 1 220px; min-width: 160px; }
+.ng-toolbar-spacer { flex: 1 1 auto; }
+
+/* 复制按钮 (URL / Key 一键复制) */
+.ng-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+.ng-copy-btn:hover { border-color: var(--border-focus); color: var(--foreground); background: var(--muted); }
+.ng-copy-btn.ng-copied { color: var(--success); border-color: var(--success); }
+
+/* 可排序表头 */
+.ng-sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.ng-sortable::after { content: "\2195"; opacity: 0.35; margin-left: 0.3rem; font-size: 0.8em; }
+.ng-sortable.ng-sort-asc::after { content: "\2191"; opacity: 0.9; }
+.ng-sortable.ng-sort-desc::after { content: "\2193"; opacity: 0.9; }
+
+/* 实时 RPM 徽标 (脉冲点表示有活跃流量) */
+.ng-rpm { display: inline-flex; align-items: center; gap: 0.3rem; font-variant-numeric: tabular-nums; font-weight: 600; }
+.ng-rpm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-foreground); flex: none; }
+.ng-rpm-live .ng-rpm-dot { background: var(--success); animation: ngPulse 1.6s ease-in-out infinite; }
+@keyframes ngPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* ================================================================
+   Admin polish round: grouped overview sections, aligned filter/sort
+   fields, dense Rust-style rows for accounts + keys, overview daily
+   table. Flat only (no shadows); all tokens theme-aware.
+   ================================================================ */
+
+/* Overview: labelled stat sections */
+.ov-sections { display: flex; flex-direction: column; gap: 1.35rem; }
+.ng-section { display: flex; flex-direction: column; gap: 0.7rem; }
+.ng-section-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted-foreground);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ng-section-title::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* Aligned label + control field inside a .ng-toolbar (search/filter/sort) */
+.ng-filter-toolbar { padding-bottom: 1rem; }
+.ng-field { display: inline-flex; align-items: center; gap: 0.5rem; flex: 0 0 auto; }
+.ng-field-label {
+  font-size: 0.78rem;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.ng-field-label i { font-size: 0.72rem; opacity: 0.8; }
+.ng-field > .custom-select { flex: 0 0 auto; width: 11rem; }
+@media (max-width: 640px) {
+  .ng-field { flex: 1 1 100%; }
+  .ng-field > .custom-select { flex: 1 1 auto; width: auto; }
+}
+
+/* Dense list container (rows divided by hairlines, Rust-admin feel) */
+.ng-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  overflow: hidden;
+}
+.ng-list > .empty-state { border: 0; }
+
+/* Shared dense-row internals (used by .account-card and .key-card rows) */
+.ng-row-main { min-width: 0; flex: 1 1 15rem; display: flex; flex-direction: column; gap: 0.3rem; }
+.ng-row-title { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.ng-row-name { font-size: 0.9rem; font-weight: 600; color: var(--foreground); word-break: break-all; line-height: 1.35; }
+.ng-row-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem 0.7rem;
+  flex-wrap: wrap;
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+.ng-row-sub .ng-sub-seg { display: inline-flex; align-items: center; gap: 0.3rem; min-width: 0; }
+.ng-row-sub .ng-sub-seg i { opacity: 0.7; font-size: 0.68rem; }
+/* Metadata strip: 过期 · 并发 · 绑定账号 … read as one compact line with dot
+   separators, instead of each item wrapping onto its own row. */
+.ng-row-sub--meta { gap: 0.2rem 0.55rem; }
+.ng-row-sub--meta .ng-sub-seg { position: relative; }
+.ng-row-sub--meta .ng-sub-seg + .ng-sub-seg::before {
+  content: "\00b7";
+  margin-right: 0.55rem;
+  opacity: 0.45;
+}
+.ng-row-metrics { display: flex; align-items: center; gap: 0.35rem 1.15rem; flex-wrap: wrap; flex: 0 0 auto; }
+.ng-metric { display: flex; flex-direction: column; align-items: center; text-align: center; min-width: 3.4rem; line-height: 1.15; }
+.ng-metric-val { font-size: 0.9rem; font-weight: 700; color: var(--foreground); font-variant-numeric: tabular-nums; }
+.ng-metric-val.success-text { color: var(--success); }
+.ng-metric-label { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted-foreground); white-space: nowrap; }
+.ng-usage-mini {
+  width: 3.4rem;
+  height: 4px;
+  margin-top: 4px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+.ng-row-actions { display: flex; align-items: center; gap: 0.3rem; flex-wrap: wrap; flex: 0 0 auto; justify-content: flex-end; }
+.ng-row-actions .btn-icon { background: transparent; border-color: transparent; }
+.ng-row-actions .btn-icon:hover { background: var(--muted); border-color: var(--border); }
+
+/* ── Round-4: grouped tag strip + soft-tinted data blocks ── */
+/* Attribute + state badges are grouped on their own line below the name, so the
+   title line stays clean (just a health dot + the name). */
+.ng-row-tags { display: flex; align-items: center; gap: 0.3rem; flex-wrap: wrap; }
+.ng-row-tags:empty { display: none; }
+
+/* Title-line health dot: green = ok, amber = warn (disabled / overspent),
+   red = bad (banned / expired / no token). The specifics live in the tag strip. */
+.ng-status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted-foreground); }
+.ng-status-dot.is-ok { background: var(--success); box-shadow: 0 0 0 3px color-mix(in oklab, var(--success) 22%, transparent); }
+.ng-status-dot.is-warn { background: var(--warning); box-shadow: 0 0 0 3px color-mix(in oklab, var(--warning) 22%, transparent); }
+.ng-status-dot.is-bad { background: var(--destructive); box-shadow: 0 0 0 3px color-mix(in oklab, var(--destructive) 22%, transparent); }
+
+/* Priority: a soft, low-emphasis chip (metadata, not a status). */
+.badge-priority {
+  background: color-mix(in oklab, var(--info) 12%, var(--card));
+  color: color-mix(in oklab, var(--info) 66%, var(--foreground));
+  border-color: color-mix(in oklab, var(--info) 28%, transparent);
+}
+
+/* The two data blocks replace the flat metric row: 计费 (warm) + 流量 (blue).
+   Soft, low-saturation tints group "money" vs "traffic" at a glance. */
+.ng-row-blocks { display: flex; align-items: stretch; gap: 0.5rem; flex: 0 0 auto; flex-wrap: wrap; }
+.ng-block {
+  display: flex; align-items: center; gap: 0.3rem 1rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+}
+.ng-block--credit {
+  background: color-mix(in oklab, var(--warning) 10%, var(--card));
+  border-color: color-mix(in oklab, var(--warning) 24%, transparent);
+}
+.ng-block--traffic {
+  background: color-mix(in oklab, var(--info) 9%, var(--card));
+  border-color: color-mix(in oklab, var(--info) 22%, transparent);
+}
+/* Even, fixed-width columns so every metric lines up top-to-bottom across cards.
+   Numbers are pre-compacted (1.7B / 21.9K) so they always fit — no truncation. */
+.ng-block .ng-metric { flex: 1 1 0; min-width: 0; align-items: center; text-align: center; }
+/* Fixed block widths + right alignment → the orange/blue blocks start and end at
+   the same x on every card, instead of drifting with content width. Blocks are
+   vertically centered against the card and share one baseline height. */
+.ng-row-blocks { justify-content: flex-end; align-items: center; }
+.ng-block { gap: 0.3rem 0.5rem; align-items: center; }
+.ng-block--credit { width: 13rem; flex: none; justify-content: center; }
+.ng-block--traffic { width: 12rem; flex: none; justify-content: center; }
+
+@media (max-width: 860px) {
+  .account-card, .key-card { flex-wrap: wrap; }
+  .ng-row-metrics { width: 100%; justify-content: flex-start; gap: 0.35rem 1.5rem; }
+  .ng-row-blocks { width: 100%; }
+  .ng-block, .ng-block--credit, .ng-block--traffic { width: auto; flex: 1 1 auto; justify-content: flex-start; gap: 0.35rem 1.25rem; }
+  .ng-metric { align-items: flex-start; }
+  .ng-block .ng-metric { flex: 0 1 auto; align-items: flex-start; text-align: left; }
+  .ng-usage-mini { width: 4.5rem; }
+  .ng-row-actions { width: 100%; justify-content: flex-start; }
+}
+
+/* Sub-card (parent) tag colour */
+.key-tag-parent {
+  background: color-mix(in oklab, var(--info) 15%, transparent);
+  color: var(--info);
+  border-color: color-mix(in oklab, var(--info) 38%, transparent);
+}
+
+/* Overview daily history table */
+.ov-daily-table { max-height: 340px; overflow-y: auto; overflow-x: hidden; }
+.ov-daily-table .data-table { table-layout: fixed; }
+.ov-daily-table .ov-daily-date { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ov-daily-table .data-table th { position: sticky; top: 0; background: var(--card); z-index: 1; }
+
+/* ── Round-4: reseller (self-service sub-card) portal ── */
+.up-section-stack { display: flex; flex-direction: column; gap: 1rem; }
+.res-pool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+.res-create-grid { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 0.75rem; align-items: end; }
+.res-create-btn { height: 2.5rem; white-space: nowrap; }
+.res-alloc-hint { display: inline-flex; align-items: center; gap: 0.35rem; margin-top: 0.6rem; color: var(--muted-foreground); }
+.res-child-list { display: flex; flex-direction: column; }
+.res-child { display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap; padding: 0.75rem 0.25rem; border-bottom: 1px solid var(--border); }
+.res-child:last-child { border-bottom: none; }
+.res-child-main { flex: 1 1 16rem; min-width: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.res-child-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.res-child-name { font-weight: 600; color: var(--foreground); word-break: break-all; }
+.res-child-key { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.res-child-key code {
+  font-size: 0.75rem; padding: 0.15rem 0.45rem; border-radius: var(--radius-sm);
+  background: var(--muted); color: var(--muted-foreground);
+  max-width: 24rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.res-child-meta { font-size: 0.72rem; color: var(--muted-foreground); }
+.res-child-actions { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.res-child--editing { align-items: flex-end; }
+.res-edit-grid { flex: 1 1 16rem; display: grid; grid-template-columns: 2fr 1fr; gap: 0.75rem; }
+
+@media (max-width: 720px) {
+  .res-pool-grid { grid-template-columns: repeat(2, 1fr); }
+  .res-create-grid { grid-template-columns: 1fr 1fr; }
+  .res-create-btn { grid-column: 1 / -1; }
+  .res-edit-grid { grid-template-columns: 1fr; }
+  .res-child-actions { width: 100%; }
 }

@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,6 +39,15 @@ var modelAliases = []modelMapping{
 // Minor is capped at 1-2 digits with a \b boundary so dated snapshots
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
+
+// datedSnapshotSuffix matches a trailing dated snapshot suffix (e.g. "-20250929")
+// that Anthropic SDKs / Claude Code append to model names (claude-sonnet-4-5-20250929,
+// claude-opus-4-1-20250805, claude-3-5-sonnet-20241022 ...). Kiro model IDs carry
+// no such date; leaving it attached produces an invalid ID after version
+// normalization (claude-sonnet-4.5-20250929) → upstream 400 / pool 503. It is
+// stripped early in ParseModelAndThinking so every downstream step sees a clean
+// name. Substring aliases still match, and Kiro IDs never end in a 6-8 digit run.
+var datedSnapshotSuffix = regexp.MustCompile(`-\d{6,8}$`)
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
@@ -78,6 +89,16 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		lower = strings.ToLower(model)
 	}
 
+	// Strip a trailing dated snapshot suffix (e.g. "-20250929") that Anthropic
+	// SDKs / Claude Code append (claude-sonnet-4-5-20250929, claude-opus-4-1-20250805).
+	// Kiro model IDs carry no date; leaving it attached yields an invalid ID after
+	// version normalization (claude-sonnet-4.5-20250929) → upstream 400 / pool 503.
+	// Done before alias/version matching so every downstream step sees a clean name.
+	if datedSnapshotSuffix.MatchString(model) {
+		model = datedSnapshotSuffix.ReplaceAllString(model, "")
+		lower = strings.ToLower(model)
+	}
+
 	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
 	for _, m := range modelAliases {
 		if strings.Contains(lower, m.key) {
@@ -112,6 +133,28 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 	return kind == "enabled" || kind == "adaptive"
 }
 
+// claudeEffortRequested 判断客户端是否通过 Kiro 原生 output_config.effort 表达了思考意图。
+//
+// 这是"完全不返回思考"的根因所在:原生 Kiro 客户端(及对齐它的 api2kiro 插件)默认 auto 档
+// **只发** output_config.effort —— 既不带 thinking 字段,模型名也不带 -thinking 后缀。
+// 此前 kirogo 的响应侧推理门只认 thinking 布尔(后缀/thinking字段),effort-only 请求门恒关,
+// AWS 后端产出的 reasoningContentEvent 被静默丢弃(实测 #1-#4:effort-only=0 段,thinking字段=17 段)。
+//
+// 对齐旧 Rust 反代黄金实现 `thinking_enabled = thinking.is_enabled() || output_config.is_some()`:
+// 两类信号任一命中即开响应门。客户端显式关思考(thinking.type=="disabled")时以关闭为准。
+//
+// 注意:这只用于**响应门**(是否转发思考),不改**请求侧**——系统 <thinking_mode> 标签仍只在
+// 显式 thinking 时注入,忠实复刻原生 Kiro(它发 effort 时并不带该标签,思考由 effort 自适应)。
+func claudeEffortRequested(req *ClaudeRequest) bool {
+	if req == nil {
+		return false
+	}
+	if req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled") {
+		return false
+	}
+	return req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != ""
+}
+
 func MapModel(model string) string {
 	mapped, _ := ParseModelAndThinking(model, "-thinking")
 	return mapped
@@ -130,6 +173,23 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	// OutputConfig 是 Kiro 生态扩展字段(非标准 Anthropic):承载 effort 档位与 GPT reasoning.mode。
+	// 客户端未传时 effort 默认 high。
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+	// Metadata 承载 Anthropic 的 metadata.user_id。Claude Code 在其中编码 session UUID,
+	// 用于派生确定性 conversationId / agentContinuationId,命中 Kiro 前缀缓存。
+	Metadata *ClaudeMetadata `json:"metadata,omitempty"`
+}
+
+// ClaudeMetadata 是 Anthropic messages 请求的 metadata 字段(仅取 user_id)。
+type ClaudeMetadata struct {
+	UserID string `json:"user_id,omitempty"`
+}
+
+// ClaudeOutputConfig 承载思考档位(effort: low/medium/high/xhigh/max)与 GPT reasoning 模式(mode: standard/pro)。
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+	Mode   string `json:"mode,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -239,12 +299,24 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				})
 			}
 		} else if msg.Role == "assistant" {
-			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			content, toolUses, reasoningText, reasoningSig := extractClaudeAssistantContent(msg.Content)
+			asst := &KiroAssistantResponseMessage{
+				Content:  content,
+				ToolUses: toolUses,
+			}
+			// 回传历史带签名的思考(interleaved thinking 跨工具轮)。仅当带模型真实签名时才发:
+			// 无签名 / 伪造签名(kirogofakesig 前缀)一律省略,否则 Kiro 400
+			// (REQUEST_BODY_INVALID / THINKING_SIGNATURE_INVALID)。
+			if reasoningText != "" && reasoningSig != "" && !isFakeSignature(reasoningSig) {
+				asst.ReasoningContent = &KiroReasoningContent{
+					ReasoningText: KiroReasoningText{
+						Text:      reasoningText,
+						Signature: reasoningSig,
+					},
+				}
+			}
 			history = append(history, KiroHistoryMessage{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content:  content,
-					ToolUses: toolUses,
-				},
+				AssistantResponseMessage: asst,
 			})
 		}
 	}
@@ -287,13 +359,19 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 构建最终内容
 	finalContent := ""
-	if currentContent != "" {
+	switch {
+	case currentContent != "":
 		finalContent = currentContent
-	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
-	} else if len(currentToolResults) > 0 {
+	case len(currentToolResults) > 0 && !keepCurrentToolResults:
+		// 孤立工具结果(未作为结构化 ToolResults 挂载,如上下文压缩后):折叠进文本以保留其文字。
+		// 若同时带图片,图片仍通过 currentImages 单独附上,不会丢失。放在图片分支之前,
+		// 避免"图片+孤立工具结果"时文字被图片占位符吞掉。
 		finalContent = buildToolResultsContinuation(currentToolResults)
-	} else {
+	case len(currentImages) > 0:
+		finalContent = normalizeUserContent("", true)
+	default:
+		// keepCurrentToolResults==true:结构化 ToolResults 已挂到 UserInputMessageContext,
+		// 若再用 buildToolResultsContinuation 塞进文本会重复同一份工具输出。用 "." 占位。
 		finalContent = minimalFallbackUserContent
 	}
 
@@ -305,8 +383,16 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ToolNameMap = toolNameMap
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
-	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	// 确定性会话身份:session id > system+tools 哈希 > system+锚点 派生。
+	// agentContinuationId 从 conversationId 派生,同一会话稳定 → 命中 Kiro 前缀缓存。
+	// 旧实现 uuid.New() 每请求随机,前缀缓存永不命中。
+	claudeSessionHint := ""
+	if req.Metadata != nil {
+		claudeSessionHint = req.Metadata.UserID
+	}
+	conversationID := deriveConversationID(claudeSessionHint, modelID, systemPrompt, claudeToolNames(req.Tools), firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = conversationID
+	payload.ConversationState.AgentContinuationId = deriveAgentContinuationID(conversationID)
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -338,6 +424,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			TopP:        req.TopP,
 		}
 	}
+
+	// reasoning/thinking effort 档位透传(按模型家族 schema 驱动)。空 schema 模型返回 nil,
+	// 不序列化 additionalModelRequestFields,避免上游 400 "not supported for this model"。
+	// 放在 truncate 之前,使 payload 尺寸测量包含该字段。
+	payload.AdditionalModelRequestFields = buildAdditionalModelRequestFields(req, thinking)
 
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
@@ -735,12 +826,11 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 	return "", nil
 }
 
-func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
-	var text string
-	var toolUses []KiroToolUse
-
+// extractClaudeAssistantContent 提取历史 assistant 消息的正文、工具调用,以及
+// 第一个带签名的思考块(text+signature),后者用于回传 Kiro 延续 interleaved thinking。
+func extractClaudeAssistantContent(content interface{}) (text string, toolUses []KiroToolUse, reasoningText string, reasoningSig string) {
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, "", ""
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -755,6 +845,16 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 			case "text":
 				if t, ok := block["text"].(string); ok {
 					text += t
+				}
+			case "thinking":
+				// 历史思考块:只取第一个带签名的。伪造签名的剥离在调用侧(ClaudeToKiro)用 isFakeSignature 处理。
+				if reasoningText == "" {
+					t, _ := block["thinking"].(string)
+					sig, _ := block["signature"].(string)
+					if t != "" && sig != "" {
+						reasoningText = t
+						reasoningSig = sig
+					}
 				}
 			case "tool_use":
 				id, _ := block["id"].(string)
@@ -772,7 +872,151 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		}
 	}
 
-	return text, toolUses
+	return text, toolUses, reasoningText, reasoningSig
+}
+
+// ==================== reasoning / thinking effort 透传 ====================
+//
+// 移植自 Rust kiro2cc-proxy 的 converter.rs(build_additional_model_request_fields 等)。
+// 核心是按模型真实 schema 决定 additionalModelRequestFields 的承载路径与内容,对齐原生 Kiro:
+//   - GPT 家族走 reasoning schema(带 mode);Claude effort 家族走 output_config;空 schema 模型不发。
+// Kiro-Go 无动态 schema 注册表,故用 fallbackSchemaPath 按模型家族硬编码兜底。
+
+// modelMaxOutputTokens 返回 Kiro 对该模型允许的 max_tokens 上限。
+// opus-4.7 / opus-4.8 支持 128000,其余 reasoning 模型 64000。
+// 入参可为客户端别名或归一 kiro_id(小写包含匹配,两种写法都命中)。
+func modelMaxOutputTokens(model string) int {
+	m := strings.ToLower(model)
+	if strings.Contains(m, "opus-4-7") || strings.Contains(m, "opus-4.7") ||
+		strings.Contains(m, "opus-4-8") || strings.Contains(m, "opus-4.8") {
+		return 128000
+	}
+	return 64000
+}
+
+// reasoningEffortLevels 是 effort 合法档位的已知超集(GPT reasoning schema)。
+// Kiro-Go 未内置动态 schema 注册表,用此超集校验,非法值回退 high。
+var reasoningEffortLevels = map[string]bool{
+	"none": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
+}
+
+// resolveReasoningEffort 解析 reasoning-schema 模型(GPT)的 effort:
+// 客户端显式关思考(thinking.type=="disabled")→ none;否则取 output_config.effort,
+// 缺省 high;非法档位回退 high。
+func resolveReasoningEffort(req *ClaudeRequest) string {
+	if req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled") {
+		return "none"
+	}
+	raw := "high"
+	if req.OutputConfig != nil && req.OutputConfig.Effort != "" {
+		raw = req.OutputConfig.Effort
+	}
+	if reasoningEffortLevels[raw] {
+		return raw
+	}
+	return "high"
+}
+
+// resolveReasoningMode 解析 GPT reasoning 的 mode(standard/pro)。
+// 仅 GPT 家族支持 mode;其余模型返回 ("", false) → 调用方不发 mode 字段
+// (上游 schema default=standard 兜底)。output_config.mode 非法/缺省回退 standard。
+func resolveReasoningMode(req *ClaudeRequest, modelLower string) (string, bool) {
+	if !strings.Contains(modelLower, "gpt") {
+		return "", false
+	}
+	validModes := map[string]bool{"standard": true, "pro": true}
+	if req.OutputConfig != nil && validModes[req.OutputConfig.Mode] {
+		return req.OutputConfig.Mode, true
+	}
+	return "standard", true
+}
+
+// fallbackSchemaPath 按模型家族硬编码 additionalModelRequestFields 的承载路径
+// (镜像 Kiro 已知模型目录)。入参应为已 MapModel 归一后的 kiro_id(小写)。
+//   - gpt 家族 → "reasoning"(GPT 5.6)
+//   - Claude effort 家族(sonnet-5 / opus-4.8·4.7·4.6 / sonnet-4.6)→ "output_config"
+//   - 其余(sonnet-4.5 / opus-4.5 / sonnet-4 / haiku / deepseek / minimax / glm / qwen …)→ ""
+//     这些模型 schema 为空,发 additionalModelRequestFields 会被上游 400。
+func fallbackSchemaPath(kiroIDLower string) string {
+	if strings.Contains(kiroIDLower, "gpt") {
+		return "reasoning"
+	}
+	switch kiroIDLower {
+	case "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6":
+		return "output_config"
+	default:
+		return ""
+	}
+}
+
+// buildAdditionalModelRequestFields 严格按模型真实 schema 构建 additionalModelRequestFields,
+// 对齐原生 Kiro。三分支:
+//   - "reasoning"(GPT 5.6):只发 {reasoning:{mode?,effort}}。其 schema additionalProperties=false,
+//     混入 output_config / max_tokens / thinking 会被上游 400。
+//   - "output_config"(Claude effort 系):发 thinking(disabled)? + output_config.effort + max_tokens。
+//   - ""(空 schema 模型):返回 nil,不发任何字段,否则上游 400 "not supported for this model"。
+func buildAdditionalModelRequestFields(req *ClaudeRequest, thinking bool) map[string]interface{} {
+	// 归一到上游真实 kiro_id 再判家族——客户端别名(如 claude-sonnet-4-5-20250929)直判会误判。
+	kiroID := MapModel(req.Model)
+	modelLower := strings.ToLower(kiroID)
+
+	switch fallbackSchemaPath(modelLower) {
+	case "reasoning":
+		// GPT reasoning schema 除 effort 外还带 mode(standard/pro)。支持该字段才发 mode。
+		reasoning := map[string]interface{}{}
+		if mode, ok := resolveReasoningMode(req, modelLower); ok {
+			reasoning["mode"] = mode
+		}
+		reasoning["effort"] = resolveReasoningEffort(req)
+		return map[string]interface{}{"reasoning": reasoning}
+
+	case "output_config":
+		fields := map[string]interface{}{}
+
+		// 关键:绝不注入 thinking:{type:"adaptive"}——实测在工具续跑轮会抑制推理
+		// (reasoningContentEvent 从 55 掉到 1)。原生 Kiro 只发 output_config.effort,
+		// 思考深度由模型按 effort 自适应。唯一例外:客户端显式关思考(thinking.type=="disabled")
+		// 时透传 disabled,支持一键省钱/提速。
+		disabled := req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled")
+		if disabled {
+			fields["thinking"] = map[string]interface{}{"type": "disabled"}
+		}
+
+		// effort 注入的判定:两类信号都算"请求思考",任一满足即注入(除非显式 disabled)。
+		//   1) thinking bool —— 老路径:模型名带 -thinking 后缀,或 thinking.type=="enabled"。
+		//   2) 客户端直接带了 output_config.effort —— 这正是**原生 Kiro 自己的思考信号**:
+		//      Kiro 客户端(及对齐它的插件)默认 auto 档**只发** output_config.effort,既不发
+		//      thinking 字段、模型名也不带后缀。此前只认 thinking bool → 这份 effort 被整个丢弃,
+		//      Claude effort 家族(opus-4.8 等)后端收不到任何思考指令,导致"完全不思考"。
+		// 注入时统一走 resolveReasoningEffort 校验(非法档位回退 high),不再直接透传未校验的 effort。
+		hasExplicitEffort := req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != ""
+		if !disabled && (thinking || hasExplicitEffort) {
+			fields["output_config"] = map[string]interface{}{"effort": resolveReasoningEffort(req)}
+		}
+
+		if req.MaxTokens > 0 {
+			// 上游 reasoning 模型要求 max_tokens >= 1024,否则 400。客户端辅助调用(标题生成/
+			// 摘要等)常发 <1024,这里兜底抬到下限;上限按模型 cap。cap 恒 >=1024,结果恒在 [1024, cap]。
+			const minAdditionalMaxTokens = 1024
+			maxCap := modelMaxOutputTokens(kiroID)
+			capped := req.MaxTokens
+			if capped > maxCap {
+				capped = maxCap
+			}
+			if capped < minAdditionalMaxTokens {
+				capped = minAdditionalMaxTokens
+			}
+			fields["max_tokens"] = capped
+		}
+
+		if len(fields) == 0 {
+			return nil
+		}
+		return fields
+
+	default:
+		return nil
+	}
 }
 
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
@@ -800,18 +1044,28 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	return result, nameMap
 }
 
-// ensureObjectSchema 确保工具 schema 顶层是 object，并清理 Kiro 不接受的字段。
+// ensureObjectSchema 确保工具 schema 顶层是 object，并规范化/清理 Kiro 不接受的字段。
+// 顺序:克隆(不改调用方) → 展开 $ref/$defs(Kiro 不认 $ref,未展开会让 MCP/pydantic/zod
+// 工具的参数约束静默丢失) → 递归清洗(删 additionalProperties/空 required、归一 type 数组、
+// 合并/折叠 anyOf/oneOf/allOf)。
 func ensureObjectSchema(schema interface{}) interface{} {
 	m, ok := schema.(map[string]interface{})
 	if !ok {
 		return map[string]interface{}{"type": "object"}
 	}
 	cleaned := cloneSchemaMap(m)
-	cleanSchema(cleaned)
-	if _, hasType := cleaned["type"]; !hasType {
-		cleaned["type"] = "object"
+	// 展开 $ref(依赖 $defs/definitions);即便无 $defs 也运行,把无法展开的 $ref
+	// (OpenAPI/外部形式)显式降级为宽松 object,否则会被后续清洗留成空壳。
+	defs := extractSchemaDefs(cleaned)
+	resolved, ok := resolveSchemaRefs(cleaned, defs, 0).(map[string]interface{})
+	if !ok {
+		return map[string]interface{}{"type": "object"}
 	}
-	return cleaned
+	cleanSchema(resolved)
+	if _, hasType := resolved["type"]; !hasType {
+		resolved["type"] = "object"
+	}
+	return resolved
 }
 
 func cloneSchemaMap(m map[string]interface{}) map[string]interface{} {
@@ -837,40 +1091,295 @@ func cloneSchemaValue(v interface{}) interface{} {
 	}
 }
 
-// cleanSchema 递归清理会导致 Kiro 400 的 schema 字段。
-func cleanSchema(m map[string]interface{}) {
-	delete(m, "additionalProperties")
+// maxSchemaRefDepth 限制 $ref 展开与组合关键字折叠的递归深度,防循环引用/栈溢出。
+const maxSchemaRefDepth = 16
 
-	// required 必须是非空数组，否则 Kiro 会报 Improperly formed request。
-	if req, exists := m["required"]; exists {
-		switch arr := req.(type) {
-		case nil:
-			delete(m, "required")
-		case []interface{}:
-			if len(arr) == 0 {
-				delete(m, "required")
+// extractSchemaDefs 提取顶层 $defs / definitions 作为 $ref 解析表。镜像 Rust extract_schema_defs。
+func extractSchemaDefs(schema map[string]interface{}) map[string]interface{} {
+	defs := make(map[string]interface{})
+	for _, key := range []string{"$defs", "definitions"} {
+		if m, ok := schema[key].(map[string]interface{}); ok {
+			for k, v := range m {
+				defs[k] = v
 			}
-		case []string:
-			if len(arr) == 0 {
-				delete(m, "required")
-			}
-		default:
-			delete(m, "required")
 		}
 	}
+	return defs
+}
 
-	for _, v := range m {
-		switch val := v.(type) {
-		case map[string]interface{}:
-			cleanSchema(val)
+// resolveSchemaRefs 深度优先展开所有 $ref(仅支持 #/$defs/<name> 与 #/definitions/<name>)。
+// depth 仅在 $ref 跳转时递增,超过上限视为循环引用,降级为宽松 object 兜底。
+// 无法展开的 $ref(OpenAPI #/components/... / 外部 / 目标缺失)降级为宽松 object 而非留空壳。
+// 镜像 Rust resolve_schema_refs。
+func resolveSchemaRefs(value interface{}, defs map[string]interface{}, depth int) interface{} {
+	if depth > maxSchemaRefDepth {
+		return map[string]interface{}{"type": "object", "additionalProperties": true}
+	}
+	switch v := value.(type) {
+	case map[string]interface{}:
+		if refRaw, ok := v["$ref"].(string); ok {
+			name := ""
+			if strings.HasPrefix(refRaw, "#/$defs/") {
+				name = strings.TrimPrefix(refRaw, "#/$defs/")
+			} else if strings.HasPrefix(refRaw, "#/definitions/") {
+				name = strings.TrimPrefix(refRaw, "#/definitions/")
+			}
+			delete(v, "$ref")
+			if target, found := defs[name]; found && name != "" {
+				// 展开目标后并入同级字段(不覆盖 $ref 旁已有的 description 等)。
+				// 克隆 target 再展开:同一 def 被多个 $ref 引用时避免就地改动共享定义(对齐 Rust target.clone())。
+				resolved := resolveSchemaRefs(cloneSchemaValue(target), defs, depth+1)
+				if robj, ok := resolved.(map[string]interface{}); ok {
+					for k, rv := range robj {
+						if _, exists := v[k]; !exists {
+							v[k] = rv
+						}
+					}
+				}
+			} else if _, hasType := v["type"]; !hasType {
+				// 无法展开:约束只能丢弃,显式标记为宽松 object 而非留空壳。
+				v["type"] = "object"
+			}
+		}
+		out := make(map[string]interface{}, len(v))
+		for k, sub := range v {
+			out[k] = resolveSchemaRefs(sub, defs, depth)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			out = append(out, resolveSchemaRefs(item, defs, depth))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+// cleanSchema 递归规范化/清理会导致 Kiro 400 的 schema 字段。把 m 视为一个 schema 节点:
+//   - 删 additionalProperties(Kiro 不接受)与残留 $ref/$defs/definitions/$schema;
+//   - 把 type 数组(如 ["string","null"])归一成单个基础类型;
+//   - 合并/折叠 anyOf/oneOf/allOf 进本节点(allOf 合并全部,anyOf/oneOf 取第一个分支),
+//     避免原样透传导致 400;
+//   - 删空/非法 required;
+//   - 仅递归进"承载子 schema 的位置"(properties 各值、items、if/then/else 等),
+//     避免误伤名字恰好叫 "type"/"required" 的参数(它们是 properties 的键,不是关键字)。
+func cleanSchema(m map[string]interface{}) {
+	delete(m, "$ref")
+	delete(m, "$defs")
+	delete(m, "definitions")
+	delete(m, "$schema")
+
+	// 归一 type 数组 → 单基础类型(在删 additionalProperties 之前无所谓,先做)。
+	normalizeSchemaTypeField(m)
+
+	// 折叠组合关键字进本节点(可能引入 additionalProperties/required/properties)。
+	mergeCompositeSchemas(m)
+
+	// additionalProperties 可能被合并的分支重新引入,故在折叠之后再删。
+	delete(m, "additionalProperties")
+
+	// required 必须是非空字符串数组,否则 Kiro 报 Improperly formed request。
+	if req, exists := m["required"]; exists && !isNonEmptyArray(req) {
+		delete(m, "required")
+	}
+
+	// 递归:仅进入承载子 schema 的位置,避免误伤与关键字同名的属性。
+	if props, ok := m["properties"].(map[string]interface{}); ok {
+		for _, sub := range props {
+			if subMap, ok := sub.(map[string]interface{}); ok {
+				cleanSchema(subMap)
+			}
+		}
+	}
+	switch items := m["items"].(type) {
+	case map[string]interface{}:
+		cleanSchema(items)
+	case []interface{}:
+		for _, it := range items {
+			if itMap, ok := it.(map[string]interface{}); ok {
+				cleanSchema(itMap)
+			}
+		}
+	}
+	if patternProps, ok := m["patternProperties"].(map[string]interface{}); ok {
+		for _, sub := range patternProps {
+			if subMap, ok := sub.(map[string]interface{}); ok {
+				cleanSchema(subMap)
+			}
+		}
+	}
+	for _, key := range []string{"additionalItems", "contains", "propertyNames", "if", "then", "else", "not"} {
+		if sub, ok := m[key].(map[string]interface{}); ok {
+			cleanSchema(sub)
+		}
+	}
+}
+
+// isNonEmptyArray 报告 v 是否为非空 []interface{} / []string。其余(nil、非数组、空数组)均为 false,
+// 供 cleanSchema 判定是否删除 required(保留原 cleanSchema 行为:仅保留非空数组)。
+func isNonEmptyArray(v interface{}) bool {
+	switch arr := v.(type) {
+	case []interface{}:
+		return len(arr) > 0
+	case []string:
+		return len(arr) > 0
+	default:
+		return false
+	}
+}
+
+// normalizeSchemaBaseType 把原始 type 字符串归一为 Kiro 认可的基础类型;非基础类型返回 ""。
+func normalizeSchemaBaseType(raw string) string {
+	switch strings.TrimSpace(raw) {
+	case "object", "array", "string", "number", "integer", "boolean":
+		return strings.TrimSpace(raw)
+	default:
+		return ""
+	}
+}
+
+// normalizeSchemaTypeField 把 "type" 数组(如 ["string","null"])归一成第一个基础类型字符串,
+// 镜像 Rust normalize_schema_type。数组里找不到基础类型则删除 type(交由调用方兜底 object)。
+// 单字符串 type 原样保留。
+func normalizeSchemaTypeField(m map[string]interface{}) {
+	raw, ok := m["type"]
+	if !ok {
+		return
+	}
+	switch t := raw.(type) {
+	case string:
+		// 单一 type:原样保留(即便非基础类型也不动,避免误删自定义约束)。
+		m["type"] = t
+	case []interface{}:
+		for _, item := range t {
+			if s, ok := item.(string); ok {
+				if base := normalizeSchemaBaseType(s); base != "" {
+					m["type"] = base
+					return
+				}
+			}
+		}
+		delete(m, "type")
+	case []string:
+		for _, s := range t {
+			if base := normalizeSchemaBaseType(s); base != "" {
+				m["type"] = base
+				return
+			}
+		}
+		delete(m, "type")
+	default:
+		delete(m, "type")
+	}
+}
+
+// toSchemaSlice 把 anyOf/oneOf/allOf 的值转成 object 子 schema 列表(过滤非 object 分支)。
+// 空或无 object 分支返回 (nil, false)。
+func toSchemaSlice(v interface{}) ([]map[string]interface{}, bool) {
+	arr, ok := v.([]interface{})
+	if !ok || len(arr) == 0 {
+		return nil, false
+	}
+	out := make([]map[string]interface{}, 0, len(arr))
+	for _, item := range arr {
+		if sub, ok := item.(map[string]interface{}); ok {
+			out = append(out, sub)
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// mergeRequired 合并两个 required 列表为去重后的 []interface{}(保序)。
+func mergeRequired(existing, incoming interface{}) interface{} {
+	set := make(map[string]bool)
+	var out []interface{}
+	add := func(v interface{}) {
+		switch arr := v.(type) {
 		case []interface{}:
-			for _, item := range val {
-				if sub, ok := item.(map[string]interface{}); ok {
-					cleanSchema(sub)
+			for _, item := range arr {
+				if s, ok := item.(string); ok && !set[s] {
+					set[s] = true
+					out = append(out, s)
+				}
+			}
+		case []string:
+			for _, s := range arr {
+				if !set[s] {
+					set[s] = true
+					out = append(out, s)
 				}
 			}
 		}
 	}
+	add(existing)
+	add(incoming)
+	return out
+}
+
+// mergeSchemaInto 把 src 的键并入 dst(已存在的键不覆盖)。properties 逐字段并入、
+// required 去重合并,使多个分支的约束累积而非互相覆盖。
+func mergeSchemaInto(dst, src map[string]interface{}) {
+	for k, v := range src {
+		switch k {
+		case "properties":
+			srcProps, ok := v.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			dstProps, ok := dst["properties"].(map[string]interface{})
+			if !ok {
+				dstProps = make(map[string]interface{})
+				dst["properties"] = dstProps
+			}
+			for pk, pv := range srcProps {
+				if _, exists := dstProps[pk]; !exists {
+					dstProps[pk] = pv
+				}
+			}
+		case "required":
+			dst["required"] = mergeRequired(dst["required"], v)
+		default:
+			if _, exists := dst[k]; !exists {
+				dst[k] = v
+			}
+		}
+	}
+}
+
+// mergeCompositeSchemas 把 anyOf/oneOf/allOf 折叠进本节点,使 Kiro 永远看不到组合关键字
+// (原样透传易被判 malformed → 400)。allOf 合并全部子 schema;anyOf/oneOf 取第一个 object 分支
+// (即"能合并就合并、否则取第一个分支")。已存在的父键始终优先。迭代进行,以便某分支自身又带
+// 组合关键字时继续折叠;残留一律兜底删除。
+func mergeCompositeSchemas(m map[string]interface{}) {
+	for iter := 0; iter < maxSchemaRefDepth; iter++ {
+		merged := false
+		if branches, ok := toSchemaSlice(m["allOf"]); ok {
+			delete(m, "allOf")
+			for _, b := range branches {
+				mergeSchemaInto(m, b)
+			}
+			merged = true
+		}
+		for _, key := range []string{"anyOf", "oneOf"} {
+			if branches, ok := toSchemaSlice(m[key]); ok {
+				delete(m, key)
+				mergeSchemaInto(m, branches[0]) // 取第一个 object 分支
+				merged = true
+			}
+		}
+		if !merged {
+			break
+		}
+	}
+	// 兜底:绝不留下组合关键字。
+	delete(m, "anyOf")
+	delete(m, "oneOf")
+	delete(m, "allOf")
 }
 
 func normalizeToolDesc(desc, name string) string {
@@ -984,6 +1493,9 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	// User 是标准 OpenAI 字段;若客户端在其中编码 session（如 ..._session_<UUID>）,
+	// 用于派生确定性 conversationId / agentContinuationId。无则回退 system+tools 哈希。
+	User string `json:"user,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1100,9 +1612,18 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	// 接入与 Claude 侧(buildClaudeSystemPrompt)一致的 prompt 过滤:Claude Code 检测、
+	// 边界标记剥离、env 噪声剥离、用户自定义正则/行过滤规则。使前端配置的过滤规则对
+	// /v1/chat/completions 同样生效(此前 OpenAI 路径完全绕过 applyPromptFilters)。
+	systemPrompt = applyPromptFilters(systemPrompt)
+
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		if systemPrompt == "" {
+			systemPrompt = ThinkingModePrompt
+		} else {
+			systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		}
 	}
 
 	// 构建历史消息
@@ -1233,11 +1754,14 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建最终内容
 	finalContent := currentContent
 	if finalContent == "" {
-		if len(currentImages) > 0 {
-			finalContent = normalizeUserContent("", true)
-		} else if len(currentToolResults) > 0 {
+		switch {
+		case len(currentToolResults) > 0 && !keepCurrentToolResults:
+			// 孤立工具结果:折叠进文本保留文字;带图片时图片仍单独附上。放在图片分支之前。
 			finalContent = buildToolResultsContinuation(currentToolResults)
-		} else {
+		case len(currentImages) > 0:
+			finalContent = normalizeUserContent("", true)
+		default:
+			// keepCurrentToolResults==true:结构化 ToolResults 已挂载,不重复塞文本;或纯占位。
 			finalContent = minimalFallbackUserContent
 		}
 	}
@@ -1248,7 +1772,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	// 与 Claude 侧对齐:设 AgentTaskType 并派生确定性会话身份(此前 OpenAI 路径两者都没设,
+	// AgentContinuationId 缺失 → Kiro 前缀缓存永不命中)。
+	payload.ConversationState.AgentTaskType = "vibe"
+	conversationID := deriveConversationID(req.User, modelID, strings.TrimSpace(systemPrompt), openAIToolNames(req.Tools), firstOpenAIConversationAnchor(nonSystemMessages))
+	payload.ConversationState.ConversationID = conversationID
+	payload.ConversationState.AgentContinuationId = deriveAgentContinuationID(conversationID)
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -1824,6 +2353,155 @@ func buildConversationID(modelID, systemPrompt, anchor string) string {
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
 }
 
+// ==================== 确定性会话身份(缓存关键) ====================
+//
+// 移植自 Rust converter.rs(extract_session_id / derive_fallback_conversation_id /
+// derive_agent_continuation_id)。目标:同一会话的连续请求产生稳定的 conversationId 与
+// agentContinuationId,让 Kiro 后端识别为同一会话并复用前缀 prompt cache。随机 UUID
+// (旧 uuid.New)会让缓存永不命中。
+
+// isValidSessionUUID 校验字符串是否为规范 36 字符 UUID(8-4-4-4-12,4 个连字符,其余 hex)。
+// 镜像 Rust is_valid_uuid。
+func isValidSessionUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	dashes := 0
+	for _, c := range s {
+		if c == '-' {
+			dashes++
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return dashes == 4
+}
+
+// extractSessionID 从 metadata.user_id / OpenAI user 中抽取 session UUID。支持两种格式:
+//  1. JSON:{"session_id":"UUID"} 或 {"id":"UUID"}(Claude Code 2.1.128+)
+//  2. 后缀:..._session_<UUID>
+// 找不到合法 36 字符 UUID 时返回 ""。镜像 Rust extract_session_id(含 JSON 污染值拒绝)。
+func extractSessionID(userID string) string {
+	trimmed := strings.TrimSpace(userID)
+	if strings.HasPrefix(trimmed, "{") {
+		var v map[string]interface{}
+		if err := json.Unmarshal([]byte(trimmed), &v); err == nil {
+			for _, key := range []string{"session_id", "id"} {
+				if raw, ok := v[key].(string); ok && isValidSessionUUID(raw) {
+					return raw
+				}
+			}
+		}
+	}
+	if pos := strings.Index(userID, "session_"); pos != -1 {
+		rest := userID[pos+len("session_"):]
+		// 严格取 36 字节候选;非 ASCII / 污染值(如 id":"...)不是合法 UUID,会被拒。
+		if len(rest) >= 36 {
+			candidate := rest[:36]
+			if isValidSessionUUID(candidate) {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+// deriveConversationID 计算确定性 conversationId,并作为 agentContinuationId 的种子。优先级:
+//  1. sessionHint 中的 session UUID(Claude metadata.user_id / OpenAI user);
+//  2. system 文本 + 排序后工具名集合的哈希(让无 metadata 的客户端如 opencode 也能 sticky);
+//  3. 既有 system+锚点 派生(buildConversationID),其对合成锚点回退随机 UUID。
+func deriveConversationID(sessionHint, modelID, systemPrompt string, toolNames []string, anchor string) string {
+	if sessionHint != "" {
+		if sid := extractSessionID(sessionHint); sid != "" {
+			return sid
+		}
+	}
+	if id, ok := deriveFallbackConversationID(systemPrompt, toolNames); ok {
+		return id
+	}
+	return buildConversationID(modelID, systemPrompt, anchor)
+}
+
+// deriveFallbackConversationID 用 system 文本 + 排序工具名集合哈希出稳定的 v4 形态 UUID,
+// 让无 session 元数据的客户端对相同 system+tools 组合始终得到同一 conversationId
+// (sticky 路由 / 跨轮缓存冻结)。system 与 tools 都为空时返回 ("", false)。
+// 镜像 Rust derive_fallback_conversation_id。
+func deriveFallbackConversationID(systemPrompt string, toolNames []string) (string, bool) {
+	sys := systemPrompt
+	names := append([]string(nil), toolNames...)
+	sort.Strings(names)
+	if strings.TrimSpace(sys) == "" && len(names) == 0 {
+		return "", false
+	}
+	// 仅取 system 前 4096 rune,避免超长 prompt 拖慢哈希。
+	if runes := []rune(sys); len(runes) > 4096 {
+		sys = string(runes[:4096])
+	}
+	h := sha256.New()
+	h.Write([]byte("fallback-conversation:"))
+	h.Write([]byte(sys))
+	h.Write([]byte("|tools="))
+	for _, n := range names {
+		h.Write([]byte(n))
+		h.Write([]byte(","))
+	}
+	sum := h.Sum(nil)
+	var b [16]byte
+	copy(b[:], sum[:16])
+	// 强制 v4 Version(4)与 Variant(8/9/A/B)位,确保上游严格 UUID 解析器不拒绝(400)。
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	u, err := uuid.FromBytes(b[:])
+	if err != nil {
+		return "", false
+	}
+	return u.String(), true
+}
+
+// deriveAgentContinuationID 从 conversationId 派生稳定的 agentContinuationId:
+// SHA256("agent-continuation:"+convID) 前 16 字节格式化为 UUID(逐字节对齐 Rust
+// derive_agent_continuation_id,不设 v4 位——与 Rust 原样格式化保持一致)。
+func deriveAgentContinuationID(conversationID string) string {
+	h := sha256.New()
+	h.Write([]byte("agent-continuation:"))
+	h.Write([]byte(conversationID))
+	sum := h.Sum(nil)
+	// uuid.FromBytes 仅复制 16 字节,String() 按 8-4-4-4-12 小写十六进制原样格式化,
+	// 不改动任何位——与 Rust 的手写 format! 输出逐字节一致。
+	u, err := uuid.FromBytes(sum[:16])
+	if err != nil {
+		// sum 恒为 32 字节,不会到这里;兜底返回随机 UUID 而非 panic。
+		return uuid.New().String()
+	}
+	return u.String()
+}
+
+// claudeToolNames 收集 Claude 工具名集合(用于 deriveFallbackConversationID)。
+func claudeToolNames(tools []ClaudeTool) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
+// openAIToolNames 收集 OpenAI 工具名集合(用于 deriveFallbackConversationID)。
+func openAIToolNames(tools []OpenAITool) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Function.Name)
+	}
+	return names
+}
+
 func isSyntheticConversationAnchor(anchor string) bool {
 	if strings.TrimSpace(anchor) == "" {
 		return true
@@ -2026,7 +2704,7 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 		Role: "assistant",
 	}
 
-	finishReason := "stop"
+	finishReason := openAIFinishReason(len(toolUses) > 0, false, inputTokens, model)
 
 	if len(toolUses) > 0 {
 		msg.Content = nil
@@ -2040,7 +2718,6 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 			msg.ToolCalls[i].Function.Name = tu.Name
 			msg.ToolCalls[i].Function.Arguments = string(args)
 		}
-		finishReason = "tool_calls"
 	} else {
 		msg.Content = content
 	}
@@ -2092,7 +2769,7 @@ func extractThinkingFromContent(content string) (string, string) {
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
 func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
-	finishReason := "stop"
+	finishReason := openAIFinishReason(len(toolUses) > 0, false, inputTokens, model)
 
 	message := map[string]interface{}{
 		"role": "assistant",
@@ -2113,7 +2790,6 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			}
 		}
 		message["tool_calls"] = toolCalls
-		finishReason = "tool_calls"
 	} else {
 		// 根据配置格式化 thinking 输出
 		if reasoningContent != "" {

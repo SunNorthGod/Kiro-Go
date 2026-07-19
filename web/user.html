@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NorthGod Kiro-Go</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/admin/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="64x64" href="/admin/favicon-64.png" />
+  <link rel="icon" type="image/png" sizes="128x128" href="/admin/favicon-128.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/admin/favicon-180.png" />
+  <script src="/admin/vendor/tailwindcss-browser/index.global.js"></script>
+  <script src="/admin/vendor/chartjs/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/admin/vendor/fontawesome/css/all.min.css" />
+  <link rel="stylesheet" href="/admin/styles.css" id="__cssAsset" />
+  <link rel="stylesheet" href="/admin/toast.css" id="__toastCss" />
+  <script>
+    (function () {
+      var v = Date.now();
+      window.__v = v;
+      var css = document.getElementById('__cssAsset');
+      if (css) css.href = '/admin/styles.css?v=' + v;
+      var tcss = document.getElementById('__toastCss');
+      if (tcss) tcss.href = '/admin/toast.css?v=' + v;
+    })();
+  </script>
+  <style>
+    /* User-portal-specific layout helpers (scoped with up- prefix).
+       Two-column and 4-up overview grids now use the shared .ng-grid helpers
+       (equal-height, auto-collapsing) instead of a bespoke up-grid. */
+    .up-balance-card { display: flex; flex-direction: column; gap: 0.75rem; }
+    .up-balance-figure {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .up-balance-value {
+      font-size: 2.25rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1;
+      color: var(--success);
+      font-feature-settings: "tnum";
+    }
+    .up-balance-suffix { font-size: 0.8125rem; color: var(--muted-foreground); }
+    .up-balance-sub {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      color: var(--muted-foreground);
+      font-feature-settings: "tnum";
+    }
+    .up-key-inline {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .up-key-code {
+      font-family: var(--font-mono);
+      word-break: break-all;
+      font-size: 0.8125rem;
+    }
+    .up-loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 2rem;
+      color: var(--muted-foreground);
+      font-size: 0.875rem;
+    }
+    .up-section-gap { display: flex; flex-direction: column; gap: 1rem; }
+    /* The stat row now sits inside the Overview tab, whose flex-column gap
+       already spaces it from the content below; drop the extra margin so the
+       vertical rhythm stays even. */
+    #userTabOverview .stats-grid { margin-bottom: 0; }
+    /* Balance overview card stretches to match the key-info card height. */
+    #upOverview .up-balance-card { height: 100%; }
+    /* Usage summary metrics: 4-up on wide screens (via .ng-grid-4). The shared
+       .ng-grid-4 collapses to a single column at <=760px; for these small
+       metric tiles a 2-up layout reads better, so override just this grid. */
+    @media (max-width: 760px) {
+      #upOverview .up-usage-metrics.ng-grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Login -->
+  <div id="userLoginPage" class="login-wrapper">
+    <div class="ghost-bg" aria-hidden="true">
+      <i class="fa-solid fa-ghost ghost ghost-1"></i>
+      <i class="fa-solid fa-ghost ghost ghost-2"></i>
+      <i class="fa-solid fa-ghost ghost ghost-3"></i>
+      <i class="fa-solid fa-ghost ghost ghost-4"></i>
+      <i class="fa-solid fa-ghost ghost ghost-5"></i>
+      <i class="fa-solid fa-ghost ghost ghost-7"></i>
+      <i class="fa-solid fa-ghost ghost ghost-8"></i>
+      <i class="fa-solid fa-ghost ghost ghost-9"></i>
+      <i class="fa-solid fa-ghost ghost ghost-11"></i>
+      <i class="fa-solid fa-ghost ghost ghost-12"></i>
+    </div>
+    <header class="login-topbar">
+      <div class="login-topbar-inner">
+        <div class="brand" aria-label="NorthGod Kiro-Go" data-i18n-aria-label="app.title">
+          <img class="brand-icon brand-logo" src="/admin/logo.png" alt="" />
+          <span class="brand-text">NorthGod Kiro-Go</span>
+        </div>
+        <div class="topbar-actions">
+          <div class="lang-switch" id="loginLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
+            <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
+            <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
+          </div>
+          <span class="divider" aria-hidden="true"></span>
+          <button id="loginThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
+            data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
+            <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
+            <i class="fa-solid fa-sun theme-ico-light"></i>
+            <i class="fa-solid fa-moon theme-ico-dark"></i>
+          </button>
+        </div>
+      </div>
+    </header>
+    <main class="login-main">
+      <div class="login-box">
+        <h1 class="login-title" data-i18n="user.login.title"></h1>
+        <p class="login-subtitle" data-i18n="user.login.subtitle"></p>
+        <div class="form-group">
+          <label data-i18n="user.login.keyLabel"></label>
+          <div class="input-affix">
+            <i class="fa-solid fa-key affix-icon"></i>
+            <input type="password" id="userKeyField" data-i18n-placeholder="user.login.keyPlaceholder"
+              autocomplete="off" spellcheck="false" />
+            <button type="button" class="affix-btn" id="userKeyToggle" aria-label=""
+              data-i18n-aria-label="user.login.showKey" data-shown="false">
+              <i class="fa-solid fa-eye"></i>
+            </button>
+          </div>
+        </div>
+        <label class="remember-row" for="userRemember">
+          <input type="checkbox" id="userRemember" />
+          <span class="remember-box" aria-hidden="true"><i class="fa-solid fa-check"></i></span>
+          <span class="remember-label" data-i18n="user.login.remember"></span>
+        </label>
+        <button type="button" class="btn btn-primary btn-lg w-full" id="userLoginBtn">
+          <i class="fa-solid fa-magnifying-glass"></i>
+          <span data-i18n="user.login.submit"></span>
+        </button>
+        <p class="login-footer"><i class="fa-solid fa-shield-halved"></i><span
+            data-i18n="user.login.rememberHint"></span></p>
+      </div>
+    </main>
+  </div>
+
+  <!-- Main app -->
+  <div id="userMainPage" class="hidden">
+    <header class="app-header">
+      <div class="app-header-inner">
+        <div class="brand-wrap">
+          <div class="brand">
+            <img class="brand-icon brand-logo" src="/admin/logo.png" alt="" />
+            <span class="brand-text">NorthGod Kiro-Go</span>
+          </div>
+        </div>
+        <nav class="header-nav" aria-label="" data-i18n-aria-label="aria.sections">
+          <div class="tabs" id="userTabBar">
+            <button type="button" class="tab active" data-tab="overview"><i
+                class="fa-solid fa-gauge-high tab-icon"></i><span data-i18n="user.tabs.overview"></span></button>
+            <button type="button" class="tab" data-tab="records"><i class="fa-solid fa-list tab-icon"></i><span
+                data-i18n="user.tabs.records"></span></button>
+            <button type="button" class="tab" data-tab="recharges"><i class="fa-solid fa-wallet tab-icon"></i><span
+                data-i18n="user.tabs.recharges"></span></button>
+            <button type="button" class="tab hidden" data-tab="children" id="userChildrenTab"><i
+                class="fa-solid fa-code-branch tab-icon"></i><span data-i18n="user.tabs.children"></span></button>
+            <button type="button" class="tab" data-tab="usage"><i class="fa-solid fa-plug tab-icon"></i><span
+                data-i18n="user.tabs.usage"></span></button>
+          </div>
+        </nav>
+        <div class="topbar-actions flex-wrap justify-end">
+          <div class="lang-switch" id="mainLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
+            <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
+            <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
+          </div>
+          <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
+            data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
+            <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
+            <i class="fa-solid fa-sun theme-ico-light"></i>
+            <i class="fa-solid fa-moon theme-ico-dark"></i>
+          </button>
+          <button class="btn btn-outline btn-sm" id="userLogoutBtn">
+            <i class="fa-solid fa-right-from-bracket"></i>
+            <span data-i18n="user.logout"></span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div class="container">
+      <!-- Overview tab (the at-a-glance stat row lives here so it only shows on Overview) -->
+      <div id="userTabOverview" class="tab-content">
+        <!-- At-a-glance stats -->
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-card-title" data-i18n="user.overview.balance"></div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="upStatBalance">–</div>
+              </div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card-title" data-i18n="user.overview.granted"></div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="upStatGranted">–</div>
+                <div class="stat-sub">
+                  <span class="stat-sub-sec"><span class="stat-value-sm" id="upStatUsed">0</span> <span
+                      class="stat-label" data-i18n="user.overview.used"></span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card-title" data-i18n="user.overview.tokens"></div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="upStatTokens">0</div>
+              </div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-card-title" data-i18n="user.overview.requests"></div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="upStatRequests">0</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="upOverview">
+          <div class="up-loading"><i class="fa-solid fa-spinner fa-spin"></i> <span data-i18n="detail.loading"></span></div>
+        </div>
+      </div>
+
+      <!-- Records tab -->
+      <div id="userTabRecords" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fa-solid fa-list card-title-icon"></i><span
+                data-i18n="user.records.title"></span></span>
+          </div>
+          <div id="upRecords">
+            <div class="up-loading"><i class="fa-solid fa-spinner fa-spin"></i> <span data-i18n="detail.loading"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recharges tab -->
+      <div id="userTabRecharges" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fa-solid fa-wallet card-title-icon"></i><span
+                data-i18n="user.recharges.title"></span></span>
+          </div>
+          <div id="upRecharges">
+            <div class="up-loading"><i class="fa-solid fa-spinner fa-spin"></i> <span data-i18n="detail.loading"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Children tab -->
+      <div id="userTabChildren" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fa-solid fa-code-branch card-title-icon"></i><span
+                data-i18n="user.children.title"></span></span>
+          </div>
+          <p class="card-subtitle" data-i18n="user.children.hint"></p>
+          <div id="upChildren">
+            <div class="up-loading"><i class="fa-solid fa-spinner fa-spin"></i> <span data-i18n="detail.loading"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- How to use tab -->
+      <div id="userTabUsage" class="tab-content hidden">
+        <div id="upUsage"></div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="app-footer" aria-label="" data-i18n-aria-label="aria.footer">
+      <div class="app-footer-inner">
+        <div class="footer-panel">
+          <div class="footer-identity">
+            <img class="footer-icon footer-logo" src="/admin/logo.png" alt="" />
+            <div class="footer-copy">
+              <div class="footer-title-row">
+                <span class="footer-title">NorthGod Kiro-Go</span>
+                <span class="footer-version" data-i18n="user.brandSub"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="footer-meta">
+          <span>© <span id="userFooterYear"></span> NorthGod Kiro-Go</span>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Confirm dialog (styled replacement for window.confirm) -->
+  <div id="confirmModal" class="modal">
+    <div class="modal-content confirm-modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="confirmTitle"></span>
+        <button class="modal-close" id="confirmClose" type="button" aria-label="close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="confirm-message" id="confirmMessage"></p>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="confirmCancel" type="button"></button>
+          <button class="btn btn-primary" id="confirmOk" type="button"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Script loader -->
+  <script>
+    (function () {
+      var v = window.__v || Date.now();
+      var t = document.createElement('script');
+      t.src = '/admin/toast.js?v=' + v;
+      document.body.appendChild(t);
+      var s = document.createElement('script');
+      s.src = '/admin/user.js?v=' + v;
+      s.defer = true;
+      document.body.appendChild(s);
+    })();
+  </script>
+</body>
+
+</html>

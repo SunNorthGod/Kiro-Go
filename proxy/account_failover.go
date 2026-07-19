@@ -3,6 +3,7 @@ package proxy
 import (
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"strings"
 	"time"
 )
@@ -97,19 +98,24 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	switch {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
-		h.pool.RecordError(account.ID, false)
-	case isQuotaErrorMessage(errMsg):
-		h.pool.RecordError(account.ID, true)
+		h.pool.ReportOutcome(account.ID, "", pool.OutcomeQuotaExhausted)
 	case isSuspensionErrorMessage(errMsg):
+		// Suspension is a definitive upstream ban → disable immediately.
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
+	case isQuotaErrorMessage(errMsg):
+		// 429 = Kiro rate-limiting (transient), NOT monthly quota (that is handled
+		// by usage tracking / isQuotaBlocked). Apply a short exponential backoff and
+		// rotate — never a 1h cooldown.
+		h.pool.ReportOutcome(account.ID, "", pool.OutcomeRateLimited)
 	case isProfileUnavailableErrorMessage(errMsg):
-		// Profile ARN may be transiently unresolvable (upstream blip, stale token).
-		// Treat as a soft failure: short cooldown so the next request rotates account,
-		// but never auto-disable — operators can still investigate via warn logs.
-		h.pool.RecordError(account.ID, false)
+		// Profile ARN may be transiently unresolvable; soft transient, never auto-disable.
+		h.pool.ReportOutcome(account.ID, "", pool.OutcomeTransient)
 	case isAuthErrorMessage(errMsg):
-		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
+		// A single 401/403 no longer hard-bans (could be a transient blip or, before
+		// the pool race fix, a torn-read Bearer). Disable only after N consecutive
+		// auth failures with no success in between (see pool.ReportOutcome).
+		h.pool.ReportOutcome(account.ID, "", pool.OutcomeAuthError)
 	default:
-		h.pool.RecordError(account.ID, false)
+		h.pool.ReportOutcome(account.ID, "", pool.OutcomeTransient)
 	}
 }

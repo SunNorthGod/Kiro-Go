@@ -4,7 +4,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Kiro-Go</title>
+    <title>NorthGod Kiro-Go</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/admin/favicon-32.png">
+    <link rel="icon" type="image/png" sizes="64x64" href="/admin/favicon-64.png">
+    <link rel="icon" type="image/png" sizes="128x128" href="/admin/favicon-128.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/admin/favicon-180.png">
     <style>
         * {
             box-sizing: border-box;
@@ -675,6 +679,14 @@
             color: #7c3aed;
         }
 
+        .logo-img {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            object-fit: cover;
+            flex-shrink: 0;
+        }
+
         .machine-id-row {
             display: flex;
             gap: 8px;
@@ -857,9 +869,7 @@
                     <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
                 </div>
             </div>
-            <h1 class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-                </svg>Kiro-Go</h1>
+            <h1 class="logo"><img class="logo-img" src="/admin/logo.png" alt="">NorthGod Kiro-Go</h1>
             <p data-i18n="login.subtitle"></p>
             <div class="form-group">
                 <label data-i18n="login.password"></label>
@@ -873,16 +883,14 @@
     </div>
     <div id="mainPage" class="container hidden">
         <div class="header">
-            <h1 class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-                </svg>Kiro-Go</h1>
+            <h1 class="logo"><img class="logo-img" src="/admin/logo.png" alt="">NorthGod Kiro-Go</h1>
             <div class="header-right">
                 <div class="lang-switch">
                     <button class="lang-btn" data-lang="zh" onclick="setLang('zh')">中文</button>
                     <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
                 </div>
                 <span class="badge badge-success" id="statusBadge" data-i18n="status.running"></span>
-                <span class="badge badge-info" id="versionBadge" style="cursor:pointer" onclick="checkUpdate(true)"></span>
+                <span class="badge badge-info" id="versionBadge"></span>
                 <button class="btn btn-sm btn-danger" onclick="logout()" data-i18n="common.logout" style="padding:4px 12px;font-size:12px"></button>
             </div>
         </div>
@@ -1151,13 +1159,6 @@
             <div class="modal-header"><span class="modal-title" data-i18n="export.title"></span><button
                     class="modal-close" onclick="closeExportModal()">&times;</button></div>
             <div id="exportBody"></div>
-        </div>
-    </div>
-    <div id="updateModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header"><span class="modal-title" data-i18n="update.title"></span><button
-                    class="modal-close" onclick="closeUpdateModal()">&times;</button></div>
-            <div id="updateBody"></div>
         </div>
     </div>
     <script>
@@ -1890,8 +1891,6 @@
             document.getElementById('openaiEndpoint').textContent = baseUrl + '/v1/chat/completions';
             document.getElementById('modelsEndpoint').textContent = baseUrl + '/v1/models';
             document.getElementById('statsEndpoint').textContent = baseUrl + '/v1/stats';
-            // 自动检查更新
-            setTimeout(() => checkUpdate(false), 2000);
         }
         async function loadStats() {
             const res = await fetch('/admin/api/status', { headers: { 'X-Admin-Password': password } });
@@ -2982,51 +2981,6 @@
                 document.getElementById('versionBadge').textContent = 'v' + currentVersion;
             } catch (e) { }
         }
-
-        async function checkUpdate(manual) {
-            try {
-                const res = await fetch('https://raw.githubusercontent.com/Quorinex/Kiro-Go/main/version.json?t=' + Date.now());
-                if (!res.ok) throw new Error('Fetch failed');
-                const d = await res.json();
-                const latestVersion = (d.version || '').replace(/^v/, '');
-                if (latestVersion && latestVersion !== currentVersion && compareVersions(latestVersion, currentVersion) > 0) {
-                    showUpdateModal(latestVersion, d.download || 'https://github.com/Quorinex/Kiro-Go', d.changelog || '');
-                } else if (manual) {
-                    alert(t('update.upToDate') + ' (v' + currentVersion + ')');
-                }
-            } catch (e) {
-                if (manual) alert(t('update.checkFailed'));
-            }
-        }
-
-        function compareVersions(a, b) {
-            const pa = a.split('.').map(Number);
-            const pb = b.split('.').map(Number);
-            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-                const na = pa[i] || 0, nb = pb[i] || 0;
-                if (na > nb) return 1;
-                if (na < nb) return -1;
-            }
-            return 0;
-        }
-
-        function showUpdateModal(version, url, changelog) {
-            const body = document.getElementById('updateBody');
-            body.innerHTML =
-                '<div style="text-align:center;margin-bottom:20px">' +
-                '<div style="font-size:48px;margin-bottom:12px">🎉</div>' +
-                '<p style="font-size:16px;font-weight:600;color:#7c3aed">' + t('update.newVersion') + '</p>' +
-                '</div>' +
-                '<div class="detail-grid" style="margin-bottom:16px">' +
-                '<div class="detail-item"><div class="detail-label">' + t('update.current') + '</div><div class="detail-value">v' + currentVersion + '</div></div>' +
-                '<div class="detail-item"><div class="detail-label">' + t('update.latest') + '</div><div class="detail-value" style="color:#16a34a">v' + version + '</div></div>' +
-                '</div>' +
-                (changelog ? '<div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;margin-bottom:8px">' + t('update.changelog') + '</div><div style="background:#f8fafc;padding:12px;border-radius:8px;font-size:12px;max-height:200px;overflow-y:auto;white-space:pre-wrap;line-height:1.6">' + escapeHtml(changelog) + '</div></div>' : '') +
-                '<div style="text-align:center"><a href="' + url + '" target="_blank" class="btn btn-primary" style="text-decoration:none;display:inline-block">' + t('update.goDownload') + '</a></div>';
-            document.getElementById('updateModal').classList.add('active');
-        }
-
-        function closeUpdateModal() { document.getElementById('updateModal').classList.remove('active'); }
 
         function escapeHtml(text) {
             const div = document.createElement('div');

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestApiKeyMigrationFromLegacyField(t *testing.T) {
@@ -188,7 +189,8 @@ func TestRecordApiKeyUsageConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				if err := RecordApiKeyUsage(created.ID, 7, 0.5); err != nil {
+				// input(3)+output(4) == 7 tokens per call, exercising both fields.
+				if err := RecordApiKeyUsage(created.ID, "test-model", 3, 4, 0.5); err != nil {
 					atomic.AddInt32(&failures, 1)
 					return
 				}
@@ -227,7 +229,7 @@ func TestResetApiKeyUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := RecordApiKeyUsage(created.ID, 100, 1.5); err != nil {
+	if err := RecordApiKeyUsage(created.ID, "test-model", 100, 0, 1.5); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if err := ResetApiKeyUsage(created.ID); err != nil {
@@ -244,10 +246,10 @@ func TestResetApiKeyUsage(t *testing.T) {
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},
@@ -255,6 +257,14 @@ func TestApiKeyOverLimit(t *testing.T) {
 		{"over token limit", ApiKeyEntry{TokenLimit: 100, TokensUsed: 150}, true, false},
 		{"over credit limit", ApiKeyEntry{CreditLimit: 1, CreditsUsed: 2}, false, true},
 		{"both over", ApiKeyEntry{TokenLimit: 1, TokensUsed: 2, CreditLimit: 1, CreditsUsed: 2}, true, true},
+		// Unified balance model: balance = CreditsGranted - CreditsUsed.
+		{"granted balance remaining", ApiKeyEntry{CreditsGranted: 10, CreditsUsed: 5}, false, false},
+		{"granted balance exhausted", ApiKeyEntry{CreditsGranted: 10, CreditsUsed: 10}, false, true},
+		// A positive grant takes precedence over the legacy CreditLimit.
+		{"granted overrides legacy limit", ApiKeyEntry{CreditsGranted: 10, CreditsUsed: 5, CreditLimit: 1}, false, false},
+		// Expiry forces over-credit regardless of remaining balance.
+		{"expired over credit", ApiKeyEntry{ExpiresAt: 1, CreditsGranted: 10, CreditsUsed: 0}, false, true},
+		{"future expiry not over", ApiKeyEntry{ExpiresAt: time.Now().Unix() + 3600, CreditsGranted: 10, CreditsUsed: 5}, false, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,5 +301,88 @@ func TestGenerateApiKeyValueIsUnique(t *testing.T) {
 	}
 	if len(a) < 10 {
 		t.Fatalf("expected non-trivial key length, got %q", a)
+	}
+}
+
+func TestIsApiKeyExpired(t *testing.T) {
+	now := time.Now().Unix()
+	tests := []struct {
+		name string
+		e    ApiKeyEntry
+		want bool
+	}{
+		{"never expires (zero)", ApiKeyEntry{ExpiresAt: 0}, false},
+		{"expired in past", ApiKeyEntry{ExpiresAt: 1}, true},
+		{"expires in future", ApiKeyEntry{ExpiresAt: now + 3600}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsApiKeyExpired(tc.e); got != tc.want {
+				t.Fatalf("IsApiKeyExpired(%+v) = %v, want %v", tc.e, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRechargeApiKeyAndBalance exercises the unified ledger on the JSON/in-memory
+// backend: recharge grows CreditsGranted, usage grows CreditsUsed, and the balance
+// reported by GetApiKeyBalanceByID is granted - used.
+func TestRechargeApiKeyAndBalance(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Name: "wallet", Key: "sk-wallet", Enabled: true})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	// Fresh key: zero grant, zero used, zero balance, but a known id.
+	granted, used, balance, ok := GetApiKeyBalanceByID(created.ID)
+	if !ok || granted != 0 || used != 0 || balance != 0 {
+		t.Fatalf("fresh balance = (g=%v u=%v b=%v ok=%v), want all zero + ok", granted, used, balance, ok)
+	}
+
+	// Recharge twice; CreditsGranted accumulates monotonically.
+	if err := RechargeApiKey(created.ID, 10, "admin", "first top-up"); err != nil {
+		t.Fatalf("recharge 1: %v", err)
+	}
+	if err := RechargeApiKey(created.ID, 5, "admin", "second top-up"); err != nil {
+		t.Fatalf("recharge 2: %v", err)
+	}
+
+	// Consume some credits.
+	if err := RecordApiKeyUsage(created.ID, "test-model", 100, 50, 4); err != nil {
+		t.Fatalf("record usage: %v", err)
+	}
+
+	granted, used, balance, ok = GetApiKeyBalanceByID(created.ID)
+	if !ok {
+		t.Fatalf("expected balance lookup to succeed")
+	}
+	if granted != 15 {
+		t.Fatalf("granted = %v, want 15", granted)
+	}
+	if used != 4 {
+		t.Fatalf("used = %v, want 4", used)
+	}
+	if balance != 11 {
+		t.Fatalf("balance = %v, want 11", balance)
+	}
+
+	// Non-positive recharge is rejected.
+	if err := RechargeApiKey(created.ID, 0, "admin", ""); err == nil {
+		t.Fatalf("expected zero-amount recharge to fail")
+	}
+	if err := RechargeApiKey(created.ID, -3, "admin", ""); err == nil {
+		t.Fatalf("expected negative-amount recharge to fail")
+	}
+
+	// Unknown id is an error / not-ok.
+	if err := RechargeApiKey("does-not-exist", 1, "admin", ""); err == nil {
+		t.Fatalf("expected recharge of unknown key to fail")
+	}
+	if _, _, _, ok := GetApiKeyBalanceByID("does-not-exist"); ok {
+		t.Fatalf("expected balance lookup of unknown key to report ok=false")
 	}
 }
