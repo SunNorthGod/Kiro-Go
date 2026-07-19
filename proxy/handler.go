@@ -2318,20 +2318,35 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
+//
+// 与其它五条路径同构:走 pool.Acquire(公平准入/并发计数/粘性/RPM,拿到的是账号值拷贝,
+// 修复了旧 GetNextForModelExcluding 返回池内指针后 ensureValidToken 无锁写 token 与
+// 调度器读写竞态的问题)+ callKiroWithSelfHeal(可自愈 400 同账号重试一次)。
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
 
+	conversationID := payload.ConversationState.AgentContinuationId
+	bypassFairness := apiKeyID == ""
+	keyFloor := 0
+	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
+		keyFloor = e.MaxConcurrency
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded)
+		if aerr == pool.ErrTooBusy {
+			h.sendOpenAIError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
+			return
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if aerr != nil {
+			break // ErrNoAccount → 无可用账号
+		}
+		if err := h.ensureValidToken(&account); err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -2365,11 +2380,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroWithSelfHeal(&account, payload, callback)
 		if err != nil {
+			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(&account, err)
 			continue
 		}
 
@@ -2391,6 +2407,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		releaseSlot()
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 

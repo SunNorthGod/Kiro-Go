@@ -146,7 +146,8 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		return acc
+		cp := *acc
+		return &cp
 	}
 
 		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
@@ -166,10 +167,15 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			cp := *acc
+			return &cp
 		}
 	}
-	return best
+	if best == nil {
+		return nil
+	}
+	cp := *best
+	return &cp
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -257,7 +263,8 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		return acc
+		cp := *acc
+		return &cp
 	}
 
 	// fallback：找冷却时间最短且支持该模型的账号
@@ -280,19 +287,26 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			cp := *acc
+			return &cp
 		}
 	}
-	return best
+	if best == nil {
+		return nil
+	}
+	cp := *best
+	return &cp
 }
 
-// GetByID 根据 ID 获取账号
+// GetByID 根据 ID 获取账号。返回值拷贝(而非池内指针),与 eligibleSnapshot 同思路:
+// 调用方在锁外读写返回值不会与池内 token 刷新(UpdateToken)产生数据竞态。
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			cp := p.accounts[i]
+			return &cp
 		}
 	}
 	return nil
