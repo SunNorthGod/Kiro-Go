@@ -1,5 +1,5 @@
 {
-  "version": "1.1.10",
-  "changelog": "🖼️ 修复带图请求 400 IMAGE_MIME_MISMATCH：客户端声明的图片 media_type 与 base64 真实字节格式不一致（如 PNG 截图标成 image/jpeg）时，Kiro/AmazonQ 上游严格校验并拒绝。现在发上游前对每个图片块做魔数嗅探（PNG/JPEG/GIF/WEBP/BMP/TIFF，只解码前几十字节），嗅探结果与声明不符且属于上游支持集（jpeg/png/gif/webp）则以真实格式为准覆盖；嗅探不出已知格式保持原样不误改。覆盖 Anthropic /v1/messages 的 image 块与 OpenAI /v1/chat/completions 的 image_url data URI 两条路径，服务端统一纠正、所有客户端受益。\n🖼️ Fix HTTP 400 IMAGE_MIME_MISMATCH on image requests: when the client-declared media_type disagrees with the actual base64 bytes (e.g. a PNG screenshot labeled image/jpeg), the Kiro/AmazonQ upstream strictly validates and rejects the request. Every image block is now magic-number sniffed before going upstream (PNG/JPEG/GIF/WEBP/BMP/TIFF, decoding only the first few dozen bytes); if the sniffed format differs from the declaration and is in the upstream allow-list (jpeg/png/gif/webp), the real format wins. Unrecognizable bytes keep the declared type untouched. Covers both the Anthropic /v1/messages image block and the OpenAI /v1/chat/completions image_url data URI paths — corrected server-side so every client benefits.",
+  "version": "1.1.11",
+  "changelog": "✨ 管理端账号详情弹窗：点击「保存」成功后自动关闭弹窗（保存失败仍停留在弹窗内以便修改）。\n✨ Admin account detail modal: clicking Save now closes the modal automatically on success (on failure the modal stays open so you can fix the input).",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }
