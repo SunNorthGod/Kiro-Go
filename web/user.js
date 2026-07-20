@@ -490,7 +490,7 @@
   }
   function statusInfo() {
     if (meData && meData.expired) return { key: 'user.status.expired', cls: 'badge-error' };
-    if (meData && meData.enabled === false) return { key: 'user.status.disabled', cls: 'badge-warning' };
+    if (meData && meData.enabled === false) return { key: 'user.status.disabled', cls: 'badge-disabled' };
     return { key: 'user.status.active', cls: 'badge-success' };
   }
 
@@ -773,7 +773,7 @@
     const used = ch.creditsUsed || 0;
     const bal = ch.balance != null ? ch.balance : (g - used);
     const status = ch.status || (ch.enabled === false ? 'disabled' : 'active');
-    const stCls = status === 'expired' ? 'badge-error' : (status === 'disabled' ? 'badge-muted' : 'badge-success');
+    const stCls = status === 'expired' ? 'badge-error' : (status === 'disabled' ? 'badge-disabled' : 'badge-success');
     const stKey = status === 'expired' ? 'user.status.expired' : (status === 'disabled' ? 'user.status.disabled' : 'user.status.active');
     const dotCls = status === 'expired' ? 'is-bad' : (ch.enabled === false ? 'is-warn' : 'is-ok');
 

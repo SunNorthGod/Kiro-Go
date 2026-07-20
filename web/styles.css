@@ -688,6 +688,13 @@ select.custom-select-native {
   color: #ffffff;
   border-color: #991b1b;
 }
+/* Disabled status badge: red (danger) so a disabled account/key reads as an
+   attention state at a glance, consistent everywhere it renders. */
+.badge-disabled {
+  background: #dc2626;
+  color: #ffffff;
+  border-color: #dc2626;
+}
 .badge-suspended {
   background: #92400e;
   color: #ffffff;
@@ -3765,9 +3772,9 @@ img.brand-icon.brand-logo {
   border-color: color-mix(in oklab, var(--info) 38%, transparent);
 }
 .key-tag-disabled {
-  background: var(--muted);
-  color: var(--muted-foreground);
-  border-color: var(--border);
+  background: color-mix(in oklab, var(--destructive) 15%, transparent);
+  color: var(--destructive);
+  border-color: color-mix(in oklab, var(--destructive) 38%, transparent);
 }
 .key-tag-expired {
   background: color-mix(in oklab, var(--destructive) 15%, transparent);

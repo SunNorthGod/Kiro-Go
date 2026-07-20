@@ -1420,7 +1420,7 @@
     if (isBanned) {
       if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned">' + escapeHtml(t('accounts.banned')) + '</span>');
       else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
-      out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+      out.push('<span class="badge badge-disabled">' + escapeHtml(t('accounts.disabled')) + '</span>');
     } else {
       if (!a.hasToken)
         out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
@@ -1430,7 +1430,7 @@
         out.push('<span class="badge badge-success">' + escapeHtml(t('accounts.normal')) + '</span>');
       out.push(a.enabled
         ? '<span class="badge badge-info">' + escapeHtml(t('accounts.enabled')) + '</span>'
-        : '<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+        : '<span class="badge badge-disabled">' + escapeHtml(t('accounts.disabled')) + '</span>');
     }
     return out.join('');
   }
@@ -1617,7 +1617,7 @@
     else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
     if (!a.hasToken) out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
     else if (accountTokenExpired(a)) out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.expired')) + '</span>');
-    if (!a.enabled && !banned) out.push('<span class="badge badge-muted">' + escapeHtml(t('accounts.disabled')) + '</span>');
+    if (!a.enabled && !banned) out.push('<span class="badge badge-disabled">' + escapeHtml(t('accounts.disabled')) + '</span>');
     return out.join('');
   }
   // Overall-health dot for a card row: red = expired; amber = disabled or an
