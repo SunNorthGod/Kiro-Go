@@ -2439,6 +2439,13 @@ img.brand-icon.brand-logo {
   flex: 1;
   min-width: 12rem;
 }
+/* Detail modal footer sits outside the scrollable body (sibling of .modal-body),
+   so it stays visible while the form scrolls; give it the body's side padding. */
+#detailModal .modal-footer {
+  flex: none;
+  margin-top: 0;
+  padding: 1rem 1.5rem 1.25rem;
+}
 .model-list {
   display: flex;
   flex-direction: column;

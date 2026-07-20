@@ -1816,7 +1816,6 @@
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.machineId')) + '</h4><div class="machine-id-row">' +
       '<input type="text" id="machineIdInput" value="' + escapeAttr(a.machineId || '') + '" placeholder="UUID" />' +
       '<button class="btn btn-sm btn-outline" id="generateMachineIdBtn" type="button">' + escapeHtml(t('detail.generate')) + '</button>' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div></div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('accounts.priority')) + '</h4>' +
@@ -1824,7 +1823,13 @@
       '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" step="1" placeholder="1" />' +
       '<small>' + escapeHtml(t('accounts.priorityHint')) + '</small>' +
       '</div>' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div>' +
+
+      '<div class="detail-section"><h4>' + escapeHtml(t('detail.proxyURL')) + '</h4>' +
+      '<div class="form-group">' +
+      '<input type="text" id="proxyURLInput" value="' + escapeAttr(a.proxyURL || '') + '" placeholder="socks5://host:port" />' +
+      '<small>' + escapeHtml(t('detail.proxyHint')) + '</small>' +
+      '</div>' +
       '</div>' +
 
       '<div class="detail-section">' +
@@ -1834,11 +1839,6 @@
       '<p class="help-block">' + escapeHtml(t('detail.overageHint')) + '</p>' +
       renderOverageBlock(a, idAttr) +
       '</div>' +
-
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.proxyURL')) + '</h4><div class="machine-id-row">' +
-      '<input type="text" id="proxyURLInput" value="' + escapeAttr(a.proxyURL || '') + '" placeholder="socks5://host:port" />' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveProxyURL" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-      '</div><p class="help-block">' + escapeHtml(t('detail.proxyHint')) + '</p></div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.subscription')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.subscriptionType'), a.subscriptionTitle || (a.subscriptionType ? formatSubscriptionLabel(a.subscriptionType) : '-')) +
@@ -1866,6 +1866,9 @@
       '</h4>' +
       '<div id="modelsList" class="model-list"></div>' +
       '</div>';
+
+    $('detailFooter').innerHTML =
+      '<button class="btn btn-primary" data-detail-action="saveDetail" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>';
 
     openDialog('detailModal');
   }
@@ -1921,16 +1924,18 @@
       toast(t('detail.saveFailed'), 'error');
     }
   }
-  async function saveMachineId(id) {
+  // Unified save for the detail form: machineId + weight + proxyURL in one PUT.
+  async function saveAccountDetail(id) {
     const m = $('machineIdInput').value.trim();
     if (m && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(m) && !/^[0-9a-f]{32}$/i.test(m)) {
       toast(t('detail.machineIdError'), 'warning'); return;
     }
-    await putAccount(id, { machineId: m }, t('detail.saved'));
-  }
-  async function saveWeight(id) {
+    const proxyURL = $('proxyURLInput').value.trim();
+    if (proxyURL && !/^(socks5|socks5h|http|https):\/\//.test(proxyURL)) {
+      toast(t('detail.proxyFormatError'), 'warning'); return;
+    }
     const weight = Math.max(0, parseInt($('weightInput').value, 10) || 0);
-    await putAccount(id, { weight }, t('detail.saved'));
+    await putAccount(id, { machineId: m, weight, proxyURL }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -2006,13 +2011,6 @@
     } catch (e) {
       toast(t('accounts.overageSwitchFailed') + ': ' + (e.message || e), 'warning');
     }
-  }
-  async function saveProxyURL(id) {
-    const url = $('proxyURLInput').value.trim();
-    if (url && !/^(socks5|socks5h|http|https):\/\//.test(url)) {
-      toast(t('detail.proxyFormatError'), 'warning'); return;
-    }
-    await putAccount(id, { proxyURL: url }, t('detail.proxySaved'));
   }
   function closeDetailModal() { closeDialog('detailModal'); }
 
@@ -3709,20 +3707,20 @@
   }
 
   function bindDetailEvents() {
-    $('detailBody').addEventListener('click', e => {
+    const onDetailClick = e => {
       if (e.target.id === 'generateMachineIdBtn') { generateMachineId(); return; }
       const b = e.target.closest('[data-detail-action]');
       if (!b) return;
       const id = b.dataset.id;
       const a = b.dataset.detailAction;
-      if (a === 'saveMachineId') saveMachineId(id);
-      else if (a === 'saveWeight') saveWeight(id);
+      if (a === 'saveDetail') saveAccountDetail(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
-      else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
-    });
+    };
+    $('detailBody').addEventListener('click', onDetailClick);
+    $('detailFooter').addEventListener('click', onDetailClick);
   }
 
   function bindTestEvents() {

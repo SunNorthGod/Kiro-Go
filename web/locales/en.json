@@ -213,7 +213,6 @@
   "detail.overageSwitching": "Calling AWS...",
   "detail.proxyURL": "Account Proxy",
   "detail.proxyHint": "Leave empty to use global proxy. Format: socks5://host:port or http://host:port",
-  "detail.proxySaved": "Proxy saved",
   "detail.save": "Save",
   "modal.addAccount": "Add Account",
   "modal.builderIdTitle": "AWS Builder ID",
