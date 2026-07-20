@@ -340,6 +340,14 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 
+	// SSE keepalive(注释行心跳,同 OpenAI chat 路径)。responses 流一进来就发
+	// response.created(隐式提交 200 头并 flush),所以这里无需 commitStream 挂
+	// OnStreamStart——首个 send 之后直接 Start,心跳顺带覆盖换号重试的等待期。
+	kw := newSSEKeepaliveWriter(w, flusher, commentKeepalivePing, sseKeepaliveInterval, &h.keepalivePings, "responses")
+	defer kw.Stop()
+	w = kw
+	flusher = kw
+
 	send := func(eventName string, payload interface{}) {
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -365,6 +373,8 @@ func (h *Handler) handleResponsesStream(
 		"type":     "response.created",
 		"response": initial,
 	})
+	// 200 头已随首个事件提交,从此心跳安全。
+	kw.Start()
 
 	excluded := make(map[string]bool)
 	var lastErr error

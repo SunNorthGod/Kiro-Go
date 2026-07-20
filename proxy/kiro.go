@@ -337,6 +337,14 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
+	// OnStreamStart fires as soon as an upstream endpoint returned 2xx and the
+	// event stream is about to be consumed — i.e. this request WILL stream (or
+	// die trying). Streaming handlers use it to flush response headers early
+	// and start the SSE keepalive before the first content event, killing the
+	// pre-first-token silent window (CF 524). May fire again on a later
+	// account/self-heal retry, so it must be idempotent. Synchronous, on the
+	// handler goroutine.
+	OnStreamStart  func()
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
 	OnComplete     func(inputTokens, outputTokens int)
@@ -532,6 +540,13 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 				}
 				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
 				return false, e
+			}
+
+			// The upstream stream is established: let the handler flush its
+			// response headers / start its keepalive before the first content
+			// event arrives.
+			if callback != nil && callback.OnStreamStart != nil {
+				callback.OnStreamStart()
 			}
 
 			// Success: stream with a per-read idle deadline. On idle, cancel

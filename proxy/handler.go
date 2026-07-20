@@ -52,6 +52,9 @@ type Handler struct {
 	// clientDisconnects 计数被客户端断开中断、因此未走到上游 metering 计费的请求
 	// (仅观测:计费策略不变,断开是否计费留待产品决策)。
 	clientDisconnects int64
+	// keepalivePings 计数三条流式路径已发出的 SSE 心跳(防中间层空闲读超时切流,
+	// 见 sse_keepalive.go)。仅观测,挂在 /admin/api/status 与 /admin/api/stats。
+	keepalivePings int64
 	totalTokens       int64
 	totalCredits    float64 // float64 需要用锁保护
 	creditsMu       sync.RWMutex
@@ -1043,6 +1046,30 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	// SSE keepalive:所有写出(事件+心跳+头提交+flush)从此经同一把锁串行;Start 后
+	// 静默超过 sseKeepaliveInterval 即发 Anthropic 原生 ping 事件,防止 CF 等中间层
+	// 的 ~100s 空闲读超时在思考被吞/tool_use 缓冲/首 token 前的静默窗口里切流。
+	kw := newSSEKeepaliveWriter(w, flusher, claudeKeepalivePing, sseKeepaliveInterval, &h.keepalivePings, "claude")
+	defer kw.Stop()
+	w = kw
+	flusher = kw
+
+	// commitStream:上游拿到 2xx(确定走流式输出)后立即提交 200 响应头 + flush 并
+	// 启动心跳,不等首个内容事件(消灭 TTFB>100s 的 CF 524)。SSE 语义上尚无内容被
+	// commit,未出首内容时的换号重试照常工作(心跳在换号期间继续)。幂等:重试账号
+	// 再次拿到 2xx 只是 no-op。commit 之前的失败仍走真实 HTTP 状态码(插件流前重试
+	// 依赖 5xx);commit 之后的失败改发 SSE error 事件收尾。
+	streamCommitted := false
+	commitStream := func() {
+		if streamCommitted {
+			return
+		}
+		streamCommitted = true
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		kw.Start()
+	}
+
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
 
@@ -1100,6 +1127,14 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			// 本卡密并发已达公平上限且池子饱和 → 429(软限制:空载时不会到这里)。
+			// 若前一账号已拿过上游 2xx(200 头已 flush),状态码不可再改,发 SSE error 事件。
+			if streamCommitted {
+				h.sendSSE(w, flusher, "error", map[string]interface{}{
+					"type":  "error",
+					"error": map[string]string{"type": "rate_limit_error", "message": "Too many concurrent requests for this key; retry shortly"},
+				})
+				return
+			}
 			h.sendClaudeError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
 			return
 		}
@@ -1402,6 +1437,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		callback := &KiroStreamCallback{
+			OnStreamStart: commitStream,
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -1568,11 +1604,27 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if lastErr == nil {
+		if streamCommitted {
+			h.sendSSE(w, flusher, "error", map[string]interface{}{
+				"type":  "error",
+				"error": map[string]string{"type": "api_error", "message": "No available accounts"},
+			})
+			return
+		}
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
+	// 200 头已随上游 2xx 提前 flush 时不能再改状态码 → SSE error 事件收尾
+	// (对齐既有"已 committed 失败"路径);否则保持真实 500。
+	if streamCommitted {
+		h.sendSSE(w, flusher, "error", map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": lastErr.Error()},
+		})
+		return
+	}
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -2078,6 +2130,25 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	// SSE keepalive(同 Claude 路径,心跳格式换成 SSE 注释行 ": keepalive",
+	// OpenAI 协议无原生 ping 事件,SSE 规范要求解析器忽略注释行)。
+	kw := newSSEKeepaliveWriter(w, flusher, commentKeepalivePing, sseKeepaliveInterval, &h.keepalivePings, "openai")
+	defer kw.Stop()
+	w = kw
+	flusher = kw
+
+	// commitStream:上游 2xx 后立即提交 200 头 + flush + 启动心跳(见 Claude 路径注释)。
+	streamCommitted := false
+	commitStream := func() {
+		if streamCommitted {
+			return
+		}
+		streamCommitted = true
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		kw.Start()
+	}
+
 	// 获取 thinking 输出格式配置
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
@@ -2109,6 +2180,11 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
+			// 200 头已提前 flush 时不能再改状态码 → 流内 error 帧收尾。
+			if streamCommitted {
+				h.sendOpenAIStreamError(w, flusher, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
+				return
+			}
 			h.sendOpenAIError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
 			return
 		}
@@ -2346,6 +2422,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		callback := &KiroStreamCallback{
+			OnStreamStart: commitStream,
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -2487,11 +2564,21 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if lastErr == nil {
+		if streamCommitted {
+			h.sendOpenAIStreamError(w, flusher, "server_error", "No available accounts")
+			return
+		}
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("openai", model, "", lastErr)
+	// 200 头已随上游 2xx 提前 flush 时不能再改状态码 → 流内 error 帧收尾;
+	// 否则保持真实 500(插件流前重试依赖状态码)。
+	if streamCommitted {
+		h.sendOpenAIStreamError(w, flusher, "server_error", lastErr.Error())
+		return
+	}
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2635,6 +2722,22 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 			"message": message,
 		},
 	})
+}
+
+// sendOpenAIStreamError emits an in-band error for an OpenAI SSE stream whose
+// 200 response headers were already flushed (commitStream): the HTTP status can
+// no longer change, so the error is delivered as a terminal data frame followed
+// by [DONE], the shape OpenAI-compatible clients parse for late failures.
+func (h *Handler) sendOpenAIStreamError(w http.ResponseWriter, flusher http.Flusher, errType, message string) {
+	data, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]string{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	fmt.Fprintf(w, "data: %s\n\n", string(data))
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 // accountRefreshLock returns the per-account refresh mutex, creating it on first
@@ -3792,6 +3895,7 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"successRequests":   atomic.LoadInt64(&h.successRequests),
 		"failedRequests":    atomic.LoadInt64(&h.failedRequests),
 		"clientDisconnects": atomic.LoadInt64(&h.clientDisconnects),
+		"keepalivePings":    atomic.LoadInt64(&h.keepalivePings),
 		"totalTokens":       atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":      h.getCredits(),
 		"uptime":            time.Now().Unix() - h.startTime,
@@ -3877,6 +3981,7 @@ func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 		"successRequests":   atomic.LoadInt64(&h.successRequests),
 		"failedRequests":    atomic.LoadInt64(&h.failedRequests),
 		"clientDisconnects": atomic.LoadInt64(&h.clientDisconnects),
+		"keepalivePings":    atomic.LoadInt64(&h.keepalivePings),
 		"totalTokens":       atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":      h.getCredits(),
 		"uptime":            time.Now().Unix() - h.startTime,
