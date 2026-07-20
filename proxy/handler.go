@@ -852,54 +852,6 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	return nil
 }
 
-// apiRefreshAccountModels POST /admin/api/accounts/{id}/models/refresh
-// 立即为指定账号拉取并更新模型路由缓存。
-func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-	// 从 pool 取运行时最新 token（与 refreshModelsCache 逻辑一致）
-	if latest := h.pool.GetByID(id); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-	}
-	if err := h.fetchAndCacheAccountModels(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"count":   len(h.pool.GetModelList(id)),
-	})
-}
-
-// apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
-// 直接复用 refreshModelsCache，为所有已启用账号刷新模型路由缓存。
-func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
-	h.refreshModelsCache()
-	h.modelsCacheMu.RLock()
-	cachedLen := len(h.cachedModels)
-	h.modelsCacheMu.RUnlock()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"refreshed": cachedLen,
-		"failed":    0,
-	})
-}
-
 func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
 	if len(incoming) == 0 {
 		return existing
@@ -2786,35 +2738,19 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
-	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
-	case path == "/accounts/models/refresh" && r.Method == "POST":
-		h.apiRefreshAllAccountsModels(w, r)
-	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
-		h.apiRefreshAccountModels(w, r, id)
-	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
-		h.apiRefreshAccount(w, r, id)
+	// 手动刷新端点(账号/模型/超额)已删除:数据新鲜度由后台定时刷新(5min)全权负责,
+	// 管理网页只读渲染。见 backgroundRefresh / RefreshAccountInfo。
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/test")
 		h.apiTestAccount(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
 		h.apiGetAccountModelsCached(w, r, id)
-	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models") && r.Method == "GET":
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models")
-		h.apiGetAccountModels(w, r, id)
 
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
 		h.apiSetAccountOverage(w, r, id)
-	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "GET":
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
-		h.apiGetAccountOverage(w, r, id)
 
-	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/full") && r.Method == "GET":
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/full")
-		h.apiGetAccountFull(w, r, id)
 	// 单账号详情(与 /accounts 列表项同 shape;弹窗打开时拉取)。必须在所有
 	// /accounts/{id}/xxx 子路由之后匹配:仅接受不含 "/" 的裸 id。
 	case strings.HasPrefix(path, "/accounts/") && r.Method == "GET" && !strings.Contains(strings.TrimPrefix(path, "/accounts/"), "/"):
@@ -3127,46 +3063,6 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// apiGetAccountOverage 拉取并返回单个账号的上游 Overages 状态。
-// 同步把结果写回 config.json 缓存，确保 UI 与持久化一致。
-func (h *Handler) apiGetAccountOverage(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-
-	snap, err := FetchOverageStatus(account)
-	if err != nil {
-		w.WriteHeader(502)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	if persistErr := PersistOverageSnapshot(id, snap); persistErr != nil {
-		logger.Warnf("[Overage] persist GET overage failed for %s: %v", account.Email, persistErr)
-	}
-	h.pool.Reload()
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":           true,
-		"overageStatus":     snap.Status,
-		"overageCapability": snap.Capability,
-		"subscriptionTitle": snap.SubscriptionTitle,
-		"overageCap":        snap.OverageCap,
-		"overageRate":       snap.OverageRate,
-		"currentOverages":   snap.CurrentOverages,
-		"overageCheckedAt":  snap.CheckedAt,
-	})
-}
-
 // apiSetAccountOverage 翻转单个账号的上游 Overages 开关，并刷新缓存。
 // Body: {"enabled": true|false}
 func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, id string) {
@@ -3216,11 +3112,12 @@ func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, i
 	})
 }
 
-// apiBatchAccounts 批量操作账号（启用/禁用/刷新）
+// apiBatchAccounts 批量操作账号（启用/禁用）。批量"刷新"action 已随前端手动
+// 刷新触发一并删除——额度/订阅/overage 由后台每 5min 定时刷新兜底。
 func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IDs    []string `json:"ids"`
-		Action string   `json:"action"` // "enable", "disable", "refresh"
+		Action string   `json:"action"` // "enable", "disable"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3268,54 +3165,6 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}(acc)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
-
-	case "refresh":
-		successCount := 0
-		failCount := 0
-		for _, id := range req.IDs {
-			accounts := config.GetAccounts()
-			var account *config.Account
-			for i := range accounts {
-				if accounts[i].ID == id {
-					account = &accounts[i]
-					break
-				}
-			}
-			if account == nil {
-				failCount++
-				continue
-			}
-			// 刷新 token
-			if account.RefreshToken != "" {
-				if newAccess, newRefresh, newExpires, profileArn, err := auth.RefreshToken(account); err == nil {
-					account.AccessToken = newAccess
-					if newRefresh != "" {
-						account.RefreshToken = newRefresh
-					}
-					account.ExpiresAt = newExpires
-					config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
-					if profileArn != "" {
-						account.ProfileArn = profileArn
-						config.UpdateAccountProfileArn(id, profileArn)
-					}
-					h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
-				}
-			}
-			// 刷新账户信息
-			info, err := RefreshAccountInfo(account)
-			if err != nil {
-				failCount++
-				continue
-			}
-			config.UpdateAccountInfo(id, *info)
-			successCount++
-		}
-		h.pool.Reload()
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":   true,
-			"refreshed": successCount,
-			"failed":    failCount,
-		})
 
 	default:
 		w.WriteHeader(400)
@@ -4132,228 +3981,6 @@ func (h *Handler) hydrateNewAccount(account *config.Account) {
 	}
 	// 对 capable 且未设置过 Overages 的账号自动开启（内部自带能力/状态判断）。
 	h.maybeAutoEnableOverage(account)
-}
-
-// apiRefreshAccount 刷新账户信息（使用量、订阅等）
-func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-
-	// 先尝试刷新 token（不管是否过期，确保 token 有效）
-	refreshTokenIfNeeded := func() error {
-		if account.RefreshToken == "" {
-			return nil
-		}
-		newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-		if err != nil {
-			return err
-		}
-		account.AccessToken = newAccessToken
-		if newRefreshToken != "" {
-			account.RefreshToken = newRefreshToken
-		}
-		account.ExpiresAt = newExpiresAt
-		config.UpdateAccountToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		h.pool.UpdateToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		if profileArn != "" {
-			account.ProfileArn = profileArn
-			config.UpdateAccountProfileArn(id, profileArn)
-		}
-		return nil
-	}
-
-	// 检查 token 是否快过期，先刷新
-	if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-		if err := refreshTokenIfNeeded(); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-			return
-		}
-	}
-
-	// 获取账户信息
-	info, err := RefreshAccountInfo(account)
-	if err != nil {
-		// 检查是否为封禁相关错误
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") || strings.Contains(errMsg, "Account suspended") {
-			// 封禁状态已在 RefreshAccountInfo 中处理，静默返回成功
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"message": "Account status updated",
-			})
-			return
-		}
-
-		// 如果是 403/401，说明 token 无效，尝试刷新后重试
-		if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
-			if refreshErr := refreshTokenIfNeeded(); refreshErr == nil {
-				// 重试
-				info, err = RefreshAccountInfo(account)
-				if err != nil {
-					// 重试后仍然失败，检查是否为封禁状态
-					if strings.Contains(err.Error(), "TEMPORARILY_SUSPENDED") || strings.Contains(err.Error(), "Account suspended") {
-						json.NewEncoder(w).Encode(map[string]interface{}{
-							"success": true,
-							"message": "Account status updated",
-						})
-						return
-					}
-				}
-			}
-		}
-
-		// 其他错误才显示错误信息
-		if err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-	}
-
-	// 保存到配置
-	if err := config.UpdateAccountInfo(id, *info); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"info":    info,
-	})
-}
-
-// apiGetAccountFull 获取单个账号的完整信息（包含敏感字段）
-func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	poolAccounts := h.pool.GetAllAccounts()
-
-	// 查找指定账号
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-
-	// 获取运行时统计
-	var stats config.Account
-	for _, a := range poolAccounts {
-		if a.ID == id {
-			stats = a
-			break
-		}
-	}
-
-	// 返回完整账号信息（包含敏感字段）
-	result := map[string]interface{}{
-		"id":                account.ID,
-		"email":             account.Email,
-		"userId":            account.UserId,
-		"nickname":          account.Nickname,
-		"accessToken":       account.AccessToken,
-		"refreshToken":      account.RefreshToken,
-		"clientId":          account.ClientID,
-		"clientSecret":      account.ClientSecret,
-		"authMethod":        account.AuthMethod,
-		"provider":          account.Provider,
-		"region":            account.Region,
-		"expiresAt":         account.ExpiresAt,
-		"machineId":         account.MachineId,
-		"weight":            account.Weight,
-		"overageStatus":     account.OverageStatus,
-		"overageCapability": account.OverageCapability,
-		"overageCap":        account.OverageCap,
-		"overageRate":       account.OverageRate,
-		"currentOverages":   account.CurrentOverages,
-		"overageCheckedAt":  account.OverageCheckedAt,
-		"proxyURL":          account.ProxyURL,
-		"enabled":           account.Enabled,
-		"banStatus":         account.BanStatus,
-		"banReason":         account.BanReason,
-		"banTime":           account.BanTime,
-		"subscriptionType":  account.SubscriptionType,
-		"subscriptionTitle": account.SubscriptionTitle,
-		"daysRemaining":     account.DaysRemaining,
-		"usageCurrent":      account.UsageCurrent,
-		"usageLimit":        account.UsageLimit,
-		"usagePercent":      account.UsagePercent,
-		"nextResetDate":     account.NextResetDate,
-		"lastRefresh":       account.LastRefresh,
-		"trialUsageCurrent": account.TrialUsageCurrent,
-		"trialUsageLimit":   account.TrialUsageLimit,
-		"trialUsagePercent": account.TrialUsagePercent,
-		"trialStatus":       account.TrialStatus,
-		"trialExpiresAt":    account.TrialExpiresAt,
-		"requestCount":      stats.RequestCount,
-		"errorCount":        stats.ErrorCount,
-		"totalTokens":       stats.TotalTokens,
-		"totalCredits":      stats.TotalCredits,
-		"lastUsed":          stats.LastUsed,
-	}
-
-	json.NewEncoder(w).Encode(result)
-}
-
-// apiGetAccountModels 获取账户可用模型
-func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-
-	models, err := ListAvailableModels(account)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	// 同步更新路由缓存
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(id, modelIDs)
-	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
-	h.modelsCacheMu.Unlock()
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"models":  models,
-	})
 }
 
 // apiGetAccountModelsCached 返回账号已缓存的模型列表（不实时拉取上游）。
