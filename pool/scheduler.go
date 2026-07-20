@@ -481,7 +481,44 @@ func (p *AccountPool) TotalRPM() int {
 	return p.rpmAll.sum(now)
 }
 
-// RecordTokens folds one completed request's token total into the trailing-60s
+// ---- 实时 TPM(最近 300 秒滚动 token 数,÷5 归一化为每分钟)----
+//
+// Tokens land in the ring in one lump when a request COMPLETES (unlike RPM,
+// which ticks at dispatch), so completions are sparse pulses: with a 60s
+// window the TPM tile was a square wave — a big request's full token count
+// rode the window for exactly 60s and then dropped off a cliff. A 5-minute
+// window with per-minute normalization spreads each pulse over 300s, giving a
+// smooth rise on completion and a gentle decay when traffic stops. The shared
+// rpmRing (60s, request counts) is untouched.
+const tpmWindowSeconds = 300
+
+// tpmRing is the trailing-300s token counterpart of rpmRing (same convention:
+// guarded by schedMu, stale buckets excluded by their recorded second).
+type tpmRing struct {
+	buckets [tpmWindowSeconds]int32
+	sec     [tpmWindowSeconds]int64 // the unix-second currently stored in each bucket slot
+}
+
+func (r *tpmRing) addN(now int64, n int32) {
+	i := now % tpmWindowSeconds
+	if r.sec[i] != now {
+		r.sec[i] = now
+		r.buckets[i] = 0
+	}
+	r.buckets[i] += n
+}
+
+func (r *tpmRing) sum(now int64) int64 {
+	var total int64
+	for i := 0; i < tpmWindowSeconds; i++ {
+		if now-r.sec[i] < tpmWindowSeconds {
+			total += int64(r.buckets[i])
+		}
+	}
+	return total
+}
+
+// RecordTokens folds one completed request's token total into the trailing-300s
 // token ring (the TPM counterpart of the per-dispatch RPM tick). Tokens are
 // recorded at completion time — same semantics the admin UI previously
 // approximated client-side by differencing the totalTokens counter.
@@ -495,14 +532,15 @@ func (p *AccountPool) RecordTokens(tokens int) {
 	p.schedMu.Unlock()
 }
 
-// TotalTPM returns the tokens recorded (at request completion) in the trailing
-// 60 seconds, deployment-wide. Serves the dashboard's 实时 TPM tile so the
-// frontend renders a backend-computed figure instead of sampling deltas itself.
+// TotalTPM returns the deployment-wide tokens-per-minute figure for the
+// dashboard's 实时 TPM tile: tokens recorded (at request completion) over the
+// trailing 300s, divided by 5 to normalize to a per-minute rate. See the
+// tpmRing comment for why the window is wider than RPM's.
 func (p *AccountPool) TotalTPM() int {
 	now := time.Now().Unix()
 	p.schedMu.Lock()
 	defer p.schedMu.Unlock()
-	return p.tpmAll.sum(now)
+	return int(p.tpmAll.sum(now) / (tpmWindowSeconds / 60))
 }
 
 // RPMSnapshot returns per-account and per-key RPM plus the global total in one

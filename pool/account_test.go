@@ -23,6 +23,7 @@ func newSchedTestPool(accounts ...config.Account) *AccountPool {
 		rpmAcct:      make(map[string]*rpmRing),
 		rpmKey:       make(map[string]*rpmRing),
 		rpmAll:       &rpmRing{},
+		tpmAll:       &tpmRing{},
 		accounts:     accounts,
 	}
 	p.schedCond = sync.NewCond(&p.schedMu)
@@ -393,5 +394,54 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 
 	if got := p.GetNext(); got != nil {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TPM ring (trailing-300s token window, ÷5-normalized to per-minute)
+// ---------------------------------------------------------------------------
+
+// A completed request's token pulse must stay in the ring for the full 300s
+// window and age out afterwards — the old 60s window turned each pulse into a
+// square wave on the dashboard tile.
+func TestTpmRingWindowAndAging(t *testing.T) {
+	r := &tpmRing{}
+	base := time.Now().Unix()
+
+	r.addN(base, 50000)
+	if got := r.sum(base); got != 50000 {
+		t.Fatalf("sum at t0 = %d, want 50000", got)
+	}
+	if got := r.sum(base + 299); got != 50000 {
+		t.Fatalf("sum at t+299 = %d, want 50000 (still inside the 300s window)", got)
+	}
+	if got := r.sum(base + 300); got != 0 {
+		t.Fatalf("sum at t+300 = %d, want 0 (aged out)", got)
+	}
+
+	// Pulses landing in different seconds accumulate; each ages out on its own.
+	r2 := &tpmRing{}
+	r2.addN(base, 1000)
+	r2.addN(base+120, 2000)
+	if got := r2.sum(base + 120); got != 3000 {
+		t.Fatalf("sum at t+120 = %d, want 3000 (both pulses in window)", got)
+	}
+	if got := r2.sum(base + 350); got != 2000 {
+		t.Fatalf("sum at t+350 = %d, want 2000 (first pulse aged out)", got)
+	}
+}
+
+// TotalTPM must report the 300s token sum normalized to a per-minute rate
+// (÷5), so a lone 50k-token completion reads as 10k TPM — the 5-minute mean —
+// rather than 50k for exactly 60s and then 0.
+func TestTotalTPMNormalizesToPerMinute(t *testing.T) {
+	p := newSchedTestPool()
+	p.RecordTokens(50000)
+	if got := p.TotalTPM(); got != 10000 {
+		t.Fatalf("TotalTPM = %d, want 10000 (50000 over 300s ÷ 5)", got)
+	}
+	p.RecordTokens(25000)
+	if got := p.TotalTPM(); got != 15000 {
+		t.Fatalf("TotalTPM = %d, want 15000 after second pulse", got)
 	}
 }

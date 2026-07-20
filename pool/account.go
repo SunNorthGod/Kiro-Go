@@ -39,7 +39,7 @@ type AccountPool struct {
 	rpmAcct map[string]*rpmRing // accountID → 60 秒环形计数
 	rpmKey  map[string]*rpmRing // apiKeyID  → 60 秒环形计数
 	rpmAll  *rpmRing            // 全局 60 秒环形计数
-	tpmAll  *rpmRing            // 全局 60 秒 token 计数(完成时打点,供 dashboard 实时 TPM)
+	tpmAll  *tpmRing            // 全局 300 秒 token 计数(完成时打点,读取 ÷5 归一化为每分钟,供 dashboard 实时 TPM)
 }
 
 // stickyRef 记录一个会话绑定到的账号及最近使用时间(诊断用)。
@@ -66,7 +66,7 @@ func GetPool() *AccountPool {
 			rpmAcct:      make(map[string]*rpmRing),
 			rpmKey:       make(map[string]*rpmRing),
 			rpmAll:       &rpmRing{},
-			tpmAll:       &rpmRing{},
+			tpmAll:       &tpmRing{},
 		}
 		pool.schedCond = sync.NewCond(&pool.schedMu)
 		pool.Reload()
@@ -510,10 +510,11 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	}
 	p.mu.Unlock()
 
-	// Trailing-60s token ring for the dashboard TPM tile. Recorded outside mu
-	// (the ring is schedMu-guarded; the two locks are never held together), and
-	// unconditionally — token throughput is real even when the account has been
-	// evicted from the weighted list (e.g. just went over quota).
+	// Trailing-300s token ring for the dashboard TPM tile (÷5-normalized to
+	// per-minute on read). Recorded outside mu (the ring is schedMu-guarded; the
+	// two locks are never held together), and unconditionally — token throughput
+	// is real even when the account has been evicted from the weighted list
+	// (e.g. just went over quota).
 	p.RecordTokens(tokens)
 
 	if updated {
