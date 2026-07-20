@@ -305,9 +305,19 @@ type KiroAssistantResponseMessage struct {
 	Content  string        `json:"content"`
 	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
 	// ReasoningContent 回传历史带签名的思考(延续工具循环的 interleaved thinking)。
-	// 嵌套 wire format {reasoningText:{text,signature}};仅当带模型真实签名时才发,
-	// 无签名/伪造签名一律省略(否则 Kiro 400 REQUEST_BODY_INVALID / THINKING_SIGNATURE_INVALID)。
+	// 嵌套 wire format {reasoningText:{text,signature}};仅当带模型真实签名且该签名由**当前
+	// 服务账号**产出时才发(见 signature_provenance.go)——签名跨账号回放必 400
+	// (THINKING_SIGNATURE_INVALID)。ClaudeToKiro 只填下面两个 transient 候选字段;真正是否
+	// 下发由 applyThinkingProvenance(payload, 选中账号) 在选号后裁决。
 	ReasoningContent *KiroReasoningContent `json:"reasoningContent,omitempty"`
+
+	// ---- 以下 transient 字段不参与序列化(json:"-"),仅承载"换号剥 thinking"的证据 ----
+	// ReasoningCandidate 是候选历史推理块(已解包出真实签名);applyThinkingProvenance 依据
+	// ReasoningProducer 与当前账号是否一致,决定把它赋给 ReasoningContent(保留)还是置 nil(剥离)。
+	ReasoningCandidate *KiroReasoningContent `json:"-"`
+	// ReasoningProducer 是该历史推理签名的产出账号 token(accountSignatureToken)。空串=来源未知
+	// (无我方 provenance 标记的外来/历史签名)——一律按剥离处理。
+	ReasoningProducer string `json:"-"`
 }
 
 // KiroReasoningContent 是 Kiro 后端接受的历史推理 wire 格式(嵌套,非扁平;扁平会 400)。

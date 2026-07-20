@@ -304,15 +304,20 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				Content:  content,
 				ToolUses: toolUses,
 			}
-			// 回传历史带签名的思考(interleaved thinking 跨工具轮)。仅当带模型真实签名时才发:
-			// 无签名 / 伪造签名(kirogofakesig 前缀)一律省略,否则 Kiro 400
-			// (REQUEST_BODY_INVALID / THINKING_SIGNATURE_INVALID)。
-			if reasoningText != "" && reasoningSig != "" && !isFakeSignature(reasoningSig) {
-				asst.ReasoningContent = &KiroReasoningContent{
-					ReasoningText: KiroReasoningText{
-						Text:      reasoningText,
-						Signature: reasoningSig,
-					},
+			// 回传历史带签名的思考(interleaved thinking 跨工具轮)。这里只把签名归类成
+			// transient 候选(不直接下发):真正是否发给上游,由选号后的
+			// applyThinkingProvenance 依"签名产出账号 == 当前服务账号"裁决(见
+			// signature_provenance.go)。伪造签名(kirogofakesig 前缀)一律丢弃。
+			if reasoningText != "" && reasoningSig != "" {
+				realSig, producer, kind := classifyHistorySignature(reasoningSig)
+				if kind != "fake" {
+					asst.ReasoningCandidate = &KiroReasoningContent{
+						ReasoningText: KiroReasoningText{
+							Text:      reasoningText,
+							Signature: realSig,
+						},
+					}
+					asst.ReasoningProducer = producer // tagged→产出账号 token;foreign→""(来源未知)
 				}
 			}
 			history = append(history, KiroHistoryMessage{

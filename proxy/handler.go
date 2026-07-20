@@ -1148,6 +1148,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			h.handleAccountFailure(&account, err)
 			continue
 		}
+		// 选号已定:发上游前裁决历史思考签名——同账号保留、跨账号/来源未知剥离
+		// (换号剥 thinking,消灭 THINKING_SIGNATURE_INVALID 400+SelfHeal 往返)。
+		applyThinkingProvenance(payload, account.ID)
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage = cacheUsage
 
@@ -1174,7 +1177,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			}
 			signatureSent = true
 			sig := nativeSignature
-			if sig == "" {
+			if sig != "" {
+				// 真实签名:打上产出账号 provenance 标记回传客户端,下一轮据此判定
+				// 同账号(保留)/跨账号(剥离),消灭跨账号回放的 400+SelfHeal 往返。
+				sig = wrapProvenanceSignature(sig, account.ID)
+			} else {
 				sig = generateFakeSignature()
 			}
 			// 按 40 字节切块发送 signature_delta(对齐 Anthropic 分块惯例)
@@ -1917,6 +1924,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			h.handleAccountFailure(&account, err)
 			continue
 		}
+		// 选号已定:发上游前裁决历史思考签名(换号剥 thinking,见 stream 路径同注释)。
+		applyThinkingProvenance(payload, account.ID)
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
