@@ -1867,12 +1867,13 @@
       if (d.success) {
         toast(successMsg, 'success');
         loadAccounts();
-      } else {
-        toast(t('detail.saveFailed') + (d.error ? ': ' + d.error : ''), 'error');
+        return true;
       }
+      toast(t('detail.saveFailed') + (d.error ? ': ' + d.error : ''), 'error');
     } catch (e) {
       toast(t('detail.saveFailed'), 'error');
     }
+    return false;
   }
   // Unified save for the detail form: machineId + weight + proxyURL in one PUT.
   async function saveAccountDetail(id) {
@@ -1885,7 +1886,8 @@
       toast(t('detail.proxyFormatError'), 'warning'); return;
     }
     const weight = Math.max(0, parseInt($('weightInput').value, 10) || 0);
-    await putAccount(id, { machineId: m, weight, proxyURL }, t('detail.saved'));
+    const ok = await putAccount(id, { machineId: m, weight, proxyURL }, t('detail.saved'));
+    if (ok) closeDetailModal();
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
