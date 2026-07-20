@@ -880,11 +880,11 @@
   let overviewData = null;
   let rpmSamples = [];
   let rpmChart = null;
-  // Live tokens-per-minute trend, sampled from the totalTokens counter delta.
+  // Live tokens-per-minute trend: renders the backend-computed totalTPM
+  // (trailing-60s token ring, same semantics as totalRPM) — the frontend no
+  // longer derives it by differencing counters.
   let tokenRateSamples = [];
   let tokenChart = null;
-  let lastTokenTotal = null;
-  let lastTokenAt = 0;
   let ovAnimated = false;
   const RPM_WINDOW = 30;
 
@@ -946,18 +946,9 @@
     const rpm = d.totalRPM || 0;
     rpmSamples.push(rpm);
     if (rpmSamples.length > RPM_WINDOW) rpmSamples.shift();
-    // Derive tokens-per-minute from the running totalTokens counter.
-    const nowTs = Date.now();
-    const totalTokens = d.totalTokens || 0;
-    if (lastTokenTotal != null && nowTs > lastTokenAt) {
-      const dtSec = (nowTs - lastTokenAt) / 1000;
-      let rate = dtSec > 0 ? ((totalTokens - lastTokenTotal) / dtSec) * 60 : 0;
-      if (rate < 0) rate = 0; // guard against counter resets
-      tokenRateSamples.push(rate);
-      if (tokenRateSamples.length > RPM_WINDOW) tokenRateSamples.shift();
-    }
-    lastTokenTotal = totalTokens;
-    lastTokenAt = nowTs;
+    // Tokens-per-minute straight from the backend's trailing-60s token ring.
+    tokenRateSamples.push(d.totalTPM || 0);
+    if (tokenRateSamples.length > RPM_WINDOW) tokenRateSamples.shift();
     renderOverview(d);
     renderOverviewCharts();
   }
@@ -991,8 +982,8 @@
       const pc = d.promptCache || {};
       const pcHit = (typeof pc.hitRate === 'number') ? (pc.hitRate * 100).toFixed(1) + '%' : '-';
       const pcClass = (typeof pc.hitRate === 'number' && pc.hitRate >= 0.6) ? 'success-text' : '';
-      // Live tokens-per-minute: latest sample from the totalTokens-delta trend.
-      const tpm = tokenRateSamples.length ? Math.round(tokenRateSamples[tokenRateSamples.length - 1]) : 0;
+      // Live tokens-per-minute: backend-computed trailing-60s figure.
+      const tpm = Math.round(d.totalTPM || 0);
       grid.innerHTML =
         ngSection(t('overview.sectionRealtime'),
           ngStatTile(t('overview.realtimeRpm'), rpm, { rpm: true, count: rpm, dec: 0 }) +
@@ -1502,8 +1493,8 @@
     if (quiet) window.scrollTo(0, scrollY);
   }
   // One dense row per account: identity + badges on the left, aligned metric
-  // segments in the middle, actions on the right. Preserves every action
-  // (refresh / detail / copyJSON / enable-disable / test / delete).
+  // segments in the middle, actions on the right (detail / copyJSON /
+  // enable-disable / test / delete — no refresh: freshness is backend-owned).
   function renderAccountRow(a) {
     const usagePct = (a.usagePercent || 0) * 100;
     const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
@@ -1549,11 +1540,9 @@
     const blocks = creditBlock + trafficBlock;
     const dotCls = accountDotClass(a);
 
-    const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
     const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
     const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
     const actions =
-      '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
       '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
       '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
       (banned ? '' :
@@ -1625,18 +1614,6 @@
   }
 
   // Account actions
-  async function refreshAccount(id, card) {
-    if (card) card.classList.add('loading');
-    try {
-      const res = await api('/accounts/' + id + '/refresh', { method: 'POST' });
-      const d = await res.json();
-      if (d.success) loadAccounts();
-      else toastError(t('accounts.refreshFailed') + ': ' + (d.error || ''));
-    } catch (e) {
-      toastError(t('accounts.refreshFailed'));
-    }
-    if (card) card.classList.remove('loading');
-  }
   async function toggleAccount(id, enabled) {
     await api('/accounts/' + id, { method: 'PUT', body: JSON.stringify({ enabled }) });
     loadAccounts();
@@ -1685,7 +1662,8 @@
     setTimeout(() => { btn.disabled = false; btn.className = cls; btn.innerHTML = html; }, 800);
   }
 
-  // Batch actions
+  // Batch actions (enable / disable — the batch refresh triggers are gone: data
+  // freshness is backend-owned, the UI only mutates real state).
   async function batchAction(action) {
     const ids = Array.from(selectedAccounts);
     if (!ids.length) return;
@@ -1702,9 +1680,7 @@
       const d = await res.json();
       if (!res.ok || !d.success) throw new Error(d.error || t('common.failed'));
       dismiss();
-      if (action === 'refresh') {
-        toast(t('batch.refreshResult', d.refreshed || 0, d.failed || 0), d.failed ? 'warning' : 'success');
-      } else if (action === 'enable') {
+      if (action === 'enable') {
         toast(t('batch.enableResult', d.count || ids.length), 'success');
       } else if (action === 'disable') {
         toast(t('batch.disableResult', d.count || ids.length), 'success');
@@ -1718,29 +1694,6 @@
       dismiss();
       toast((e && e.message) || t('common.failed'), 'error');
     }
-  }
-  async function batchRefreshModels() {
-    const ids = Array.from(selectedAccounts);
-    if (!ids.length) return;
-    const confirmed = await confirmAction(t('batch.confirmRefreshModels', ids.length), {
-      title: t('models.refreshAll'),
-      confirmText: t('common.confirm')
-    });
-    if (!confirmed) return;
-    const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
-    let ok = 0, fail = 0;
-    for (const id of ids) {
-      try {
-        const res = await api('/accounts/' + id + '/models/refresh', { method: 'POST' });
-        const d = await res.json();
-        if (d.success) ok++; else fail++;
-      } catch { fail++; }
-    }
-    dismiss();
-    toast(t('batch.refreshModelsResult', ok, fail), fail ? 'warning' : 'success');
-    selectedAccounts.clear();
-    updateBatchBar();
-    loadAccounts();
   }
   async function batchDelete() {
     const ids = Array.from(selectedAccounts);
@@ -1766,44 +1719,31 @@
     updateBatchBar();
     loadAccounts(); loadStats();
   }
-  async function refreshAllModels() {
-    const ok = await confirmAction(t('models.confirmRefreshAll'), {
-      title: t('models.refreshAll'),
-      confirmText: t('models.refreshAll')
-    });
-    if (!ok) return;
-    const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
-    try {
-      const res = await api('/accounts/models/refresh', { method: 'POST' });
-      const d = await res.json();
-      dismiss();
-      toast(t('models.refreshAllDone', d.refreshed || 0), 'success');
-    } catch (e) {
-      dismiss();
-      toast(t('common.failed'), 'error');
-    }
-  }
-  async function refreshAccountModels(id) {
-    const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
-    try {
-      const res = await api('/accounts/' + id + '/models/refresh', { method: 'POST' });
-      const d = await res.json();
-      dismiss();
-      if (d.success) toast(t('detail.refreshModelCache') + ' · ' + (d.count || 0), 'success');
-      else toast(t('common.failed') + (d.error ? ': ' + d.error : ''), 'error');
-    } catch (e) {
-      dismiss();
-      toast(t('common.failed'), 'error');
-    }
-  }
 
   // Detail modal
   function detailItem(label, value) {
     return '<div class="detail-item"><div class="detail-label">' + escapeHtml(label) + '</div><div class="detail-value">' + escapeHtml(value) + '</div></div>';
   }
-  function showDetail(id) {
-    const a = accountsData.find(x => x.id === id);
+  // Opening the modal fetches CURRENT data from the backend (auto-refresh
+  // polling pauses while a modal is open, so the list snapshot could be stale)
+  // and renders the account's cached models — read-only, no refresh triggers:
+  // freshness is owned entirely by the backend's periodic refresh.
+  async function showDetail(id) {
+    let a = accountsData.find(x => x.id === id);
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id));
+      if (res.ok) {
+        const fresh = await res.json();
+        if (fresh && fresh.id) a = fresh;
+      }
+    } catch (e) { /* fall back to the list snapshot */ }
     if (!a) return;
+    renderDetail(a);
+    openDialog('detailModal');
+    loadCachedModels(id);
+  }
+  function renderDetail(a) {
+    const id = a.id;
     const idAttr = escapeAttr(id);
     $('detailBody').innerHTML =
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.basicInfo')) + '</h4><div class="detail-grid">' +
@@ -1833,9 +1773,7 @@
       '</div>' +
 
       '<div class="detail-section">' +
-      '<h4>' + escapeHtml(t('detail.overage')) +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button>' +
-      '</h4>' +
+      '<h4>' + escapeHtml(t('detail.overage')) + '</h4>' +
       '<p class="help-block">' + escapeHtml(t('detail.overageHint')) + '</p>' +
       renderOverageBlock(a, idAttr) +
       '</div>' +
@@ -1860,25 +1798,23 @@
       '</div></div>' +
 
       '<div class="detail-section">' +
-      '<h4>' + escapeHtml(t('detail.models')) +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="loadModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.loadModels')) + '</button>' +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="refreshModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.refreshModelCache')) + '</button>' +
-      '</h4>' +
+      '<h4>' + escapeHtml(t('detail.models')) + '</h4>' +
       '<div id="modelsList" class="model-list"></div>' +
       '</div>';
 
     $('detailFooter').innerHTML =
       '<button class="btn btn-primary" data-detail-action="saveDetail" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>';
-
-    openDialog('detailModal');
   }
-  async function loadModels(id) {
+  // Renders the account's models from the backend's route cache (kept fresh by
+  // the periodic background refresh) — no live upstream call from the browser.
+  async function loadCachedModels(id) {
     const c = $('modelsList');
+    if (!c) return;
     c.innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.loading')) + '</p>';
     try {
-      const res = await api('/accounts/' + id + '/models');
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/models/cached');
       const d = await res.json();
-      if (d.success && d.models) {
+      if (d.success && Array.isArray(d.models)) {
         const sorted = d.models.slice().sort((a, b) => {
           if (a.modelId === 'auto') return -1;
           if (b.modelId === 'auto') return 1;
@@ -1894,11 +1830,9 @@
         }).join('') || '<p class="empty-state">' + escapeHtml(t('detail.noModels')) + '</p>';
       } else {
         c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + ': ' + escapeHtml(d.error || '') + '</p>';
-        toast(t('detail.loadFailed') + (d.error ? ': ' + d.error : ''), 'error');
       }
     } catch (e) {
       c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + '</p>';
-      toast(t('detail.loadFailed'), 'error');
     }
   }
   async function generateMachineId() {
@@ -1997,19 +1931,6 @@
       toast(t('accounts.overageSwitchFailed') + ': ' + (e.message || e), 'warning');
     } finally {
       inputEl.disabled = false;
-    }
-  }
-  async function refreshAccountOverage(id) {
-    try {
-      const res = await api('/accounts/' + encodeURIComponent(id) + '/overage', { method: 'GET' });
-      const d = await res.json().catch(() => ({}));
-      if (!res.ok || d.success === false) {
-        throw new Error(d.error || t('accounts.overageSwitchFailed'));
-      }
-      await loadAccounts();
-      showDetail(id);
-    } catch (e) {
-      toast(t('accounts.overageSwitchFailed') + ': ' + (e.message || e), 'warning');
     }
   }
   function closeDetailModal() { closeDialog('detailModal'); }
@@ -2111,7 +2032,9 @@
     try {
       const res = await api('/accounts/' + id + '/models/cached');
       const d = await res.json();
-      testModalModels = Array.isArray(d.models) ? d.models.slice().sort() : [];
+      // /models/cached entries are objects ({modelId, rateMultiplier, ...});
+      // the test picker only needs the ids.
+      testModalModels = Array.isArray(d.models) ? d.models.map(m => m && m.modelId).filter(Boolean).sort() : [];
     } catch (e) {
       testModalModelError = true;
     } finally {
@@ -3619,14 +3542,12 @@
 
   function bindAccountEvents() {
     $('exportBtn').addEventListener('click', showExportModal);
-    $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
-      if (a === 'refreshModels') batchRefreshModels();
-      else if (a === 'delete') batchDelete();
+      if (a === 'delete') batchDelete();
       else batchAction(a);
     }));
 
@@ -3647,8 +3568,7 @@
       if (!btn) return;
       const id = btn.dataset.id;
       const action = btn.dataset.action;
-      if (action === 'refresh') refreshAccount(id, btn.closest('.account-card'));
-      else if (action === 'detail') showDetail(id);
+      if (action === 'detail') showDetail(id);
       else if (action === 'copyJSON') copyAccountJSON(id, btn);
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
       else if (action === 'test') testAccount(id);
@@ -3715,9 +3635,6 @@
       const a = b.dataset.detailAction;
       if (a === 'saveDetail') saveAccountDetail(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
-      else if (a === 'refreshOverage') refreshAccountOverage(id);
-      else if (a === 'loadModels') loadModels(id);
-      else if (a === 'refreshModels') refreshAccountModels(id);
     };
     $('detailBody').addEventListener('click', onDetailClick);
     $('detailFooter').addEventListener('click', onDetailClick);
