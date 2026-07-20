@@ -82,6 +82,11 @@ type Handler struct {
 	dailyMu      sync.Mutex
 	dailyStats   map[string]*dayBucket // "2006-01-02"(CST) → 当日累计
 	dailySavedAt int64                 // 上次落盘的 unix 秒(节流用)
+	// /admin/api/overview 重聚合结果的进程内 TTL 缓存(见 dashboard.go overviewHeavyTTL)。
+	// 只缓存 daily 趋势序列(按 days 分 key)与 promptCache 统计块;实时计数不经过它。
+	ovHeavyMu     sync.Mutex
+	ovDailyCache  map[int]ovDailyEntry
+	ovPromptCache ovPromptEntry
 	// 统计落盘去抖:记录上次已持久化的计数快照,无变化时跳过 30s 定时写(避免空转重写整份配置文件)。
 	lastSavedStats savedStatsSnapshot
 	lastSavedMu    sync.Mutex

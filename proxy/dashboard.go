@@ -157,6 +157,112 @@ func (h *Handler) dailySeries(days int) []map[string]interface{} {
 	return out
 }
 
+// ---- overview 重聚合 TTL 缓存 ----
+//
+// The admin page polls /admin/api/overview every second while the 概览 tab is
+// open. Two parts of that response are expensive aggregations over the
+// display-only usage_records log (~1e5 rows): the 7-day prompt-cache SUM
+// (db.GetRecentCacheStats) and the daily GROUP BY series (db.GetDailyUsage).
+// Both only move on a minutes scale, so they are served from a short
+// in-process TTL cache: one open dashboard now costs one heavy scan per
+// overviewHeavyTTL instead of one per second.
+//
+// Realtime fields (totalRequests/totalTokens/totalCredits/RPM/TPM/concurrency/
+// account+key counts/sticky metrics) are NOT cached — they are recomputed on
+// every request, which is the whole point of the 1s poll.
+const overviewHeavyTTL = 10 * time.Second
+
+// ovDailyEntry caches one computed daily series (keyed by the `days` argument).
+// Cached slices are read-only by convention: every consumer only JSON-encodes them.
+type ovDailyEntry struct {
+	at   time.Time
+	data []map[string]interface{}
+}
+
+// ovPromptEntry caches the deployment-wide promptCache stats block.
+type ovPromptEntry struct {
+	at   time.Time
+	data map[string]interface{}
+}
+
+// overviewDaily returns the trend series for `days`, reusing the cached copy
+// while it is fresh. `days` is already clamped to [1, dailyRetentionDays] by
+// the caller, so the cache map is naturally bounded. Concurrent misses may
+// recompute in parallel (last write wins) — acceptable for a 1s poll, and it
+// avoids holding the mutex across a DB round-trip.
+func (h *Handler) overviewDaily(days int) []map[string]interface{} {
+	now := time.Now()
+	h.ovHeavyMu.Lock()
+	if e, ok := h.ovDailyCache[days]; ok && now.Sub(e.at) < overviewHeavyTTL {
+		h.ovHeavyMu.Unlock()
+		return e.data
+	}
+	h.ovHeavyMu.Unlock()
+
+	daily, ok := h.dailySeriesFromDB(days)
+	if !ok {
+		daily = h.dailySeries(days)
+	}
+
+	h.ovHeavyMu.Lock()
+	if h.ovDailyCache == nil {
+		h.ovDailyCache = make(map[int]ovDailyEntry)
+	}
+	h.ovDailyCache[days] = ovDailyEntry{at: now, data: daily}
+	h.ovHeavyMu.Unlock()
+	return daily
+}
+
+// overviewPromptCache returns the promptCache stats block, reusing the cached
+// copy while it is fresh.
+func (h *Handler) overviewPromptCache() map[string]interface{} {
+	now := time.Now()
+	h.ovHeavyMu.Lock()
+	if h.ovPromptCache.data != nil && now.Sub(h.ovPromptCache.at) < overviewHeavyTTL {
+		data := h.ovPromptCache.data
+		h.ovHeavyMu.Unlock()
+		return data
+	}
+	h.ovHeavyMu.Unlock()
+
+	data := h.computePromptCacheBlock()
+
+	h.ovHeavyMu.Lock()
+	h.ovPromptCache = ovPromptEntry{at: now, data: data}
+	h.ovHeavyMu.Unlock()
+	return data
+}
+
+// computePromptCacheBlock builds the deployment-wide prompt-cache stats block
+// over a RECENT WINDOW (last 7 days), computed from the display-only
+// usage_records log rather than the lifetime billing ledger. This reflects
+// CURRENT cache behaviour so a large historical base of un-cached input can't
+// peg the number low forever. hitRate is null when there's no input in the
+// window (the UI shows a dash rather than a misleading 0%). DB mode only; in
+// JSON mode the zero-value block is returned as before.
+func (h *Handler) computePromptCacheBlock() map[string]interface{} {
+	const cacheWindowDays = 7
+	promptCache := map[string]interface{}{"hitRate": nil, "readTokens": 0, "creationTokens": 0, "inputTokens": 0, "windowDays": cacheWindowDays}
+	if pool := config.DatabasePool(); pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		since := time.Now().Unix() - int64(cacheWindowDays)*86400
+		if gs, err := db.GetRecentCacheStats(ctx, pool, since); err == nil {
+			promptCache["readTokens"] = gs.CacheReadTokens
+			promptCache["creationTokens"] = gs.CacheCreationTokens
+			promptCache["inputTokens"] = gs.InputTokens
+			if gs.InputTokens > 0 {
+				hr := float64(gs.CacheReadTokens) / float64(gs.InputTokens)
+				if hr > 1 {
+					hr = 1
+				}
+				promptCache["hitRate"] = hr
+			}
+		}
+	}
+	return promptCache
+}
+
 // dailySeriesFromDB aggregates the last `days` from usage_records (DB mode only),
 // filling gaps. Returns (series, true) when the DB backend served it.
 func (h *Handler) dailySeriesFromDB(days int) ([]map[string]interface{}, bool) {
@@ -221,38 +327,10 @@ func (h *Handler) apiGetOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	daily, ok := h.dailySeriesFromDB(days)
-	if !ok {
-		daily = h.dailySeries(days)
-	}
-
-	// Deployment-wide prompt-cache hit rate (DB mode only): one cheap SUM over the
-	// counters. hitRate is null when there's no input yet so the UI shows a dash
-	// rather than a misleading 0%.
-	// Deployment-wide prompt-cache hit rate over a RECENT WINDOW (last 7 days),
-	// computed from the display-only usage_records log rather than the lifetime
-	// billing ledger. This reflects CURRENT cache behaviour so a large historical
-	// base of un-cached input can't peg the number low forever. hitRate is null
-	// when there's no input in the window so the UI shows a dash.
-	const cacheWindowDays = 7
-	promptCache := map[string]interface{}{"hitRate": nil, "readTokens": 0, "creationTokens": 0, "inputTokens": 0, "windowDays": cacheWindowDays}
-	if pool := config.DatabasePool(); pool != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		since := time.Now().Unix() - int64(cacheWindowDays)*86400
-		if gs, err := db.GetRecentCacheStats(ctx, pool, since); err == nil {
-			promptCache["readTokens"] = gs.CacheReadTokens
-			promptCache["creationTokens"] = gs.CacheCreationTokens
-			promptCache["inputTokens"] = gs.InputTokens
-			if gs.InputTokens > 0 {
-				hr := float64(gs.CacheReadTokens) / float64(gs.InputTokens)
-				if hr > 1 {
-					hr = 1
-				}
-				promptCache["hitRate"] = hr
-			}
-		}
-	}
+	// Heavy usage_records aggregations (daily trend + 7d prompt-cache stats) are
+	// served through a short TTL cache; everything else below stays realtime.
+	daily := h.overviewDaily(days)
+	promptCache := h.overviewPromptCache()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"totalRequests":   atomic.LoadInt64(&h.totalRequests),

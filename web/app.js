@@ -1131,15 +1131,25 @@
     if (tokenChart) { tokenChart.destroy(); tokenChart = null; }
     renderOverviewCharts();
   }
-  // ── Unified ~1s auto-refresh for the active tab ─────────────────────────
-  // A single interval refreshes only the visible tab's data (概览→/overview,
-  // 账号→/accounts, 卡密→/api-keys, 日志→/logs). 设置 is never auto-refreshed
-  // (it holds form inputs). The tick pauses while any modal or custom-select
-  // dropdown is open, or while the page is hidden; list renders preserve scroll
-  // and only rebuild when data changed, so there is no per-second flicker.
+  // ── Unified auto-refresh for the active tab (tiered cadence) ────────────
+  // A single 1s interval drives all tabs, but each tab refreshes at its own
+  // cadence: 概览→/overview and 日志→/logs stay at ~1s (realtime tiles / new
+  // log lines), while 账号→/accounts and 卡密→/api-keys only re-fetch every
+  // ~10s (their data moves on the backend's 5-minute refresh cycle, so a 1s
+  // poll was pure server load). 设置 is never auto-refreshed (it holds form
+  // inputs). The tick pauses while any modal or custom-select dropdown is
+  // open, or while the page is hidden; list renders preserve scroll and only
+  // rebuild when data changed, so there is no flicker. Regaining visibility
+  // resets the slow-tab gate so the first tick refreshes immediately.
+  const SLOW_TAB_REFRESH_MS = 10000;
+  const slowTabLastFetch = { accounts: 0, keys: 0 };
   let autoRefreshBusy = false;
   function anyModalOpen() { return !!document.querySelector('.modal.active'); }
   function anyCustomSelectOpen() { return !!document.querySelector('.custom-select.is-open'); }
+  function resetSlowTabGate() {
+    slowTabLastFetch.accounts = 0;
+    slowTabLastFetch.keys = 0;
+  }
   async function autoRefreshTick() {
     if (autoRefreshBusy || !password) return;
     const main = $('mainPage');
@@ -1150,8 +1160,12 @@
     autoRefreshBusy = true;
     try {
       if (currentTab === 'overview') await loadOverview();
-      else if (currentTab === 'accounts') await loadAccounts(true);
-      else if (currentTab === 'keys') await loadApiKeys(true);
+      else if (currentTab === 'accounts') {
+        if (Date.now() - slowTabLastFetch.accounts >= SLOW_TAB_REFRESH_MS) await loadAccounts(true);
+      }
+      else if (currentTab === 'keys') {
+        if (Date.now() - slowTabLastFetch.keys >= SLOW_TAB_REFRESH_MS) await loadApiKeys(true);
+      }
       else if (currentTab === 'logs') await loadLogs(true);
     } catch (e) { /* transient error: the next tick retries */ }
     finally { autoRefreshBusy = false; }
@@ -1287,6 +1301,8 @@
   }
 
   async function loadAccounts(quiet) {
+    // Any fetch (auto or user-triggered) restarts the slow-tab window.
+    slowTabLastFetch.accounts = Date.now();
     let data;
     try {
       const res = await api('/accounts');
@@ -2209,6 +2225,8 @@
   const KEY_PAGE_SIZE = 20;
 
   async function loadApiKeys(quiet) {
+    // Any fetch (auto or user-triggered) restarts the slow-tab window.
+    slowTabLastFetch.keys = Date.now();
     const list = $('keysList');
     try {
       const res = await api('/api-keys');
@@ -3521,8 +3539,11 @@
     }));
 
     // Auto-refresh: run one immediate tick when the page regains focus so
-    // coming back feels instant (the 1s loop handles the steady state).
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) autoRefreshTick(); });
+    // coming back feels instant (the 1s loop handles the steady state). The
+    // slow-tab (accounts/keys) 10s gate is reset so that tick fetches at once.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) { resetSlowTabGate(); autoRefreshTick(); }
+    });
 
     // API View modal (guarded: its triggers were removed with the API tab)
     const vmb = $('viewModelsBtn'); if (vmb) vmb.addEventListener('click', showModelsView);
