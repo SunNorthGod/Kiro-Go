@@ -416,12 +416,18 @@ type rpmRing struct {
 }
 
 func (r *rpmRing) add(now int64) {
+	r.addN(now, 1)
+}
+
+// addN records n units (e.g. tokens) in the current second's bucket. Shared by
+// the request ring (n=1) and the token ring (n=tokens of one completed request).
+func (r *rpmRing) addN(now int64, n int32) {
 	i := now % 60
 	if r.sec[i] != now {
 		r.sec[i] = now
 		r.buckets[i] = 0
 	}
-	r.buckets[i]++
+	r.buckets[i] += n
 }
 
 func (r *rpmRing) sum(now int64) int {
@@ -473,6 +479,30 @@ func (p *AccountPool) TotalRPM() int {
 	p.schedMu.Lock()
 	defer p.schedMu.Unlock()
 	return p.rpmAll.sum(now)
+}
+
+// RecordTokens folds one completed request's token total into the trailing-60s
+// token ring (the TPM counterpart of the per-dispatch RPM tick). Tokens are
+// recorded at completion time — same semantics the admin UI previously
+// approximated client-side by differencing the totalTokens counter.
+func (p *AccountPool) RecordTokens(tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	now := time.Now().Unix()
+	p.schedMu.Lock()
+	p.tpmAll.addN(now, int32(tokens))
+	p.schedMu.Unlock()
+}
+
+// TotalTPM returns the tokens recorded (at request completion) in the trailing
+// 60 seconds, deployment-wide. Serves the dashboard's 实时 TPM tile so the
+// frontend renders a backend-computed figure instead of sampling deltas itself.
+func (p *AccountPool) TotalTPM() int {
+	now := time.Now().Unix()
+	p.schedMu.Lock()
+	defer p.schedMu.Unlock()
+	return p.tpmAll.sum(now)
 }
 
 // RPMSnapshot returns per-account and per-key RPM plus the global total in one

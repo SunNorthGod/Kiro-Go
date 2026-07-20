@@ -262,6 +262,7 @@ func (h *Handler) apiGetOverview(w http.ResponseWriter, r *http.Request) {
 		"totalCredits":    h.getCredits(),
 		"uptime":          time.Now().Unix() - h.startTime,
 		"totalRPM":        h.pool.TotalRPM(),
+		"totalTPM":        h.pool.TotalTPM(),
 		"accounts": map[string]interface{}{
 			"total":     total,
 			"available": h.pool.AvailableCount(),

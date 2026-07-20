@@ -426,6 +426,43 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 	applyKiroBaseHeaders(req, account, headerValues)
 }
 
+// ---- 后台刷新防误封 ----
+//
+// RefreshAccountInfo 过去对单次 401/403/invalid/expired 立即 BANNED+禁用。定时刷新
+// 间隔收紧(30min→5min)后,一次上游抖动就可能把健康账号刷成 banned。改为:
+//   1. 先尝试用 refreshToken 换新 token 再重试一次(被动过期/瞬时失效自愈);
+//   2. 仍失败则累计连续失败次数,达到 authFailureBanThreshold 才封禁;
+//   3. 任意一次成功清零计数。TEMPORARILY_SUSPENDED 是上游明确封禁,仍立即禁用。
+const authFailureBanThreshold = 3
+
+// authFailureStreaks: accountID → 连续认证失败次数(进程内,重启清零即可)。
+var authFailureStreaks sync.Map
+
+// isAuthLikeRefreshError 保持与旧版完全相同的判定字符串(行为兼容)。
+func isAuthLikeRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "403") || strings.Contains(msg, "401") ||
+		strings.Contains(msg, "invalid") || strings.Contains(msg, "expired")
+}
+
+func bumpAuthFailureStreak(accountID string) int {
+	streak := 1
+	if v, ok := authFailureStreaks.Load(accountID); ok {
+		if n, ok := v.(int); ok {
+			streak = n + 1
+		}
+	}
+	authFailureStreaks.Store(accountID, streak)
+	return streak
+}
+
+func clearAuthFailureStreak(accountID string) {
+	authFailureStreaks.Delete(accountID)
+}
+
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
 func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	info := &config.AccountInfo{
@@ -434,6 +471,24 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 
 	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
+	if err != nil && isAuthLikeRefreshError(err) && account.RefreshToken != "" {
+		// 认证类失败先刷 token 重试一次:token 被动过期/瞬时 401 属正常自愈路径,
+		// 不应计入封禁判定。
+		logger.Debugf("[RefreshAccountInfo] Auth-like error for %s, retrying after token refresh: %v", account.Email, err)
+		if newAccess, newRefresh, newExpires, profileArn, refreshErr := auth.RefreshToken(account); refreshErr == nil {
+			account.AccessToken = newAccess
+			if newRefresh != "" {
+				account.RefreshToken = newRefresh
+			}
+			account.ExpiresAt = newExpires
+			config.UpdateAccountToken(account.ID, newAccess, newRefresh, newExpires)
+			if profileArn != "" {
+				account.ProfileArn = profileArn
+				config.UpdateAccountProfileArn(account.ID, profileArn)
+			}
+			usage, err = GetUsageLimits(account)
+		}
+	}
 	if err != nil {
 		// 检测封禁状态
 		errMsg := err.Error()
@@ -454,10 +509,17 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			}
 
 			return nil, fmt.Errorf("Account suspended: %w", err)
-		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
-			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
-			// Token 相关错误，可能需要重新认证
-			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
+		} else if isAuthLikeRefreshError(err) {
+			// Token 相关错误:容忍瞬时失败,连续 authFailureBanThreshold 次才封禁。
+			streak := bumpAuthFailureStreak(account.ID)
+			if streak < authFailureBanThreshold {
+				logger.Warnf("[RefreshAccountInfo] Authentication error for %s (streak %d/%d, not banning yet): %v",
+					account.Email, streak, authFailureBanThreshold, err)
+				return nil, fmt.Errorf("GetUsageLimits: %w", err)
+			}
+			logger.Warnf("[RefreshAccountInfo] Authentication error for %s persisted %d times, banning: %v",
+				account.Email, streak, err)
+			clearAuthFailureStreak(account.ID)
 
 			// 更新账户封禁状态为认证失败并自动禁用
 			updatedAccount := *account
@@ -474,6 +536,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 
 		return nil, fmt.Errorf("GetUsageLimits: %w", err)
 	}
+	clearAuthFailureStreak(account.ID)
 
 	// 如果成功获取信息，清除封禁状态（如果之前被标记）
 	if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
@@ -487,6 +550,25 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		// 保存更新后的账户状态
 		if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
 			logger.Errorf("[RefreshAccountInfo] Failed to clear account ban status: %v", updateErr)
+		}
+	}
+
+	// Overage 顺带更新:getUsageLimits 响应本身就带 overageConfiguration/
+	// overageCapability/overageCap 等字段(与 FetchOverageStatus 同一个上游 API),
+	// 零额外上游调用即可保持超额状态新鲜。仅在 OverageStatus 已定型(非空)时写回:
+	// 新账号留给 maybeAutoEnableOverage 的 ""-guard 决定是否自动开启。
+	if strings.TrimSpace(account.OverageStatus) != "" {
+		if snap := extractOverageSnapshot(usage); snap != nil {
+			if persistErr := PersistOverageSnapshot(account.ID, snap); persistErr != nil {
+				logger.Warnf("[RefreshAccountInfo] Failed to persist overage snapshot for %s: %v", account.Email, persistErr)
+			} else {
+				account.OverageStatus = snap.Status
+				account.OverageCapability = snap.Capability
+				account.OverageCap = snap.OverageCap
+				account.OverageRate = snap.OverageRate
+				account.CurrentOverages = snap.CurrentOverages
+				account.OverageCheckedAt = snap.CheckedAt
+			}
 		}
 	}
 
@@ -582,17 +664,27 @@ type UsageLimitsResponse struct {
 	NextDateReset      json.Number       `json:"nextDateReset"`
 	SubscriptionInfo   *SubscriptionInfo `json:"subscriptionInfo"`
 	UserInfo           *UserInfo         `json:"userInfo"`
+	// OverageConfiguration carries the user-level Overages switch state; parsed
+	// here so the periodic refresh keeps overage data fresh from the SAME
+	// getUsageLimits call (no extra upstream round-trip).
+	OverageConfiguration *OverageConfiguration `json:"overageConfiguration"`
+}
+
+type OverageConfiguration struct {
+	OverageStatus string `json:"overageStatus"`
 }
 
 type UsageBreakdown struct {
-	ResourceType  string         `json:"resourceType"`
-	CurrentUsage  float64        `json:"currentUsage"`
-	UsageLimit    float64        `json:"usageLimit"`
-	Currency      string         `json:"currency"`
-	Unit          string         `json:"unit"`
-	OverageRate   float64        `json:"overageRate"`
-	FreeTrialInfo *FreeTrialInfo `json:"freeTrialInfo"`
-	Bonuses       []BonusInfo    `json:"bonuses"`
+	ResourceType    string         `json:"resourceType"`
+	CurrentUsage    float64        `json:"currentUsage"`
+	UsageLimit      float64        `json:"usageLimit"`
+	Currency        string         `json:"currency"`
+	Unit            string         `json:"unit"`
+	OverageRate     float64        `json:"overageRate"`
+	OverageCap      float64        `json:"overageCap"`
+	CurrentOverages float64        `json:"currentOverages"`
+	FreeTrialInfo   *FreeTrialInfo `json:"freeTrialInfo"`
+	Bonuses         []BonusInfo    `json:"bonuses"`
 }
 
 type FreeTrialInfo struct {
@@ -617,6 +709,7 @@ type SubscriptionInfo struct {
 	SubscriptionType  string `json:"subscriptionType"`
 	Status            string `json:"status"`
 	UpgradeCapability string `json:"upgradeCapability"`
+	OverageCapability string `json:"overageCapability"`
 }
 
 type UserInfo struct {

@@ -283,9 +283,18 @@ func NewHandler() *Handler {
 	return h
 }
 
+// accountRefreshInterval 账号信息(额度/订阅/overage)的后台刷新周期。管理页已
+// 去掉所有手动刷新按钮,数据新鲜度完全靠这里,故从 30min 收紧到 5min。
+const accountRefreshInterval = 5 * time.Minute
+
+// maintenanceEveryNTicks 低频维护(模型缓存刷新/日志清理/粘性会话淘汰等)按
+// N 个账号刷新周期跑一次:5min × 6 = 30min,与旧节奏一致(模型列表变化极少,
+// 无需 5min 一轮全账号 ListAvailableModels)。
+const maintenanceEveryNTicks = 6
+
 // backgroundRefresh 后台定时刷新账户信息
 func (h *Handler) backgroundRefresh() {
-	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
+	ticker := time.NewTicker(accountRefreshInterval)
 	defer ticker.Stop()
 
 	// 启动时延迟 10 秒后执行一次
@@ -294,11 +303,18 @@ func (h *Handler) backgroundRefresh() {
 	h.refreshAllAccounts()
 	pruneUsageRecordsRetention()
 
+	tick := 0
 	for {
 		select {
 		case <-ticker.C:
-			h.refreshModelsCache()
+			// 每 tick(5min):账号额度/订阅/overage 刷新——前端只读渲染,新鲜度全在这。
 			h.refreshAllAccounts()
+			tick++
+			if tick%maintenanceEveryNTicks != 0 {
+				continue
+			}
+			// 每 6 tick(30min):低频维护,保持旧节奏。
+			h.refreshModelsCache()
 			pruneUsageRecordsRetention()
 			sweepLowBalanceGates(time.Hour)
 			// Periodic maintenance that previously ran only once at startup or
@@ -345,7 +361,8 @@ func (h *Handler) refreshAllAccounts() {
 			}
 		}
 
-		// 刷新账户信息
+		// 刷新账户信息(RefreshAccountInfo 内部会顺带把 getUsageLimits 响应里的
+		// overage 状态写回,零额外上游调用;见 kiro_api.go / extractOverageSnapshot)
 		info, err := RefreshAccountInfo(account)
 		if err != nil {
 			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
@@ -353,6 +370,13 @@ func (h *Handler) refreshAllAccounts() {
 		}
 
 		config.UpdateAccountInfo(account.ID, *info)
+
+		// 存量账号 OverageStatus 从未定型("")的,在这里补一次探测+自动开启
+		// (与新账号建号后的 maybeAutoEnableOverage 同一套 ""-guard 逻辑,定型后
+		// 不再触发;此前若建号时探测失败会永远漏掉,这里兜底闭环)。
+		if strings.TrimSpace(account.OverageStatus) == "" {
+			h.maybeAutoEnableOverage(account)
+		}
 		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
 	}
 	h.pool.Reload()
@@ -2791,6 +2815,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/full") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/full")
 		h.apiGetAccountFull(w, r, id)
+	// 单账号详情(与 /accounts 列表项同 shape;弹窗打开时拉取)。必须在所有
+	// /accounts/{id}/xxx 子路由之后匹配:仅接受不含 "/" 的裸 id。
+	case strings.HasPrefix(path, "/accounts/") && r.Method == "GET" && !strings.Contains(strings.TrimPrefix(path, "/accounts/"), "/"):
+		h.apiGetAccount(w, r, strings.TrimPrefix(path, "/accounts/"))
 	case strings.HasPrefix(path, "/accounts/") && r.Method == "DELETE":
 		h.apiDeleteAccount(w, r, strings.TrimPrefix(path, "/accounts/"))
 	case strings.HasPrefix(path, "/accounts/") && r.Method == "PUT":
@@ -2888,6 +2916,64 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// accountSummaryMap builds the JSON shape shared by the /accounts list and the
+// single-account GET /accounts/{id} (detail modal): persisted fields + runtime
+// stats + live RPM. `stats` carries the runtime counters (pool copy when the
+// account is schedulable, else the persisted account itself — disabled/over-quota
+// accounts are not in the pool and would otherwise show zeros).
+func accountSummaryMap(a *config.Account, stats *config.Account, rpm int) map[string]interface{} {
+	return map[string]interface{}{
+		"id":         a.ID,
+		"email":      a.Email,
+		"userId":     a.UserId,
+		"nickname":   a.Nickname,
+		"authMethod": a.AuthMethod,
+		"provider":   a.Provider,
+		"region":     a.Region,
+		"createdAt":  a.CreatedAt,
+		"enabled":    a.Enabled,
+		"banStatus":  a.BanStatus,
+		"banReason":  a.BanReason,
+		"banTime":    a.BanTime,
+		"expiresAt":  a.ExpiresAt,
+		"hasToken":   a.AccessToken != "",
+		// canRefresh: an expired access token is normal and self-healing for
+		// accounts that can renew it — OAuth/IdC accounts with a refresh token,
+		// and api_key (ksk_) accounts whose key is itself the long-lived bearer
+		// (never expires). The UI uses this to avoid flashing a false "expired"
+		// badge in the brief window between token TTL and the next refresh.
+		"canRefresh":        a.RefreshToken != "" || auth.IsApiKeyAccount(a),
+		"machineId":         a.MachineId,
+		"weight":            a.Weight,
+		"overageStatus":     a.OverageStatus,
+		"overageCapability": a.OverageCapability,
+		"overageCap":        a.OverageCap,
+		"overageRate":       a.OverageRate,
+		"currentOverages":   a.CurrentOverages,
+		"overageCheckedAt":  a.OverageCheckedAt,
+		"proxyURL":          a.ProxyURL,
+		"subscriptionType":  a.SubscriptionType,
+		"subscriptionTitle": a.SubscriptionTitle,
+		"daysRemaining":     a.DaysRemaining,
+		"usageCurrent":      a.UsageCurrent,
+		"usageLimit":        a.UsageLimit,
+		"usagePercent":      a.UsagePercent,
+		"nextResetDate":     a.NextResetDate,
+		"lastRefresh":       a.LastRefresh,
+		"trialUsageCurrent": a.TrialUsageCurrent,
+		"trialUsageLimit":   a.TrialUsageLimit,
+		"trialUsagePercent": a.TrialUsagePercent,
+		"trialStatus":       a.TrialStatus,
+		"trialExpiresAt":    a.TrialExpiresAt,
+		"requestCount":      stats.RequestCount,
+		"errorCount":        stats.ErrorCount,
+		"totalTokens":       stats.TotalTokens,
+		"totalCredits":      stats.TotalCredits,
+		"lastUsed":          stats.LastUsed,
+		"rpm":               rpm,
+	}
+}
+
 func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	accounts := config.GetAccounts()
 	poolAccounts := h.pool.GetAllAccounts()
@@ -2901,66 +2987,42 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 
 	// 运行时统计 + 实时 RPM
 	result := make([]map[string]interface{}, len(accounts))
-	for i, a := range accounts {
+	for i := range accounts {
+		a := &accounts[i]
 		// 获取运行时统计。池子只装可调度账号(启用且未被配额挡住),被禁用/超额
 		// 的账号不在池里 → 回退 config 里持久化的累计值,统计不再显示为 0。
 		stats, inPool := statsMap[a.ID]
 		if !inPool {
-			stats = a
+			stats = *a
 		}
-
-		result[i] = map[string]interface{}{
-			"id":                a.ID,
-			"email":             a.Email,
-			"userId":            a.UserId,
-			"nickname":          a.Nickname,
-			"authMethod":        a.AuthMethod,
-			"provider":          a.Provider,
-			"region":            a.Region,
-			"createdAt":         a.CreatedAt,
-			"enabled":           a.Enabled,
-			"banStatus":         a.BanStatus,
-			"banReason":         a.BanReason,
-			"banTime":           a.BanTime,
-			"expiresAt":         a.ExpiresAt,
-			"hasToken":          a.AccessToken != "",
-			// canRefresh: an expired access token is normal and self-healing for
-			// accounts that can renew it — OAuth/IdC accounts with a refresh token,
-			// and api_key (ksk_) accounts whose key is itself the long-lived bearer
-			// (never expires). The UI uses this to avoid flashing a false "expired"
-			// badge in the brief window between token TTL and the next refresh.
-			"canRefresh":        a.RefreshToken != "" || auth.IsApiKeyAccount(&accounts[i]),
-			"machineId":         a.MachineId,
-			"weight":            a.Weight,
-			"overageStatus":     a.OverageStatus,
-			"overageCapability": a.OverageCapability,
-			"overageCap":        a.OverageCap,
-			"overageRate":       a.OverageRate,
-			"currentOverages":   a.CurrentOverages,
-			"overageCheckedAt":  a.OverageCheckedAt,
-			"proxyURL":          a.ProxyURL,
-			"subscriptionType":  a.SubscriptionType,
-			"subscriptionTitle": a.SubscriptionTitle,
-			"daysRemaining":     a.DaysRemaining,
-			"usageCurrent":      a.UsageCurrent,
-			"usageLimit":        a.UsageLimit,
-			"usagePercent":      a.UsagePercent,
-			"nextResetDate":     a.NextResetDate,
-			"lastRefresh":       a.LastRefresh,
-			"trialUsageCurrent": a.TrialUsageCurrent,
-			"trialUsageLimit":   a.TrialUsageLimit,
-			"trialUsagePercent": a.TrialUsagePercent,
-			"trialStatus":       a.TrialStatus,
-			"trialExpiresAt":    a.TrialExpiresAt,
-			"requestCount":      stats.RequestCount,
-			"errorCount":        stats.ErrorCount,
-			"totalTokens":       stats.TotalTokens,
-			"totalCredits":      stats.TotalCredits,
-			"lastUsed":          stats.LastUsed,
-			"rpm":               rpmByAcct[a.ID],
-		}
+		result[i] = accountSummaryMap(a, &stats, rpmByAcct[a.ID])
 	}
 	json.NewEncoder(w).Encode(result)
+}
+
+// apiGetAccount GET /admin/api/accounts/{id} — one account in exactly the same
+// shape as one /accounts list item. The detail modal fetches this on open so it
+// renders CURRENT data (auto-refresh polling pauses while a modal is open, so
+// the in-memory list snapshot could be stale).
+func (h *Handler) apiGetAccount(w http.ResponseWriter, r *http.Request, id string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	stats := *account
+	if inPool := h.pool.GetByID(id); inPool != nil {
+		stats = *inPool
+	}
+	json.NewEncoder(w).Encode(accountSummaryMap(account, &stats, h.pool.AccountRPM(id)))
 }
 
 func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
@@ -4294,9 +4356,37 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	})
 }
 
-// apiGetAccountModelsCached 返回账号已缓存的模型列表（不实时拉取）
+// apiGetAccountModelsCached 返回账号已缓存的模型列表（不实时拉取上游）。
+// pool 里只存 modelId 集合;这里与聚合模型缓存(cachedModels,后台每 30min 刷新)
+// join 出名称/倍率/描述等元数据,让详情弹窗无需实时端点也能渲染完整模型卡。
+// join 不到的 id(极短暂的缓存不同步窗口)退化为只含 modelId 的条目。
 func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Request, id string) {
-	models := h.pool.GetModelList(id)
+	ids := h.pool.GetModelList(id)
+
+	h.modelsCacheMu.RLock()
+	metaByID := make(map[string]*ModelInfo, len(h.cachedModels))
+	for i := range h.cachedModels {
+		metaByID[strings.ToLower(strings.TrimSpace(h.cachedModels[i].ModelId))] = &h.cachedModels[i]
+	}
+	models := make([]map[string]interface{}, 0, len(ids))
+	for _, mid := range ids {
+		entry := map[string]interface{}{"modelId": mid}
+		if meta := metaByID[strings.ToLower(strings.TrimSpace(mid))]; meta != nil {
+			entry["modelId"] = meta.ModelId // 原样大小写
+			if meta.ModelName != "" {
+				entry["modelName"] = meta.ModelName
+			}
+			if meta.Description != "" {
+				entry["description"] = meta.Description
+			}
+			if meta.RateMultiplier > 0 {
+				entry["rateMultiplier"] = meta.RateMultiplier
+			}
+		}
+		models = append(models, entry)
+	}
+	h.modelsCacheMu.RUnlock()
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"models":  models,

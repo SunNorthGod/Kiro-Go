@@ -105,6 +105,41 @@ func FetchOverageStatus(account *config.Account) (*OverageSnapshot, error) {
 	return snap, nil
 }
 
+// extractOverageSnapshot builds an OverageSnapshot from an already-fetched
+// getUsageLimits response. FetchOverageStatus hits the very same upstream API,
+// so the periodic account refresh can keep overage state fresh with ZERO extra
+// upstream calls by reusing its GetUsageLimits response. Returns nil when the
+// response carries no overage information at all (defensive: never overwrite a
+// known state with UNKNOWN derived from a partial payload).
+func extractOverageSnapshot(usage *UsageLimitsResponse) *OverageSnapshot {
+	if usage == nil {
+		return nil
+	}
+	snap := &OverageSnapshot{
+		Status:    "UNKNOWN",
+		CheckedAt: time.Now().Unix(),
+	}
+	if usage.OverageConfiguration != nil && usage.OverageConfiguration.OverageStatus != "" {
+		snap.Status = strings.ToUpper(usage.OverageConfiguration.OverageStatus)
+	}
+	if usage.SubscriptionInfo != nil {
+		snap.Capability = usage.SubscriptionInfo.OverageCapability
+		snap.SubscriptionTitle = usage.SubscriptionInfo.SubscriptionTitle
+	}
+	for _, bd := range usage.UsageBreakdownList {
+		if bd.OverageCap > 0 || bd.OverageRate > 0 || bd.CurrentOverages > 0 {
+			snap.OverageCap = bd.OverageCap
+			snap.OverageRate = bd.OverageRate
+			snap.CurrentOverages = bd.CurrentOverages
+			break
+		}
+	}
+	if snap.Status == "UNKNOWN" && snap.Capability == "" {
+		return nil
+	}
+	return snap
+}
+
 // SetOverageStatus calls AWS Q `POST /setUserPreference` to flip the user-level
 // Overages switch, then re-fetches the snapshot for cache write-through.
 //

@@ -39,6 +39,7 @@ type AccountPool struct {
 	rpmAcct map[string]*rpmRing // accountID → 60 秒环形计数
 	rpmKey  map[string]*rpmRing // apiKeyID  → 60 秒环形计数
 	rpmAll  *rpmRing            // 全局 60 秒环形计数
+	tpmAll  *rpmRing            // 全局 60 秒 token 计数(完成时打点,供 dashboard 实时 TPM)
 }
 
 // stickyRef 记录一个会话绑定到的账号及最近使用时间(诊断用)。
@@ -65,6 +66,7 @@ func GetPool() *AccountPool {
 			rpmAcct:      make(map[string]*rpmRing),
 			rpmKey:       make(map[string]*rpmRing),
 			rpmAll:       &rpmRing{},
+			tpmAll:       &rpmRing{},
 		}
 		pool.schedCond = sync.NewCond(&pool.schedMu)
 		pool.Reload()
@@ -479,7 +481,6 @@ func (p *AccountPool) AvailableCount() int {
 // UpdateStats 更新账号统计
 func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	var updated bool
 	var requestCount, errorCount, totalTokens int
 	var totalCredits float64
@@ -507,6 +508,14 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].LastUsed = lastUsed
 		}
 	}
+	p.mu.Unlock()
+
+	// Trailing-60s token ring for the dashboard TPM tile. Recorded outside mu
+	// (the ring is schedMu-guarded; the two locks are never held together), and
+	// unconditionally — token throughput is real even when the account has been
+	// evicted from the weighted list (e.g. just went over quota).
+	p.RecordTokens(tokens)
+
 	if updated {
 		// Hand the latest cumulative snapshot to the single coalescing persistence
 		// worker instead of spawning a goroutine per success (which was unbounded
