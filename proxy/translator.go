@@ -2662,6 +2662,10 @@ func parseBase64Image(data, format string) *KiroImage {
 		}
 	}
 
+	// 以字节魔数为准纠正声明格式：客户端标错(如 PNG 标成 image/jpeg)会被
+	// AmazonQ 严格校验拒绝(400 IMAGE_MIME_MISMATCH)。见 image_sniff.go。
+	format = correctImageFormat(data, format)
+
 	if format == "" {
 		format = "png"
 	}
