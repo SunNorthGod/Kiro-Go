@@ -464,6 +464,7 @@ func (h *Handler) handleUserAPI(w http.ResponseWriter, r *http.Request) {
 			"tokensUsed": entry.TokensUsed, "requestsCount": entry.RequestsCount,
 			"tokenLimit": entry.TokenLimit, "creditLimit": entry.CreditLimit,
 			"expiresAt": entry.ExpiresAt, "maxConcurrency": entry.MaxConcurrency,
+			"maxRPM": entry.MaxRPM,
 			"createdAt": entry.CreatedAt, "lastUsedAt": entry.LastUsedAt,
 			"isParent":         keyHasChildren(entry.ID),
 			"canManageSubKeys": canManageSubKeys(entry),

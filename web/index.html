@@ -363,6 +363,22 @@
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
         </div>
 
+        <!-- Per-key default limits -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.limitsTitle"></span></div>
+          <div class="form-group">
+            <label data-i18n="settings.defaultMaxConcurrency"></label>
+            <input type="number" id="defaultMaxConcurrency" min="0" step="1" placeholder="5" />
+            <small data-i18n="settings.defaultMaxConcurrencyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.defaultMaxRPM"></label>
+            <input type="number" id="defaultMaxRPM" min="0" step="1" placeholder="20" />
+            <small data-i18n="settings.defaultMaxRPMHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveLimitsBtn" data-i18n="settings.saveLimits"></button>
+        </div>
+
         <!-- Advanced settings (collapsed) -->
         <details class="ng-advanced" id="advancedSettings">
           <summary>
@@ -582,12 +598,22 @@
           <div class="form-group">
             <label data-i18n="apiKeys.formMaxConcurrency"></label>
             <select id="apiKeyForm_maxConcurrencyMode">
-              <option value="0" data-i18n="apiKeys.concurrencyModeDefault"></option>
-              <option value="custom" data-i18n="apiKeys.concurrencyModeCustom"></option>
-              <option value="-1" data-i18n="apiKeys.concurrencyModeUnlimited"></option>
+              <option value="" data-i18n="apiKeys.limitModeDefault"></option>
+              <option value="unlimited" data-i18n="apiKeys.limitModeUnlimited"></option>
+              <option value="custom" data-i18n="apiKeys.limitModeCustom"></option>
             </select>
-            <input type="number" id="apiKeyForm_maxConcurrency" min="1" step="1" value="0" class="hidden mt-2" />
+            <input type="number" id="apiKeyForm_maxConcurrency" min="1" step="1" value="1" class="hidden mt-2" />
             <small data-i18n="apiKeys.formMaxConcurrencyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="apiKeys.formMaxRPM"></label>
+            <select id="apiKeyForm_maxRPMMode">
+              <option value="" data-i18n="apiKeys.limitModeDefault"></option>
+              <option value="unlimited" data-i18n="apiKeys.limitModeUnlimited"></option>
+              <option value="custom" data-i18n="apiKeys.limitModeCustom"></option>
+            </select>
+            <input type="number" id="apiKeyForm_maxRPM" min="1" step="1" value="20" class="hidden mt-2" />
+            <small data-i18n="apiKeys.formMaxRPMHint"></small>
           </div>
           <div class="form-group">
             <label data-i18n="apiKeys.formExpiresAt"></label>

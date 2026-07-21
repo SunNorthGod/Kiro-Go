@@ -359,6 +359,13 @@ type KiroStreamCallback struct {
 	OnToolUse      func(toolUse KiroToolUse)
 	OnComplete     func(inputTokens, outputTokens int)
 	OnError        func(err error)
+	// OnException fires on a mid-stream `exception` frame that is NOT a hard
+	// failure — specifically the model hitting its output-token cap
+	// (ContentLengthExceededException). The content streamed so far is valid but
+	// truncated; handlers use this to report stop_reason=max_tokens (Claude) /
+	// finish_reason=length (OpenAI) instead of a normal end_turn/stop, so agentic
+	// clients know the answer was cut short rather than genuinely finished.
+	OnException    func(exceptionType, message string)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
 	// OnReasoningSignature fires when the model emits a native reasoning
@@ -670,8 +677,38 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 			continue
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		messageType, eventType, exceptionType, errorCode := extractFrameMeta(msgBuf[0:headersLength])
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
+
+		// Mid-stream error/exception frames: the Kiro backend can emit these AFTER
+		// a 200 + partial stream. The event switch below only matches `event`
+		// frames, so previously these were silently dropped — truncated answers
+		// looked complete and transient upstream faults got billed as success with
+		// no failover. Surface them here.
+		if messageType == "exception" || messageType == "error" {
+			kind := exceptionType
+			if kind == "" {
+				kind = errorCode
+			}
+			msg := extractFrameErrorMessage(payloadBytes)
+			// Output-cap truncation is NOT a failure: the streamed content is valid,
+			// only cut short. Signal it so the handler reports max_tokens / length
+			// and finalizes normally with the partial content already sent.
+			if isOutputTruncationException(kind) {
+				if callback.OnException != nil {
+					callback.OnException(kind, msg)
+				}
+				continue
+			}
+			// Any other mid-stream exception/error is fatal for this attempt.
+			// Returning an error runs the handler's failure path (SSE error frame if
+			// the stream already committed, else account failover) — like a non-200.
+			if kind == "" {
+				kind = "UpstreamError"
+			}
+			return fmt.Errorf("%s: %s", kind, msg)
+		}
+
 		if len(payloadBytes) == 0 {
 			continue
 		}
@@ -1144,4 +1181,97 @@ func extractEventType(headers []byte) string {
 		}
 	}
 	return ""
+}
+
+// extractFrameMeta extracts the AWS Event Stream routing headers in a single
+// pass: :message-type ("event" / "exception" / "error"), :event-type (the event
+// name for event frames), :exception-type, and :error-code. Absent headers come
+// back as "". Unlike extractEventType (which only reads :event-type and thus
+// makes exception/error frames indistinguishable from an unknown event), this
+// lets the parser route non-event frames to the failure path.
+func extractFrameMeta(headers []byte) (messageType, eventType, exceptionType, errorCode string) {
+	offset := 0
+	for offset < len(headers) {
+		nameLen := int(headers[offset])
+		offset++
+		if offset+nameLen > len(headers) {
+			break
+		}
+		name := string(headers[offset : offset+nameLen])
+		offset += nameLen
+		if offset >= len(headers) {
+			break
+		}
+		valueType := headers[offset]
+		offset++
+
+		if valueType == 7 { // String
+			if offset+2 > len(headers) {
+				break
+			}
+			valueLen := int(headers[offset])<<8 | int(headers[offset+1])
+			offset += 2
+			if offset+valueLen > len(headers) {
+				break
+			}
+			value := string(headers[offset : offset+valueLen])
+			offset += valueLen
+			switch name {
+			case ":message-type":
+				messageType = value
+			case ":event-type":
+				eventType = value
+			case ":exception-type":
+				exceptionType = value
+			case ":error-code":
+				errorCode = value
+			}
+			continue
+		}
+
+		skipSizes := map[byte]int{0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
+		if valueType == 6 {
+			if offset+2 > len(headers) {
+				break
+			}
+			l := int(headers[offset])<<8 | int(headers[offset+1])
+			offset += 2 + l
+		} else if skip, ok := skipSizes[valueType]; ok {
+			offset += skip
+		} else {
+			break
+		}
+	}
+	return
+}
+
+// extractFrameErrorMessage pulls a human-readable message out of an
+// error/exception frame payload, tolerating the common JSON field name variants
+// and falling back to the raw (bounded) body.
+func extractFrameErrorMessage(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(payload, &m); err == nil {
+		for _, k := range []string{"message", "Message", "errorMessage", "error", "reason"} {
+			if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
+				return s
+			}
+		}
+	}
+	s := strings.TrimSpace(string(payload))
+	if len(s) > 500 {
+		s = s[:500]
+	}
+	return s
+}
+
+// isOutputTruncationException reports whether a mid-stream exception means the
+// model hit its output-token cap (content is valid but truncated) rather than a
+// hard failure. Mirrors the Rust reference, which maps ContentLengthExceededException
+// to stop_reason=max_tokens instead of aborting.
+func isOutputTruncationException(kind string) bool {
+	k := strings.ToLower(kind)
+	return strings.Contains(k, "contentlengthexceeded") || strings.Contains(k, "maxtokens")
 }

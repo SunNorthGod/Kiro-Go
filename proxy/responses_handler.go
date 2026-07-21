@@ -147,10 +147,10 @@ func (h *Handler) handleResponsesNonStream(
 
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
-	keyFloor := 0
+	var keyConcurrency *int
 	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
-		keyFloor = e.MaxConcurrency
+		keyConcurrency = e.MaxConcurrency
 		boundAccountIDs = e.BoundAccountIDs
 	}
 	// Panic-safety net: release the acquired slot even on a handler/callback panic.
@@ -162,7 +162,7 @@ func (h *Handler) handleResponsesNonStream(
 		}
 	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyConcurrency, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendOpenAIError(w, 429, "rate_limit_exceeded", "Too many concurrent requests for this key; retry shortly")
@@ -236,6 +236,22 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+
+		// 空响应护栏(对齐 Claude 路径):上游成功但零内容零工具 → 回错误而非静默空 completed,
+		// 避免 agentic 客户端卡死。
+		if isEmptyKiroResponse(finalContent, reasoningContent, len(toolUses), outputTokens, inputTokens, model) {
+			h.pool.RecordSuccess(account.ID)
+			releaseSlot()
+			oversized := emptyResponseIsOversizedContext(inputTokens, model)
+			errType, errMsg := emptyResponseErrorInfo(oversized)
+			h.recordFailureWithDetails("responses", model, account.ID, fmt.Errorf("empty upstream response"))
+			code := 503
+			if oversized {
+				code = 400
+			}
+			h.sendOpenAIError(w, code, errType, errMsg)
+			return
+		}
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -378,15 +394,14 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
-	responseStarted := false
 	reqStart := time.Now()
 
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
-	keyFloor := 0
+	var keyConcurrency *int
 	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
-		keyFloor = e.MaxConcurrency
+		keyConcurrency = e.MaxConcurrency
 		boundAccountIDs = e.BoundAccountIDs
 	}
 	// Panic-safety net: release the acquired slot even on a handler/callback panic.
@@ -398,7 +413,7 @@ func (h *Handler) handleResponsesStream(
 		}
 	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyConcurrency, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			send("response.failed", map[string]interface{}{
@@ -497,7 +512,6 @@ func (h *Handler) handleResponsesStream(
 					"content_index": contentIndex,
 					"delta":         text,
 				})
-				responseStarted = true
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				if messageStarted {
@@ -563,7 +577,6 @@ func (h *Handler) handleResponsesStream(
 					},
 				})
 				outputIndex++
-				responseStarted = true
 			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
@@ -587,14 +600,15 @@ func (h *Handler) handleResponsesStream(
 					estimateApproxTokens(fullText.String())+estimateApproxTokens(reasoningText.String()))
 				return
 			}
-			if !responseStarted {
-				releaseSlot()
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(&account, err)
-				continue
-			}
+			// responses 流在进入本循环前就已发 response.created(提交 200 头)。
+			// 因此上游一旦返回错误,任何换号重跑都会把第二轮内容续到同一个已提交的流里
+			// → 客户端看到"两份回答"。这里不再按 responseStarted 决定是否重试(该标志
+			// 只在首个 delta 后才置位,存在提交后未出首字的窗口);200 已提交即收尾。
+			// (CallKiroAPI 之前的 ensureValidToken 失败仍走上面的 continue,不受影响。)
 			releaseSlot()
+			lastErr = err
+			excluded[account.ID] = true
+			h.handleAccountFailure(&account, err)
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
@@ -650,6 +664,29 @@ func (h *Handler) handleResponsesStream(
 		}
 		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+
+		// Empty-response guard (parity with the Claude/OpenAI paths): upstream
+		// succeeded but produced no text/tools. A fully empty response never
+		// started a message item (ensureMessageStarted only fires on non-empty
+		// text), so emit response.failed instead of a hollow response.completed —
+		// otherwise agentic clients treat the empty turn as done and can hang.
+		if isEmptyKiroResponse(finalContent, reasoning, len(toolUses), outputTokens, inputTokens, model) {
+			h.pool.RecordSuccess(account.ID)
+			releaseSlot()
+			_, errMsg := emptyResponseErrorInfo(emptyResponseIsOversizedContext(inputTokens, model))
+			h.recordFailureWithDetails("responses", model, account.ID, fmt.Errorf("empty upstream response"))
+			send("response.failed", map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id":     respID,
+					"status": "failed",
+					"error":  map[string]string{"type": "server_error", "message": errMsg},
+				},
+			})
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

@@ -244,3 +244,66 @@ func TestSelfHealStillStripsKeptReasoning(t *testing.T) {
 		t.Fatalf("SelfHeal backstop must still be able to strip a kept block")
 	}
 }
+
+// #5: the non-stream response path stamps the first thinking block with the
+// upstream real signature, provenance-wrapped so a next-turn replay on the same
+// account is kept (and cross-account stripped) — exactly like the streaming path.
+func TestApplyResponseThinkingSignatureWrapsRealSignature(t *testing.T) {
+	real := "nonstreamREALsig12345678"
+	blocks := []ClaudeContentBlock{
+		{Type: "thinking", Thinking: "reasoning"},
+		{Type: "text", Text: "answer"},
+	}
+	applyResponseThinkingSignature(blocks, real, "acct-A")
+
+	if blocks[0].Signature == "" {
+		t.Fatalf("thinking block must receive a signature")
+	}
+	if blocks[0].Signature == real {
+		t.Fatalf("signature must be provenance-wrapped, not the raw value")
+	}
+	gotSig, gotTok, ok := parseProvenanceSignature(blocks[0].Signature)
+	if !ok || gotSig != real || gotTok != accountSignatureToken("acct-A") {
+		t.Fatalf("wrapped signature must round-trip to (real, acct-A token): sig=%q tok=%q ok=%v", gotSig, gotTok, ok)
+	}
+	// Only the first thinking block is stamped; text blocks untouched.
+	if blocks[1].Signature != "" {
+		t.Fatalf("non-thinking blocks must not receive a signature")
+	}
+}
+
+// #5: no upstream signature → no fabricated signature (non-stream keeps the
+// existing SelfHeal contract; we never emit a fake placeholder here).
+func TestApplyResponseThinkingSignatureNoopWhenAbsent(t *testing.T) {
+	blocks := []ClaudeContentBlock{{Type: "thinking", Thinking: "reasoning"}}
+	applyResponseThinkingSignature(blocks, "", "acct-A")
+	if blocks[0].Signature != "" {
+		t.Fatalf("absent upstream signature must leave the block unsigned (SelfHeal recovers), got %q", blocks[0].Signature)
+	}
+}
+
+// #5 end-to-end contract: a signature stamped on a non-stream response, when the
+// client replays it next turn, is accepted (kept) on the same account and
+// stripped cross-account — proving the provenance mechanism spans both paths.
+func TestNonStreamSignatureReplayRoundTrip(t *testing.T) {
+	real := "roundtripREALsig99887766"
+	// Stamp a non-stream response's thinking block.
+	blocks := []ClaudeContentBlock{{Type: "thinking", Thinking: "prior reasoning"}}
+	applyResponseThinkingSignature(blocks, real, "acct-A")
+	stamped := blocks[0].Signature
+
+	// Client replays it as history next turn.
+	payload := ClaudeToKiro(reqWithHistoryThinking(stamped), true)
+
+	applyThinkingProvenance(payload, "acct-A") // same account → kept, unwrapped
+	rc := historyReasoning(payload)
+	if rc == nil || rc.ReasoningText.Signature != real {
+		t.Fatalf("same-account replay of a non-stream-stamped signature must be kept and unwrapped")
+	}
+
+	payload2 := ClaudeToKiro(reqWithHistoryThinking(stamped), true)
+	applyThinkingProvenance(payload2, "acct-B") // cross account → stripped
+	if historyReasoning(payload2) != nil {
+		t.Fatalf("cross-account replay of a non-stream-stamped signature must be stripped")
+	}
+}

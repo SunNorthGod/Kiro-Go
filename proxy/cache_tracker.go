@@ -640,10 +640,20 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
-func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool, credits float64) map[string]interface{} {
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
 		"output_tokens": outputTokens,
+	}
+	// credits(#6): upstream Kiro meteringEvent truth for this turn (JSON number /
+	// float64), surfaced at the top level of the Anthropic usage object as
+	// "credits". Present (and > 0) only when the upstream reported credit
+	// consumption; omitted when 0 (message_start, or a turn the upstream did not
+	// meter). Never locally estimated — always passed through from OnCredits so
+	// the value is metering truth. The downstream Kiro IDE plugin reads this field
+	// to display per-turn credits.
+	if credits > 0 {
+		result["credits"] = credits
 	}
 	if !includeCache {
 		return result

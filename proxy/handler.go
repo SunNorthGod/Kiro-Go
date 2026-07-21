@@ -1095,7 +1095,10 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				"model":         model,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
+				// credits=0 at message_start: the upstream meteringEvent has not
+				// arrived yet, so no per-turn credits are known. The final
+				// message_delta carries the real credits (see below).
+				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil, 0),
 			},
 		})
 		messageStarted = true
@@ -1105,11 +1108,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	conversationID := payload.ConversationState.AgentContinuationId
 	// 无 API Key(公网/无鉴权模式)时不施加每卡密公平限制。
 	bypassFairness := apiKeyID == ""
-	// 每卡密并发下限(公平准入基线):取该卡密配置的 MaxConcurrency,未配置则 0(用池默认)。
-	keyFloor := 0
+	// 每卡密并发覆盖(nil=继承系统默认,0=不限制,N=该值)。
+	var keyConcurrency *int
 	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
-		keyFloor = e.MaxConcurrency
+		keyConcurrency = e.MaxConcurrency
 		boundAccountIDs = e.BoundAccountIDs
 	}
 	// Panic-safety net: guarantee the acquired concurrency slot is released even
@@ -1123,7 +1126,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyConcurrency, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			// 本卡密并发已达公平上限且池子饱和 → 429(软限制:空载时不会到这里)。
@@ -1158,6 +1161,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		var credits float64
 		var realInputTokens int
 		var contextFull bool
+		var outputTruncated bool
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1509,6 +1513,12 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					contextFull = true
 				}
 			},
+			OnException: func(exceptionType, message string) {
+				// Model hit its output-token cap mid-stream; content so far is valid
+				// but truncated → report max_tokens instead of a normal end_turn.
+				outputTruncated = true
+				logger.Warnf("[Truncation] claude stream output capped: %s %s", exceptionType, message)
+			},
 			OnReasoningSignature: func(sig string) {
 				if sig != "" {
 					nativeSignature = sig
@@ -1535,10 +1545,16 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(&account, err)
-			if !messageStarted {
+			// 换号重跑的护栏必须用 streamCommitted(200 头已 flush)而非 messageStarted
+			// (首个内容事件)。二者之间存在窗口:上游已返回 2xx、commitStream 已提交 200
+			// 并启动心跳、但尚未吐首个 delta。此时若换号重跑,第二轮内容会续在同一个已
+			// 提交的流里 → 客户端看到"两份(不同账号)回答"。commit 之后一律发 SSE error
+			// 收尾,只有 commit 之前(真正未提交)才允许静默换号重试。
+			if !streamCommitted {
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
+			ensureMessageStart()
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1594,6 +1610,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := resolveClaudeStopReason(len(toolUses) > 0, contextFull, inputTokens, model)
+		if outputTruncated && len(toolUses) == 0 {
+			stopReason = "max_tokens" // output-cap truncation surfaced via OnException
+		}
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1601,7 +1620,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil || hasCacheMetering),
+			// credits(#6): upstream meteringEvent truth for this turn (0 when the
+			// upstream did not meter → omitted by buildClaudeUsageMap).
+			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil || hasCacheMetering, credits),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1890,10 +1911,10 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
-	keyFloor := 0
+	var keyConcurrency *int
 	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
-		keyFloor = e.MaxConcurrency
+		keyConcurrency = e.MaxConcurrency
 		boundAccountIDs = e.BoundAccountIDs
 	}
 	// Panic-safety net: guarantee the acquired concurrency slot is released even
@@ -1908,7 +1929,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		}
 	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyConcurrency, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendClaudeError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
@@ -1936,6 +1957,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		var realInputTokens int
 		var meteringCacheRead, meteringCacheCreation int
 		var hasCacheMetering bool
+		// #5: 收集上游原生思考签名(reasoningContentEvent.signature),用于给非流式
+		// 响应的 thinking 块透传真实签名(与流式 emitSignatureDelta 对齐)。
+		var nativeSignature string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1957,6 +1981,11 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			},
+			OnReasoningSignature: func(sig string) {
+				if sig != "" {
+					nativeSignature = sig
+				}
 			},
 			OnCacheMetering: func(read, creation int) {
 				meteringCacheRead, meteringCacheCreation = read, creation
@@ -2040,11 +2069,22 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		// #5: 给非流式 thinking 块透传上游真实签名(provenance 包装,与流式
+		// emitSignatureDelta 的 wrapProvenanceSignature 完全对齐)。仅当上游确实下发了
+		// 真实签名、且响应确实含 thinking 块(default 格式,未并进正文)时设置;无签名
+		// 时不兜底伪造(保留既有 SelfHeal 契约,不改变"无真实签名即空签名靠客户端
+		// SelfHeal"的语义)。provenance 标记使下一轮回传的签名可判定同账号(保留)/
+		// 跨账号(applyThinkingProvenance 剥离),不引入跨账号回放 400 风险。
+		applyResponseThinkingSignature(resp.Content, nativeSignature, account.ID)
 		// 上下文写满时用更准确的 stop_reason(否则恒 end_turn/tool_use)。
 		resp.StopReason = resolveClaudeStopReason(len(toolUses) > 0, false, inputTokens, model)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+		// credits(#6): upstream meteringEvent truth for this turn; float64,
+		// omitempty → omitted when 0 (no upstream metering). Same "credits" field
+		// name/semantics as the streaming path's usage map.
+		resp.Usage.Credits = credits
 		if cacheProfile != nil || hasCacheMetering {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
@@ -2168,10 +2208,10 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
-	keyFloor := 0
+	var keyConcurrency *int
 	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
-		keyFloor = e.MaxConcurrency
+		keyConcurrency = e.MaxConcurrency
 		boundAccountIDs = e.BoundAccountIDs
 	}
 	// Panic-safety net: guarantee the acquired concurrency slot is released even
@@ -2186,7 +2226,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		}
 	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyConcurrency, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			// 200 头已提前 flush 时不能再改状态码 → 流内 error 帧收尾。
@@ -2214,6 +2254,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var outputTruncated bool
 		var meteringCacheRead, meteringCacheCreation int
 		var hasCacheMetering bool
 		var rawContentBuilder strings.Builder
@@ -2224,7 +2265,32 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
-		responseStarted := false
+
+		// OpenAI SSE 首帧约定:第一个 chunk 的 delta 必须带 {"role":"assistant"},
+		// 某些客户端(及 OpenAI 官方 SDK)据此初始化 assistant 消息。只发一次,
+		// 后续 delta 只带 content/tool_calls,不再带 role。emitFirstRole 在首个内容/
+		// 工具 chunk 写出前惰性发出这一独立的 role chunk;roleSent 保证幂等。
+		roleSent := false
+		emitFirstRole := func() {
+			if roleSent {
+				return
+			}
+			roleSent = true
+			roleChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]string{"role": "assistant"},
+					"finish_reason": nil,
+				}},
+			}
+			data, _ := json.Marshal(roleChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+		}
 
 		sendChunk := func(content string, thinkingState int) {
 			if content == "" && thinkingState == 2 {
@@ -2318,10 +2384,10 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 					}},
 				}
 			}
+			emitFirstRole()
 			data, _ := json.Marshal(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
-			responseStarted = true
 		}
 
 		processText := func(text string, isThinking bool, forceFlush bool) {
@@ -2454,6 +2520,10 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				tc.Function.Arguments = string(args)
 				toolCalls = append(toolCalls, tc)
 
+				// #4: a tool-only response makes this the first streamed chunk, so
+				// emit the role:"assistant" primer before it (OpenAI SSE首帧约定)。
+				emitFirstRole()
+
 				chunk := map[string]interface{}{
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
@@ -2479,7 +2549,6 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				data, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
-				responseStarted = true
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -2490,6 +2559,12 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			},
+			OnException: func(exceptionType, message string) {
+				// Model hit its output-token cap mid-stream; content so far is valid
+				// but truncated → report finish_reason=length instead of stop.
+				outputTruncated = true
+				logger.Warnf("[Truncation] openai stream output capped: %s %s", exceptionType, message)
 			},
 			OnCacheMetering: func(read, creation int) {
 				meteringCacheRead, meteringCacheCreation = read, creation
@@ -2510,7 +2585,10 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(&account, err)
-			if !responseStarted {
+			// 护栏用 streamCommitted(200 已 flush)而非 responseStarted(首个 chunk):
+			// 二者间存在窗口,commit 后换号重跑会让第二轮内容续在同一个流里 →"答两遍"。
+			// commit 之后一律收尾,只有 commit 之前才允许静默换号重试。
+			if !streamCommitted {
 				continue
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
@@ -2542,6 +2620,17 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
+		// 空响应检测(与 Claude 路径对齐):上游成功但零内容零工具 → 回 error 帧而非
+		// 静默的空 stop,避免 OpenAI agentic 客户端拿到空回复后卡在工具循环里。
+		if isEmptyKiroResponse(outputContent, reasoningOutput, len(toolCalls), outputTokens, inputTokens, model) {
+			h.pool.RecordSuccess(account.ID)
+			releaseSlot()
+			errType, errMsg := emptyResponseErrorInfo(emptyResponseIsOversizedContext(inputTokens, model))
+			h.recordFailureWithDetails("openai", model, account.ID, fmt.Errorf("empty upstream response"))
+			h.sendOpenAIStreamError(w, flusher, errType, errMsg)
+			return
+		}
+
 		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
@@ -2552,6 +2641,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := openAIFinishReason(len(toolCalls) > 0, false, inputTokens, model)
+		if outputTruncated && len(toolCalls) == 0 {
+			finishReason = "length" // output-cap truncation surfaced via OnException
+		}
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -2603,10 +2695,10 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 
 	conversationID := payload.ConversationState.AgentContinuationId
 	bypassFairness := apiKeyID == ""
-	keyFloor := 0
+	var keyConcurrency *int
 	var boundAccountIDs []string
 	if e := config.GetApiKeyEntry(apiKeyID); e != nil {
-		keyFloor = e.MaxConcurrency
+		keyConcurrency = e.MaxConcurrency
 		boundAccountIDs = e.BoundAccountIDs
 	}
 	// Panic-safety net: guarantee the acquired concurrency slot is released even
@@ -2621,7 +2713,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		}
 	}()
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyFloor, bypassFairness, conversationID, model, excluded, boundAccountIDs)
+		account, releaseSlot, aerr := h.pool.Acquire(apiKeyID, keyConcurrency, bypassFairness, conversationID, model, excluded, boundAccountIDs)
 		activeRelease = releaseSlot
 		if aerr == pool.ErrTooBusy {
 			h.sendOpenAIError(w, 429, "rate_limit_error", "Too many concurrent requests for this key; retry shortly")
@@ -2698,6 +2790,22 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		}
 		cacheUsage = resolvePromptCacheUsage(cacheUsage, hasCacheMetering, meteringCacheRead, meteringCacheCreation, inputTokens)
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+
+		// 空响应护栏(对齐 Claude 路径):上游成功但零内容零工具 → 回错误而非静默空 stop,
+		// 避免 agentic OpenAI 客户端卡死。
+		if isEmptyKiroResponse(finalContent, reasoningContent, len(toolUses), outputTokens, inputTokens, model) {
+			h.pool.RecordSuccess(account.ID)
+			releaseSlot()
+			oversized := emptyResponseIsOversizedContext(inputTokens, model)
+			errType, errMsg := emptyResponseErrorInfo(oversized)
+			h.recordFailureWithDetails("openai", model, account.ID, fmt.Errorf("empty upstream response"))
+			code := 503
+			if oversized {
+				code = 400
+			}
+			h.sendOpenAIError(w, code, errType, errMsg)
+			return
+		}
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, model, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -3913,10 +4021,12 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
+		"apiKey":                config.GetApiKey(),
+		"requireApiKey":         config.IsApiKeyRequired(),
+		"port":                  config.GetPort(),
+		"host":                  config.GetHost(),
+		"defaultMaxConcurrency": config.GetDefaultMaxConcurrency(),
+		"defaultMaxRPM":         config.GetDefaultMaxRPM(),
 	})
 }
 
@@ -3965,9 +4075,11 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
+		ApiKey                *string `json:"apiKey,omitempty"`
+		RequireApiKey         *bool   `json:"requireApiKey,omitempty"`
+		Password              string  `json:"password,omitempty"`
+		DefaultMaxConcurrency *int    `json:"defaultMaxConcurrency,omitempty"`
+		DefaultMaxRPM         *int    `json:"defaultMaxRPM,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3979,6 +4091,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+
+	if req.DefaultMaxConcurrency != nil || req.DefaultMaxRPM != nil {
+		if err := config.UpdateDefaultLimits(req.DefaultMaxConcurrency, req.DefaultMaxRPM); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

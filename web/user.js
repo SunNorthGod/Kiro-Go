@@ -564,8 +564,10 @@
 
     // Key info card
     const expiresText = meData.expiresAt ? formatDateTime(meData.expiresAt) : t('user.overview.neverExpires');
-    const concurrencyText = (meData.maxConcurrency && meData.maxConcurrency > 0)
-      ? String(meData.maxConcurrency) : t('user.overview.concurrencyDefault');
+    // Tri-state: null/absent = inherit system default, 0 = unlimited, N = value.
+    const limitText = (v) => v == null ? t('user.overview.concurrencyDefault')
+      : (v === 0 ? t('user.overview.unlimited') : String(v));
+    const concurrencyText = limitText(meData.maxConcurrency);
     const infoCard =
       '<div class="card">' +
       '<div class="card-header"><span class="card-title"><i class="fa-solid fa-id-card card-title-icon"></i>' +

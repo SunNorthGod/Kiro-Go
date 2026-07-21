@@ -13,6 +13,7 @@ package config
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -172,13 +173,20 @@ type ApiKeyEntry struct {
 	// ParentKeyID is the id of the key that minted this one; "" == root.
 	ParentKeyID string `json:"parentKeyId,omitempty"`
 	// MaxConcurrency is this key's per-key fairness baseline under contention
-	// (a soft floor, not a hard ceiling — idle pool capacity is always lent out):
-	//   0  → use the pool default (5)
-	//   N  → guarantee at least N concurrent slots for this key under contention
-	//   -1 → unlimited (bypass the fairness gate, like an admin/master key)
-	// In-memory/JSON only — there is no DB column for it yet, so it is not
-	// persisted when the PostgreSQL backend is active.
-	MaxConcurrency int `json:"maxConcurrency,omitempty"`
+	// (a soft floor, not a hard ceiling — idle pool capacity is always lent out).
+	// Unified tri-state semantics (nullable pointer):
+	//   nil → inherit the system default (config.GetDefaultMaxConcurrency)
+	//   0   → unlimited (bypass the fairness gate, like an admin/master key)
+	//   N   → guarantee at least N concurrent slots for this key under contention
+	// Persisted via the api_keys.max_concurrency column (NULL == inherit).
+	MaxConcurrency *int `json:"maxConcurrency,omitempty"`
+	// MaxRPM is this key's per-key requests-per-60s ceiling (a HARD cap, unlike
+	// MaxConcurrency). Unified tri-state semantics (nullable pointer):
+	//   nil → inherit the system default (config.GetDefaultMaxRPM)
+	//   0   → unlimited (never RPM-gated)
+	//   N   → reject with 429 once this key exceeds N requests in the trailing 60s
+	// Persisted via the api_keys.max_rpm column (NULL == inherit).
+	MaxRPM *int `json:"maxRPM,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -194,6 +202,17 @@ type Config struct {
 	SystemVersion string        `json:"systemVersion,omitempty"`
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+
+	// Per-key default limits (system-wide fairness baselines), nullable so the
+	// "never configured" state is distinct from an explicit 0 (= unlimited):
+	//   nil → factory default (concurrency 5, RPM 20), pre-filled in the settings UI
+	//   0   → unlimited
+	//   N   → that value
+	// DefaultMaxConcurrency is a key's fair-share concurrency baseline under
+	// contention; DefaultMaxRPM is a hard per-key requests-per-60s ceiling. Both
+	// can be overridden per key via ApiKeyEntry.
+	DefaultMaxConcurrency *int `json:"defaultMaxConcurrency,omitempty"`
+	DefaultMaxRPM         *int `json:"defaultMaxRPM,omitempty"`
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -270,7 +289,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.11"
+const Version = "1.1.14"
 
 var (
 	cfg     *Config
@@ -370,6 +389,43 @@ func Load() error {
 			return err
 		}
 	}
+
+	// Migration: per-key limit semantics were unified so that 0 == unlimited and
+	// the "-1" sentinel no longer exists. Older JSON configs may still carry
+	// MaxConcurrency/MaxRPM == -1 (the previous "unlimited" marker); remap those
+	// to 0 so they keep meaning unlimited under the new rule. Values of 0 in an
+	// old JSON meant "inherit default" — but a JSON key that was never set is
+	// absent (nil pointer) rather than 0, and the admin UI only ever emitted 0
+	// for the "default" mode as an explicit field, so a literal 0 here is rare;
+	// we leave any explicit 0 as unlimited per the new unified rule.
+	limitsMigrated := false
+	for i := range cfg.ApiKeys {
+		if v := cfg.ApiKeys[i].MaxConcurrency; v != nil && *v < 0 {
+			zero := 0
+			cfg.ApiKeys[i].MaxConcurrency = &zero
+			limitsMigrated = true
+		}
+		if v := cfg.ApiKeys[i].MaxRPM; v != nil && *v < 0 {
+			zero := 0
+			cfg.ApiKeys[i].MaxRPM = &zero
+			limitsMigrated = true
+		}
+	}
+	if v := cfg.DefaultMaxConcurrency; v != nil && *v < 0 {
+		zero := 0
+		cfg.DefaultMaxConcurrency = &zero
+		limitsMigrated = true
+	}
+	if v := cfg.DefaultMaxRPM; v != nil && *v < 0 {
+		zero := 0
+		cfg.DefaultMaxRPM = &zero
+		limitsMigrated = true
+	}
+	if limitsMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -458,6 +514,70 @@ func GetHost() string {
 		return "127.0.0.1"
 	}
 	return cfg.Host
+}
+
+// Factory defaults for the per-key limits, shown pre-filled in the settings UI
+// and used whenever the admin has never configured a value (DefaultMax* == nil).
+// These are real seeded values, not hidden magic fallbacks: concurrency 5, RPM 20.
+const (
+	FactoryDefaultConcurrency = 5
+	FactoryDefaultRPM         = 20
+)
+
+// GetDefaultMaxConcurrency returns the system-wide per-key concurrency baseline
+// (fair share under contention). Unified semantics:
+//
+//	nil (never set) → factory default (FactoryDefaultConcurrency)
+//	0               → unlimited
+//	N               → that value
+func GetDefaultMaxConcurrency() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.DefaultMaxConcurrency == nil {
+		return FactoryDefaultConcurrency
+	}
+	return *cfg.DefaultMaxConcurrency
+}
+
+// GetDefaultMaxRPM returns the system-wide per-key requests-per-60s ceiling.
+// Unified semantics:
+//
+//	nil (never set) → factory default (FactoryDefaultRPM)
+//	0               → unlimited (no RPM gating)
+//	N               → that value
+func GetDefaultMaxRPM() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.DefaultMaxRPM == nil {
+		return FactoryDefaultRPM
+	}
+	return *cfg.DefaultMaxRPM
+}
+
+// UpdateDefaultLimits sets the system-wide per-key concurrency baseline and RPM
+// ceiling. nil args are left unchanged. A stored value of 0 means unlimited; any
+// negative value is clamped to 0 (there is no "-1" sentinel any more).
+func UpdateDefaultLimits(maxConcurrency, maxRPM *int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	if maxConcurrency != nil {
+		v := *maxConcurrency
+		if v < 0 {
+			v = 0
+		}
+		cfg.DefaultMaxConcurrency = &v
+	}
+	if maxRPM != nil {
+		v := *maxRPM
+		if v < 0 {
+			v = 0
+		}
+		cfg.DefaultMaxRPM = &v
+	}
+	return saveLocked()
 }
 
 func GetAccounts() []Account {

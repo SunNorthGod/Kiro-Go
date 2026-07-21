@@ -224,3 +224,113 @@ func TestAddOrReplaceAccountDedup(t *testing.T) {
 		t.Fatalf("expected email dedupe to keep 2 accounts, got %d", got)
 	}
 }
+
+// TestDefaultLimitSemantics verifies the unified per-key default-limit rules:
+// nil (never configured) resolves to the factory default; an explicit 0 means
+// unlimited; a positive N is returned verbatim; and negatives are clamped to 0.
+func TestDefaultLimitSemantics(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	// Fresh config → never configured → factory defaults (5 / 20), NOT 0.
+	if got := GetDefaultMaxConcurrency(); got != FactoryDefaultConcurrency {
+		t.Fatalf("unset concurrency = %d, want factory %d", got, FactoryDefaultConcurrency)
+	}
+	if got := GetDefaultMaxRPM(); got != FactoryDefaultRPM {
+		t.Fatalf("unset RPM = %d, want factory %d", got, FactoryDefaultRPM)
+	}
+
+	// Explicit 0 means unlimited and must be preserved (not coerced to factory).
+	zero := 0
+	if err := UpdateDefaultLimits(&zero, &zero); err != nil {
+		t.Fatalf("update to 0: %v", err)
+	}
+	if got := GetDefaultMaxConcurrency(); got != 0 {
+		t.Fatalf("concurrency after set 0 = %d, want 0 (unlimited)", got)
+	}
+	if got := GetDefaultMaxRPM(); got != 0 {
+		t.Fatalf("RPM after set 0 = %d, want 0 (unlimited)", got)
+	}
+
+	// Positive values pass through unchanged.
+	c, r := 12, 99
+	if err := UpdateDefaultLimits(&c, &r); err != nil {
+		t.Fatalf("update to N: %v", err)
+	}
+	if got := GetDefaultMaxConcurrency(); got != 12 {
+		t.Fatalf("concurrency = %d, want 12", got)
+	}
+	if got := GetDefaultMaxRPM(); got != 99 {
+		t.Fatalf("RPM = %d, want 99", got)
+	}
+
+	// Negative values are clamped to 0 (there is no -1 sentinel any more).
+	neg := -1
+	if err := UpdateDefaultLimits(&neg, &neg); err != nil {
+		t.Fatalf("update to negative: %v", err)
+	}
+	if got := GetDefaultMaxConcurrency(); got != 0 {
+		t.Fatalf("negative concurrency clamped = %d, want 0", got)
+	}
+	if got := GetDefaultMaxRPM(); got != 0 {
+		t.Fatalf("negative RPM clamped = %d, want 0", got)
+	}
+}
+
+// TestLegacyLimitMigration verifies that a config.json written under the old
+// semantics (where -1 meant "unlimited") is remapped to the unified rule where
+// 0 means unlimited, on first load — for both the per-key overrides and the
+// system-wide defaults.
+func TestLegacyLimitMigration(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+
+	seed := map[string]interface{}{
+		"password":              "p",
+		"port":                  8080,
+		"host":                  "0.0.0.0",
+		"requireApiKey":         false,
+		"defaultMaxConcurrency": -1, // legacy unlimited
+		"defaultMaxRPM":         7,  // explicit value, must survive
+		"accounts":              []map[string]interface{}{},
+		"apiKeys": []map[string]interface{}{
+			{"id": "k-unl", "key": "sk-unl", "enabled": true, "maxConcurrency": -1, "maxRPM": -1},
+			{"id": "k-val", "key": "sk-val", "enabled": true, "maxConcurrency": 3, "maxRPM": 50},
+		},
+	}
+	raw, err := json.MarshalIndent(seed, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(cfgFile, raw, 0600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// System-wide: -1 concurrency → 0 (unlimited); RPM 7 preserved.
+	if got := GetDefaultMaxConcurrency(); got != 0 {
+		t.Fatalf("migrated default concurrency = %d, want 0", got)
+	}
+	if got := GetDefaultMaxRPM(); got != 7 {
+		t.Fatalf("migrated default RPM = %d, want 7", got)
+	}
+
+	// Per-key: legacy -1 → 0 (unlimited); explicit values untouched.
+	unl := GetApiKeyEntry("k-unl")
+	if unl == nil || unl.MaxConcurrency == nil || *unl.MaxConcurrency != 0 {
+		t.Fatalf("k-unl concurrency = %v, want ptr(0)", unl.MaxConcurrency)
+	}
+	if unl.MaxRPM == nil || *unl.MaxRPM != 0 {
+		t.Fatalf("k-unl RPM = %v, want ptr(0)", unl.MaxRPM)
+	}
+	val := GetApiKeyEntry("k-val")
+	if val == nil || val.MaxConcurrency == nil || *val.MaxConcurrency != 3 {
+		t.Fatalf("k-val concurrency = %v, want ptr(3)", val.MaxConcurrency)
+	}
+	if val.MaxRPM == nil || *val.MaxRPM != 50 {
+		t.Fatalf("k-val RPM = %v, want ptr(50)", val.MaxRPM)
+	}
+}

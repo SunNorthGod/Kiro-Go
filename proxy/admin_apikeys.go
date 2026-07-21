@@ -2,10 +2,26 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"kiro-go/config"
 	"net/http"
 	"strings"
 )
+
+// normalizeLimitPtr defensively clamps a per-key limit override to the unified
+// semantics before persisting: nil stays nil (inherit default); any negative
+// value (a stale "-1 = unlimited" client) is folded to 0 (unlimited); 0 and
+// positive values pass through unchanged (0 == unlimited, N == that value).
+func normalizeLimitPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	n := *v
+	if n < 0 {
+		n = 0
+	}
+	return &n
+}
 
 // apiKeyView is the response payload for listing/inspecting API keys. This is an
 // admin-only, password-protected view, so the full Key is returned (KeyMasked is
@@ -30,9 +46,13 @@ type apiKeyView struct {
 	// Unified-ledger + card-key fields.
 	CreditsGranted  float64  `json:"creditsGranted"`
 	Balance         float64  `json:"balance"`
-	ExpiresAt       int64    `json:"expiresAt,omitempty"`
-	Expired         bool     `json:"expired"`
-	MaxConcurrency  int      `json:"maxConcurrency,omitempty"`
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
+	Expired   bool  `json:"expired"`
+	// Per-key limit overrides, nullable with unified semantics: absent (null) ==
+	// inherit system default; 0 == unlimited; N == that value. Pointers so the
+	// "inherit" state is a distinct absent field rather than an ambiguous 0.
+	MaxConcurrency  *int     `json:"maxConcurrency,omitempty"`
+	MaxRPM          *int     `json:"maxRPM,omitempty"`
 	BoundAccountIDs []string `json:"boundAccountIds,omitempty"`
 	ParentKeyID     string   `json:"parentKeyId,omitempty"`
 }
@@ -57,6 +77,7 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		ExpiresAt:       e.ExpiresAt,
 		Expired:         config.IsApiKeyExpired(e),
 		MaxConcurrency:  e.MaxConcurrency,
+		MaxRPM:          e.MaxRPM,
 		BoundAccountIDs: e.BoundAccountIDs,
 		ParentKeyID:     e.ParentKeyID,
 	}
@@ -96,7 +117,8 @@ type apiKeyCreateRequest struct {
 	CreditLimit     float64  `json:"creditLimit,omitempty"`
 	CreditsGranted  float64  `json:"creditsGranted,omitempty"` // optional opening balance
 	ExpiresAt       int64    `json:"expiresAt,omitempty"`
-	MaxConcurrency  int      `json:"maxConcurrency,omitempty"`
+	MaxConcurrency  *int     `json:"maxConcurrency,omitempty"` // null == inherit default, 0 == unlimited, N == value
+	MaxRPM          *int     `json:"maxRPM,omitempty"`         // null == inherit default, 0 == unlimited, N == value
 	BoundAccountIDs []string `json:"boundAccountIds,omitempty"`
 	ParentKeyID     string   `json:"parentKeyId,omitempty"`
 }
@@ -178,7 +200,8 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 		CreditLimit:     req.CreditLimit,
 		CreditsGranted:  req.CreditsGranted,
 		ExpiresAt:       req.ExpiresAt,
-		MaxConcurrency:  req.MaxConcurrency,
+		MaxConcurrency:  normalizeLimitPtr(req.MaxConcurrency),
+		MaxRPM:          normalizeLimitPtr(req.MaxRPM),
 		BoundAccountIDs: req.BoundAccountIDs,
 		ParentKeyID:     req.ParentKeyID,
 	})
@@ -206,6 +229,7 @@ type apiKeyUpdateRequest struct {
 	CreditsGranted  *float64  `json:"creditsGranted,omitempty"` // absolute quota override ("额度")
 	ExpiresAt       *int64    `json:"expiresAt,omitempty"`
 	MaxConcurrency  *int      `json:"maxConcurrency,omitempty"`
+	MaxRPM          *int      `json:"maxRPM,omitempty"`
 	BoundAccountIDs *[]string `json:"boundAccountIds,omitempty"`
 	ParentKeyID     *string   `json:"parentKeyId,omitempty"`
 }
@@ -218,8 +242,27 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 
+	// Read the body once so we can both decode into the typed request AND detect
+	// which keys were actually present. The per-key limit fields are tri-state
+	// (absent = don't touch, null = set to inherit-default, number = set value),
+	// which a plain *int cannot express: absent and explicit-null both decode to
+	// nil. Presence detection lets the enable/disable toggle (which PUTs only
+	// {"enabled":...}) leave the limits untouched while still allowing the edit
+	// form to clear an override back to inherit by sending an explicit null.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid body"})
+		return
+	}
 	var req apiKeyUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
@@ -244,8 +287,14 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	if req.ExpiresAt != nil {
 		patch.ExpiresAt = *req.ExpiresAt
 	}
-	if req.MaxConcurrency != nil {
-		patch.MaxConcurrency = *req.MaxConcurrency
+	// Tri-state per-key limits: only touch a field when the JSON key is present.
+	// Present → set to the sent value (req.Max* is nil for an explicit null =
+	// inherit, or a pointer to 0 = unlimited / N = value). Absent → leave as-is.
+	if _, ok := rawFields["maxConcurrency"]; ok {
+		patch.MaxConcurrency = normalizeLimitPtr(req.MaxConcurrency)
+	}
+	if _, ok := rawFields["maxRPM"]; ok {
+		patch.MaxRPM = normalizeLimitPtr(req.MaxRPM)
 	}
 	if req.BoundAccountIDs != nil {
 		patch.BoundAccountIDs = *req.BoundAccountIDs

@@ -133,9 +133,13 @@
       'keys.copyKeyDone': 'Key 已复制',
       'keys.copyUrlDone': '接口地址已复制',
       'keys.baseUrl': '接口地址',
-      'apiKeys.concurrencyModeDefault': '默认（系统限制）',
-      'apiKeys.concurrencyModeCustom': '自定义',
-      'apiKeys.concurrencyModeUnlimited': '无限',
+      'apiKeys.limitModeDefault': '默认（跟随系统）',
+      'apiKeys.limitModeUnlimited': '不限制',
+      'apiKeys.limitModeCustom': '自定义',
+      'apiKeys.formMaxRPM': '每分钟请求数（RPM）',
+      'apiKeys.formMaxRPMHint': '留空 = 跟随系统默认；不限制 = 0；自定义 = 该值',
+      'keys.maxRPM': 'RPM 上限',
+      'keys.unlimited': '不限制',
       'accounts.rpm': '实时 RPM',
       'accounts.priority': '优先级',
       'accounts.priorityHint': '数值越高优先级越高，自动负载均衡时优先调度（0 = 最低，默认 1）',
@@ -201,9 +205,13 @@
       'keys.copyKeyDone': 'Key copied',
       'keys.copyUrlDone': 'Base URL copied',
       'keys.baseUrl': 'Base URL',
-      'apiKeys.concurrencyModeDefault': 'Default (system limit)',
-      'apiKeys.concurrencyModeCustom': 'Custom',
-      'apiKeys.concurrencyModeUnlimited': 'Unlimited',
+      'apiKeys.limitModeDefault': 'Default (follow system)',
+      'apiKeys.limitModeUnlimited': 'Unlimited',
+      'apiKeys.limitModeCustom': 'Custom',
+      'apiKeys.formMaxRPM': 'Requests per minute (RPM)',
+      'apiKeys.formMaxRPMHint': 'Empty = follow system default; Unlimited = 0; Custom = that value',
+      'keys.maxRPM': 'Max RPM',
+      'keys.unlimited': 'Unlimited',
       'accounts.rpm': 'Live RPM',
       'accounts.priority': 'Priority',
       'accounts.priorityHint': 'Higher value = higher priority; served first by the auto load-balancer (0 = lowest, default 1)',
@@ -2094,8 +2102,37 @@
   async function loadSettings() {
     // Global allowOverUsage was removed (overage is per-account now); just load
     // the remaining settings panels.
-    await Promise.all([loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadLimits()]);
     refreshCustomSelects();
+  }
+  // Per-key default limits (system-wide concurrency baseline + RPM ceiling).
+  async function loadLimits() {
+    try {
+      const res = await api('/settings');
+      const d = await res.json();
+      const c = $('defaultMaxConcurrency');
+      const r = $('defaultMaxRPM');
+      // Backend getters always resolve to a concrete value (factory 5 / 20 when
+      // never configured), so just reflect what it returns. 0 shows as 0 (=不限制).
+      if (c) c.value = (d.defaultMaxConcurrency != null ? d.defaultMaxConcurrency : 5);
+      if (r) r.value = (d.defaultMaxRPM != null ? d.defaultMaxRPM : 20);
+    } catch (e) { /* leave placeholders */ }
+  }
+  async function saveLimits() {
+    const c = parseInt($('defaultMaxConcurrency').value, 10);
+    const r = parseInt($('defaultMaxRPM').value, 10);
+    // Unified semantics: 0 = unlimited (kept, not coerced away); a blank/invalid
+    // field falls back to the factory default so the box is never saved as junk.
+    const body = {
+      defaultMaxConcurrency: (isNaN(c) || c < 0) ? 5 : c,
+      defaultMaxRPM: (isNaN(r) || r < 0) ? 20 : r
+    };
+    try {
+      const res = await api('/settings', { method: 'POST', body: JSON.stringify(body) });
+      const d = await res.json();
+      if (d.success) { toast(t('settings.limitsSaved'), 'success'); loadLimits(); }
+      else toast(t('common.failed') + (d.error ? ': ' + d.error : ''), 'error');
+    } catch (e) { toast(t('common.failed'), 'error'); }
   }
   async function loadThinkingConfig() {
     const res = await api('/thinking');
@@ -2267,7 +2304,11 @@
       tokensUsed: item.tokensUsed || 0,
       requestsCount: item.requestsCount || 0,
       expiresAt: item.expiresAt || 0,
-      maxConcurrency: item.maxConcurrency != null ? item.maxConcurrency : 0,
+      // Preserve the tri-state: null/undefined = inherit default, 0 = unlimited,
+      // N = value. Do NOT coerce null→0 (that would misread inherited keys as
+      // unlimited in the edit modal).
+      maxConcurrency: item.maxConcurrency != null ? item.maxConcurrency : null,
+      maxRPM: item.maxRPM != null ? item.maxRPM : null,
       boundAccountIds: Array.isArray(item.boundAccountIds) ? item.boundAccountIds : [],
       parentKeyId: item.parentKeyId || '',
       createdAt: item.createdAt || 0,
@@ -2452,7 +2493,10 @@
     const blocks = creditBlock + trafficBlock;
     const dotCls = keyDotClass(k, expired);
 
-    const mcLabel = k.maxConcurrency === -1 ? t('keys.unlimited') : (k.maxConcurrency > 0 ? String(k.maxConcurrency) : t('keys.concurrencyDefault'));
+    // Tri-state label: null → inherit default, 0 → unlimited, N → the value.
+    const limitLabel = (v) => v == null ? t('keys.concurrencyDefault') : (v === 0 ? t('keys.unlimited') : String(v));
+    const mcLabel = limitLabel(k.maxConcurrency);
+    const rpmLabel = limitLabel(k.maxRPM);
     const fullKey = k.key || k.keyMasked || '';
     const seg = (html) => '<span class="ng-sub-seg">' + html + '</span>';
     // Line 1: the key value + copy buttons.
@@ -2464,6 +2508,7 @@
     const metaSegs = [];
     metaSegs.push(seg('<i class="fa-regular fa-clock"></i>' + escapeHtml(t('keys.expiresAt') + ': ' + (k.expiresAt ? formatDateTime(k.expiresAt) : t('keys.neverExpires')))));
     metaSegs.push(seg('<i class="fa-solid fa-layer-group"></i>' + escapeHtml(t('keys.maxConcurrency') + ': ' + mcLabel)));
+    metaSegs.push(seg('<i class="fa-solid fa-gauge-high"></i>' + escapeHtml(t('keys.maxRPM') + ': ' + rpmLabel)));
     metaSegs.push(seg('<i class="fa-solid fa-users"></i>' + escapeHtml(t('keys.boundAccounts') + ': ' + keyBoundLabel(k))));
     if (k.parentKeyId) metaSegs.push(seg('<i class="fa-solid fa-code-branch"></i>' + escapeHtml(t('keys.parentKey') + ': ' + keyParentLabel(k.parentKeyId))));
     if (info.isParent) {
@@ -2509,12 +2554,48 @@
     try { await copyText(location.origin); markKeyCopied(btn); toast(t('keys.copyUrlDone'), 'primary'); }
     catch (e) { toastError(t('common.failed')); }
   }
-  // Max-concurrency control: default(0) / custom(N) / unlimited(-1)
+  // Per-key limit controls use a unified tri-state (default / unlimited / custom)
+  // that maps to the nullable backend field: null/absent = inherit system default,
+  // 0 = unlimited, N = that value.
+  function applyLimitToForm(value, modeId, inputId, customFallback) {
+    const mode = $(modeId);
+    const input = $(inputId);
+    if (value == null) {                 // null or undefined → inherit default
+      if (mode) mode.value = '';
+      if (input) input.value = String(customFallback);
+    } else if (value === 0) {            // explicit 0 → unlimited
+      if (mode) mode.value = 'unlimited';
+      if (input) input.value = String(customFallback);
+    } else {                             // positive N → custom
+      if (mode) mode.value = 'custom';
+      if (input) input.value = String(value);
+    }
+  }
+  // Read a tri-state limit control back into the value the backend expects:
+  //   '' (default)    → null  (inherit — a JSON null, so the field is still sent
+  //                            and the server sets the key back to inherit)
+  //   'unlimited'     → 0
+  //   'custom'        → the positive number entered (blank/invalid → null)
+  function readLimitFromForm(modeId, inputId) {
+    const mode = ($(modeId) && $(modeId).value) || '';
+    if (mode === 'unlimited') return 0;
+    if (mode === 'custom') {
+      const n = parseInt($(inputId).value, 10);
+      return (isNaN(n) || n < 1) ? null : n;
+    }
+    return null; // default → inherit
+  }
+  // Max-concurrency control: default('') / unlimited(0) / custom(N)
   function updateMaxConcurrencyField() {
-    const mode = $('apiKeyForm_maxConcurrencyMode');
-    const input = $('apiKeyForm_maxConcurrency');
-    if (!mode || !input) return;
-    input.classList.toggle('hidden', mode.value !== 'custom');
+    // Show the numeric input only in "custom" mode, for both the concurrency and
+    // the RPM limit controls (unified tri-state: default / unlimited / custom).
+    [['apiKeyForm_maxConcurrencyMode', 'apiKeyForm_maxConcurrency'],
+     ['apiKeyForm_maxRPMMode', 'apiKeyForm_maxRPM']].forEach(function (pair) {
+      const mode = $(pair[0]);
+      const input = $(pair[1]);
+      if (!mode || !input) return;
+      input.classList.toggle('hidden', mode.value !== 'custom');
+    });
   }
 
   function openApiKeyModal(entry) {
@@ -2537,12 +2618,13 @@
     // so editing sets an absolute quota (recharges are preserved when left as-is);
     // fall back to the legacy creditLimit only when no grant is present.
     $('apiKeyForm_creditLimit').value = entry ? String((entry.granted != null ? entry.granted : entry.creditLimit) || 0) : '0';
-    const mc = entry && entry.maxConcurrency != null ? entry.maxConcurrency : 0;
-    const mcMode = $('apiKeyForm_maxConcurrencyMode');
-    const mcInput = $('apiKeyForm_maxConcurrency');
-    if (mc === -1) { if (mcMode) mcMode.value = '-1'; if (mcInput) mcInput.value = '0'; }
-    else if (mc > 0) { if (mcMode) mcMode.value = 'custom'; if (mcInput) mcInput.value = String(mc); }
-    else { if (mcMode) mcMode.value = '0'; if (mcInput) mcInput.value = '0'; }
+    // Per-key limits (unified tri-state). The value is null/absent when the key
+    // inherits the system default, 0 when explicitly unlimited, or a positive N.
+    // Map that onto the select: ''(default) / 'unlimited' / 'custom'+number.
+    applyLimitToForm(entry ? entry.maxConcurrency : undefined,
+      'apiKeyForm_maxConcurrencyMode', 'apiKeyForm_maxConcurrency', 1);
+    applyLimitToForm(entry ? entry.maxRPM : undefined,
+      'apiKeyForm_maxRPMMode', 'apiKeyForm_maxRPM', 20);
     updateMaxConcurrencyField();
     $('apiKeyForm_expiresAt').value = entry ? toDatetimeLocal(entry.expiresAt) : '';
     populateParentKeySelect(apiKeyEditingId, entry ? (entry.parentKeyId || '') : '');
@@ -2604,16 +2686,11 @@
       // created/edited card shows and enforces exactly what the operator typed.
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
       const creditQuota = isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit;
-      const mcMode = ($('apiKeyForm_maxConcurrencyMode') && $('apiKeyForm_maxConcurrencyMode').value) || '0';
-      let maxConcurrency;
-      if (mcMode === '-1') {
-        maxConcurrency = -1;
-      } else if (mcMode === 'custom') {
-        const n = parseInt($('apiKeyForm_maxConcurrency').value, 10);
-        maxConcurrency = (isNaN(n) || n < 1) ? 0 : n;
-      } else {
-        maxConcurrency = 0;
-      }
+      // Unified tri-state per-key limits. null = inherit system default (sent as
+      // an explicit JSON null so the server can also RESET an override back to
+      // inherit), 0 = unlimited, N = that value.
+      const maxConcurrency = readLimitFromForm('apiKeyForm_maxConcurrencyMode', 'apiKeyForm_maxConcurrency');
+      const maxRPM = readLimitFromForm('apiKeyForm_maxRPMMode', 'apiKeyForm_maxRPM');
       const expiresAt = fromDatetimeLocal($('apiKeyForm_expiresAt').value);
       const parentKeyId = ($('apiKeyForm_parentKey').value || '').trim();
       const boundAccountIds = qsa('#apiKeyForm_boundAccounts input[type="checkbox"]:checked').map(cb => cb.value);
@@ -2624,6 +2701,7 @@
         creditLimit: creditQuota,
         creditsGranted: creditQuota,
         maxConcurrency: maxConcurrency,
+        maxRPM: maxRPM,
         expiresAt: expiresAt,
         parentKeyId: parentKeyId,
         boundAccountIds: boundAccountIds
@@ -3036,6 +3114,8 @@
     if (saveBtn) saveBtn.addEventListener('click', submitApiKeyModal);
     const mcModeSel = $('apiKeyForm_maxConcurrencyMode');
     if (mcModeSel) mcModeSel.addEventListener('change', updateMaxConcurrencyField);
+    const rpmModeSel = $('apiKeyForm_maxRPMMode');
+    if (rpmModeSel) rpmModeSel.addEventListener('change', updateMaxConcurrencyField);
     const cancelBtn = $('apiKeyModalCancelBtn');
     if (cancelBtn) cancelBtn.addEventListener('click', closeApiKeyModal);
     const closeBtn = $('apiKeyModalClose');
@@ -3604,6 +3684,7 @@
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    { const b = $('saveLimitsBtn'); if (b) b.addEventListener('click', saveLimits); }
     bindApiKeyEvents();
   }
 

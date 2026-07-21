@@ -133,6 +133,7 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	// (use RechargeApiKey / RecordApiKeyUsage / ResetApiKeyUsage).
 	cfg.ApiKeys[idx].ExpiresAt = patch.ExpiresAt
 	cfg.ApiKeys[idx].MaxConcurrency = patch.MaxConcurrency
+	cfg.ApiKeys[idx].MaxRPM = patch.MaxRPM
 	cfg.ApiKeys[idx].BoundAccountIDs = patch.BoundAccountIDs
 	cfg.ApiKeys[idx].ParentKeyID = patch.ParentKeyID
 	if patch.Migrated {

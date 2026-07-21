@@ -36,7 +36,7 @@ func TestAcquireRespectsBoundAccountIDs(t *testing.T) {
 	p := newSchedTestPool(config.Account{ID: "a"}, config.Account{ID: "b"}, config.Account{ID: "c"})
 
 	for i := 0; i < 10; i++ {
-		acc, release, err := p.Acquire("key1", 0, false, "", "", nil, []string{"b"})
+		acc, release, err := p.Acquire("key1", nil, false, "", "", nil, []string{"b"})
 		if err != nil {
 			t.Fatalf("acquire: %v", err)
 		}
@@ -46,11 +46,11 @@ func TestAcquireRespectsBoundAccountIDs(t *testing.T) {
 		release()
 	}
 
-	if _, _, err := p.Acquire("key1", 0, false, "", "", nil, []string{"zzz"}); err != ErrNoAccount {
+	if _, _, err := p.Acquire("key1", nil, false, "", "", nil, []string{"zzz"}); err != ErrNoAccount {
 		t.Fatalf("expected ErrNoAccount for out-of-pool binding, got %v", err)
 	}
 
-	acc, release, err := p.Acquire("key1", 0, false, "", "", nil, nil)
+	acc, release, err := p.Acquire("key1", nil, false, "", "", nil, nil)
 	if err != nil {
 		t.Fatalf("unbound acquire failed: %v", err)
 	}
@@ -443,5 +443,51 @@ func TestTotalTPMNormalizesToPerMinute(t *testing.T) {
 	p.RecordTokens(25000)
 	if got := p.TotalTPM(); got != 15000 {
 		t.Fatalf("TotalTPM = %d, want 15000 after second pulse", got)
+	}
+}
+
+// TestConcurrencyUnlimitedStillRPMGated is the regression guard for the
+// concurrency/RPM decoupling: a key whose concurrency override is 0 (unlimited,
+// bypassing the fairness gate) must STILL be rejected once it exceeds its RPM
+// cap. Before the unification these were coupled — an unlimited-concurrency key
+// also skipped the RPM gate, so RPM enforcement silently vanished.
+func TestConcurrencyUnlimitedStillRPMGated(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// A key with unlimited concurrency (0) but a hard RPM cap of 1.
+	zero, one := 0, 1
+	entry, err := config.AddApiKey(config.ApiKeyEntry{
+		Name: "rpm-capped", Key: "sk-rpm-cap", Enabled: true,
+		MaxConcurrency: &zero, MaxRPM: &one,
+	})
+	if err != nil {
+		t.Fatalf("AddApiKey: %v", err)
+	}
+
+	p := newSchedTestPool(config.Account{ID: "a"})
+	conc := 0 // unlimited concurrency for this key
+
+	// First request on this client key (firstAttempt: no exclusions) is admitted
+	// and ticks the per-key RPM meter to 1.
+	_, release, aerr := p.Acquire(entry.ID, &conc, false, "", "", nil, nil)
+	if aerr != nil {
+		t.Fatalf("first acquire: %v", aerr)
+	}
+	if release != nil {
+		release()
+	}
+
+	// Second client request: RPM used (1) >= cap (1) → rejected as ErrTooBusy,
+	// even though concurrency is unlimited. This proves the gates are decoupled.
+	if _, _, aerr := p.Acquire(entry.ID, &conc, false, "", "", nil, nil); aerr != ErrTooBusy {
+		t.Fatalf("expected ErrTooBusy from RPM gate on unlimited-concurrency key, got %v", aerr)
+	}
+
+	// An admin/master key bypasses BOTH gates regardless of RPM state.
+	if _, rel, aerr := p.Acquire(entry.ID, &conc, true, "", "", nil, nil); aerr != nil {
+		t.Fatalf("admin bypass should never be RPM-gated, got %v", aerr)
+	} else if rel != nil {
+		rel()
 	}
 }

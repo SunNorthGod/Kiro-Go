@@ -106,13 +106,57 @@ var schemaStatements = []string{
     parent_key_id     TEXT             NOT NULL DEFAULT '',
     created_at        BIGINT           NOT NULL DEFAULT 0,
     last_used_at      BIGINT           NOT NULL DEFAULT 0,
-    credits_granted   DOUBLE PRECISION NOT NULL DEFAULT 0
+    credits_granted   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    max_concurrency   INTEGER,
+    max_rpm           INTEGER
 )`,
 	`CREATE INDEX IF NOT EXISTS idx_api_keys_parent ON api_keys (parent_key_id)`,
 	// Idempotent backfill for deployments whose api_keys table predates the
 	// recharge ledger. credits_granted is the "进账" side of the unified ledger:
 	// a key's balance is credits_granted - credits_used.
 	`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS credits_granted DOUBLE PRECISION NOT NULL DEFAULT 0`,
+	// Per-key limit overrides. New deployments create these as NULLable (NULL ==
+	// inherit system default). Fresh backfill for tables that never had them.
+	`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS max_concurrency INTEGER`,
+	`ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS max_rpm INTEGER`,
+	// One-shot semantics migration (idempotent, guarded by is_nullable='NO').
+	// The v1.1.12 columns were `INTEGER NOT NULL DEFAULT 0`, under the OLD rule
+	// where 0 == "inherit default" and -1 == "unlimited". The unified rule flips
+	// this: NULL == inherit, 0 == unlimited, N == value. Reinterpreting the raw
+	// bytes blindly would silently turn every existing key unlimited, so remap
+	// the stored values as we drop the NOT NULL/default:
+	//   -1 → 0    (old unlimited      → new unlimited)
+	//    0 → NULL (old inherit-default→ new inherit)
+	//    N → N    (explicit value unchanged)
+	// The whole block only runs while max_concurrency is still NOT NULL, so it
+	// executes exactly once and is a no-op on every subsequent boot.
+	`DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'api_keys' AND column_name = 'max_concurrency'
+      AND is_nullable = 'NO'
+  ) THEN
+    ALTER TABLE api_keys ALTER COLUMN max_concurrency DROP DEFAULT;
+    ALTER TABLE api_keys ALTER COLUMN max_concurrency DROP NOT NULL;
+    UPDATE api_keys SET max_concurrency = CASE
+      WHEN max_concurrency < 0 THEN 0
+      WHEN max_concurrency = 0 THEN NULL
+      ELSE max_concurrency END;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'api_keys' AND column_name = 'max_rpm'
+      AND is_nullable = 'NO'
+  ) THEN
+    ALTER TABLE api_keys ALTER COLUMN max_rpm DROP DEFAULT;
+    ALTER TABLE api_keys ALTER COLUMN max_rpm DROP NOT NULL;
+    UPDATE api_keys SET max_rpm = CASE
+      WHEN max_rpm < 0 THEN 0
+      WHEN max_rpm = 0 THEN NULL
+      ELSE max_rpm END;
+  END IF;
+END $$;`,
 
 	// ---- usage_counters: AUTHORITATIVE monotonic billing ledger ----
 	// total_cache_read_tokens / total_cache_creation_tokens are DISPLAY-ONLY

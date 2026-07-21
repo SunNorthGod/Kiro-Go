@@ -359,8 +359,9 @@ func accountFromDB(a db.Account) Account {
 // every upsert overwrite the DB columns with zero values, silently wiping expiry,
 // account bindings and lineage on any key mutation (a data-loss bug).
 //
-// MaxConcurrency has no db.APIKey column, so it is intentionally not mapped here;
-// it survives only through the JSON backend.
+// MaxConcurrency / MaxRPM are per-key limit overrides, now persisted via the
+// api_keys.max_concurrency / max_rpm columns so they survive restart under the
+// PostgreSQL backend (previously JSON-only).
 
 func apiKeyToDB(e ApiKeyEntry) db.APIKey {
 	return db.APIKey{
@@ -370,6 +371,7 @@ func apiKeyToDB(e ApiKeyEntry) db.APIKey {
 		CreatedAt: e.CreatedAt, LastUsedAt: e.LastUsedAt,
 		CreditsGranted: e.CreditsGranted,
 		ExpiresAt:      e.ExpiresAt, BoundAccountIDs: e.BoundAccountIDs, ParentKeyID: e.ParentKeyID,
+		MaxConcurrency: e.MaxConcurrency, MaxRPM: e.MaxRPM,
 	}
 }
 
@@ -381,5 +383,6 @@ func apiKeyFromDB(k db.APIKey) ApiKeyEntry {
 		TokensUsed: k.TokensUsed, CreditsUsed: k.CreditsUsed, RequestsCount: k.RequestsCount,
 		CreditsGranted: k.CreditsGranted,
 		ExpiresAt:      k.ExpiresAt, BoundAccountIDs: k.BoundAccountIDs, ParentKeyID: k.ParentKeyID,
+		MaxConcurrency: k.MaxConcurrency, MaxRPM: k.MaxRPM,
 	}
 }

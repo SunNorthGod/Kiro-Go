@@ -102,3 +102,24 @@ func applyThinkingProvenance(payload *KiroPayload, accountID string) {
 		}
 	}
 }
+
+// applyResponseThinkingSignature 给非流式 Claude 响应的**第一个** thinking 块透传上游
+// 真实签名(#5)。与流式路径 emitSignatureDelta 完全对齐:真实签名经 wrapProvenanceSignature
+// 打上产出账号 provenance 标记后回传客户端,下一轮回传时 applyThinkingProvenance 据此判定
+// 同账号(保留)/跨账号(剥离),不引入跨账号回放 400 风险。
+//
+// 关键差异:无真实签名时**不兜底伪造**(流式路径缺签名会 generateFakeSignature 占位)。
+// 非流式保持既有语义——无真实签名即空签名,靠客户端 SelfHeal 恢复;仅在上游确实下发真实
+// 签名时才透传,是纯增量、不破坏现有兜底。realSig 为空或无 thinking 块时为 no-op。
+func applyResponseThinkingSignature(blocks []ClaudeContentBlock, realSig, accountID string) {
+	if realSig == "" {
+		return
+	}
+	wrapped := wrapProvenanceSignature(realSig, accountID)
+	for i := range blocks {
+		if blocks[i].Type == "thinking" {
+			blocks[i].Signature = wrapped
+			return
+		}
+	}
+}

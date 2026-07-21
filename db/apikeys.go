@@ -48,17 +48,25 @@ type APIKey struct {
 	// spendable balance is CreditsGranted - CreditsUsed. Like CreditsUsed it is
 	// monotonic and never auto-reset.
 	CreditsGranted float64
+
+	// Per-key limit overrides, nullable (NULL == inherit system default). Unified
+	// semantics for a non-null value: 0 == unlimited, N == that value. There is no
+	// "-1" sentinel any more. MaxConcurrency is the fair-share concurrency
+	// baseline; MaxRPM is the hard requests-per-60s ceiling. Persisted so per-key
+	// overrides survive restart under the PostgreSQL backend.
+	MaxConcurrency *int
+	MaxRPM         *int
 }
 
 // apiKeyColumns is the canonical column order for api_keys reads/writes. "key" is
 // quoted throughout because it is a keyword in some SQL dialects.
 const apiKeyColumns = `id, name, "key", enabled, migrated, token_limit, credit_limit, ` +
 	`tokens_used, credits_used, requests_count, expires_at, bound_account_ids, ` +
-	`parent_key_id, created_at, last_used_at, credits_granted`
+	`parent_key_id, created_at, last_used_at, credits_granted, max_concurrency, max_rpm`
 
 const apiKeyUpsert = `
 INSERT INTO api_keys (` + apiKeyColumns + `)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 ON CONFLICT (id) DO UPDATE SET
     name              = EXCLUDED.name,
     "key"             = EXCLUDED."key",
@@ -74,7 +82,9 @@ ON CONFLICT (id) DO UPDATE SET
     parent_key_id     = EXCLUDED.parent_key_id,
     created_at        = EXCLUDED.created_at,
     last_used_at      = EXCLUDED.last_used_at,
-    credits_granted   = EXCLUDED.credits_granted`
+    credits_granted   = EXCLUDED.credits_granted,
+    max_concurrency   = EXCLUDED.max_concurrency,
+    max_rpm           = EXCLUDED.max_rpm`
 
 // marshalBoundIDs encodes the id slice as a JSON array. nil/empty becomes "[]" so
 // the jsonb column never holds SQL NULL or the JSON literal null. Passing the
@@ -100,6 +110,7 @@ func scanAPIKey(row scannable) (APIKey, error) {
 		&k.ID, &k.Name, &k.Key, &k.Enabled, &k.Migrated,
 		&k.TokenLimit, &k.CreditLimit, &k.TokensUsed, &k.CreditsUsed, &k.RequestsCount,
 		&k.ExpiresAt, &bound, &k.ParentKeyID, &k.CreatedAt, &k.LastUsedAt, &k.CreditsGranted,
+		&k.MaxConcurrency, &k.MaxRPM,
 	)
 	if err != nil {
 		return APIKey{}, err
@@ -130,6 +141,7 @@ func UpsertAPIKey(ctx context.Context, q Querier, k APIKey) error {
 		k.ID, k.Name, k.Key, k.Enabled, k.Migrated,
 		k.TokenLimit, k.CreditLimit, k.TokensUsed, k.CreditsUsed, k.RequestsCount,
 		k.ExpiresAt, bound, k.ParentKeyID, k.CreatedAt, k.LastUsedAt, k.CreditsGranted,
+		k.MaxConcurrency, k.MaxRPM,
 	)
 	if err != nil {
 		return fmt.Errorf("db: upsert api key: %w", err)

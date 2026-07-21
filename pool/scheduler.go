@@ -29,13 +29,13 @@ import (
 // under schedMu — the two locks are never held at the same time, so there is no
 // lock-ordering hazard.
 
-// Tunables. perKeyConcurrencyFloor / perAccountSoftConcurrency are the *baselines*
-// used by the work-conserving fair scheduler, not hard ceilings: idle capacity is
-// always lent out. They can later be sourced from config; the defaults match the
-// agreed values (5 per key, 20 per account, global unbounded).
+// Tunables. perAccountSoftConcurrency is a *baseline* used by the work-conserving
+// fair scheduler, not a hard ceiling: idle capacity is always lent out. The
+// per-key concurrency baseline is admin-tunable (config.GetDefaultMaxConcurrency,
+// factory default 5) and resolved per request in Acquire; this per-account value
+// stays hardcoded at 20 by design.
 const (
-	defaultPerKeyConcurrencyFloor = 5
-	perAccountSoftConcurrency     = 20
+	perAccountSoftConcurrency = 20
 
 	admitTimeout         = 8 * time.Second
 	rateLimitBackoffBase = 1500 * time.Millisecond
@@ -128,25 +128,62 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, b
 // returns the chosen account (a copy) plus a release func that MUST be called
 // exactly once when the request finishes (success, error, or client disconnect).
 //
-// keyConcurrencyFloor is the per-key guaranteed baseline (0 → default 5); the
-// effective fair cap under contention is max(floor, poolCapacity/activeKeys).
+// keyConcurrency is the per-key concurrency override, nullable with unified
+// semantics: nil → inherit the system default (config.GetDefaultMaxConcurrency,
+// factory 5); 0 → unlimited (bypass the fairness gate, like an admin key); N →
+// guaranteed baseline, effective fair cap under contention max(N, poolCap/keys).
 // isAdmin bypasses the fairness gate entirely (still counted for observability).
 // boundAccountIDs restricts selection to those accounts (empty = any).
-func (p *AccountPool) Acquire(keyID string, keyConcurrencyFloor int, isAdmin bool, conversationID, model string, excluded map[string]bool, boundAccountIDs []string) (config.Account, func(), error) {
+//
+// The concurrency gate and the RPM gate are INDEPENDENT: a key that is unlimited
+// on concurrency is still RPM-gated (and vice-versa). Only isAdmin bypasses both.
+func (p *AccountPool) Acquire(keyID string, keyConcurrency *int, isAdmin bool, conversationID, model string, excluded map[string]bool, boundAccountIDs []string) (config.Account, func(), error) {
 	snap := p.eligibleSnapshot(model, excluded, boundAccountIDs)
 	if len(snap) == 0 {
 		return config.Account{}, nil, ErrNoAccount
 	}
 	distinct := len(snap)
-	// A negative floor is the "unlimited" tier: the key bypasses the fairness
-	// gate entirely (still counted for observability), like an admin/master key.
-	unlimited := keyConcurrencyFloor < 0
-	if keyConcurrencyFloor <= 0 {
-		keyConcurrencyFloor = defaultPerKeyConcurrencyFloor
+
+	// Resolve the effective concurrency baseline. nil → system default; a value of
+	// 0 means "unlimited" (bypass the fairness gate). This is decoupled from the
+	// RPM gate below so unlimited concurrency does NOT disable RPM enforcement.
+	concValue := config.GetDefaultMaxConcurrency()
+	if keyConcurrency != nil {
+		concValue = *keyConcurrency
+	}
+	concUnlimited := concValue == 0
+	keyConcurrencyFloor := concValue
+
+	// firstAttempt: this Acquire is the client request's FIRST dispatch (no prior
+	// account excluded by a failover retry). The per-key RPM meter must count
+	// CLIENT REQUESTS, not upstream dispatch attempts — otherwise a request that
+	// fails over across K accounts would burn K RPM units and could even 429
+	// itself mid-failover. So the RPM gate + the per-key RPM tick both run only on
+	// the first attempt; retries are already-admitted work and skip both.
+	firstAttempt := len(excluded) == 0
+
+	// Per-key RPM ceiling (hard cap), enforced INDEPENDENTLY of the concurrency
+	// gate: only isAdmin keys bypass it. Effective cap comes from the key's own
+	// MaxRPM override else the system default (0 == unlimited on either level).
+	// Enforced BEFORE admission so a throttled key surfaces as 429 without
+	// occupying a slot.
+	if firstAttempt && keyID != "" && !isAdmin {
+		if cap := effectiveKeyRPMCap(keyID); cap > 0 {
+			p.schedMu.Lock()
+			cur := p.rpmKey[keyID]
+			used := 0
+			if cur != nil {
+				used = cur.sum(time.Now().Unix())
+			}
+			p.schedMu.Unlock()
+			if used >= cap {
+				return config.Account{}, nil, ErrTooBusy
+			}
+		}
 	}
 
 	p.schedMu.Lock()
-	if !p.admitLocked(keyID, keyConcurrencyFloor, isAdmin || unlimited, distinct) {
+	if !p.admitLocked(keyID, keyConcurrencyFloor, isAdmin || concUnlimited, distinct) {
 		p.schedMu.Unlock()
 		return config.Account{}, nil, ErrTooBusy
 	}
@@ -155,8 +192,10 @@ func (p *AccountPool) Acquire(keyID string, keyConcurrencyFloor int, isAdmin boo
 	p.inflightAcct[acct.ID]++
 	p.inflightAll++
 	nowSec := time.Now().Unix()
+	// Per-account RPM (observability) ticks on every dispatch, but the per-key RPM
+	// meter (which enforces the cap) ticks once per client request — see firstAttempt.
 	p.rpmTickLocked(p.rpmAcct, acct.ID, nowSec)
-	if keyID != "" {
+	if keyID != "" && firstAttempt {
 		p.rpmTickLocked(p.rpmKey, keyID, nowSec)
 	}
 	p.rpmAll.add(nowSec)
@@ -460,6 +499,25 @@ func (p *AccountPool) AccountRPM(id string) int {
 		return r.sum(now)
 	}
 	return 0
+}
+
+// effectiveKeyRPMCap resolves the requests-per-60s ceiling for a key under the
+// unified nullable semantics:
+//
+//	per-key MaxRPM nil → inherit the system default (config.GetDefaultMaxRPM)
+//	per-key MaxRPM 0   → unlimited
+//	per-key MaxRPM N   → that value
+//
+// A return of 0 means "no RPM gating" (unlimited).
+func effectiveKeyRPMCap(keyID string) int {
+	if e := config.GetApiKeyEntry(keyID); e != nil && e.MaxRPM != nil {
+		v := *e.MaxRPM
+		if v < 0 {
+			v = 0
+		}
+		return v // 0 == explicit per-key unlimited, N == that cap
+	}
+	return config.GetDefaultMaxRPM() // 0 == unlimited
 }
 
 // KeyRPM returns the approximate requests-in-the-last-60s for one API key (card).
