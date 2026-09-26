@@ -237,6 +237,16 @@ type Config struct {
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
+	// DefaultEffort is the effort tier injected into requests that carry no
+	// reasoning signal at all (no thinking field, no output_config.effort).
+	// The Kiro IDE agent flow sends neither — on the native backend reasoning is
+	// protocol-internal, so without a default those requests run unreasoned
+	// (~83% of tool-round requests in production logs produced zero thinking).
+	// Empty string = disabled (strict Anthropic semantics: no signal → no thinking).
+	// Valid tiers: low | medium | high | xhigh. ("max" is Kiro-native and is
+	// deliberately not settable here; resolveModelEffort clamps it per model.)
+	DefaultEffort string `json:"defaultEffort,omitempty"`
+
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
@@ -1400,6 +1410,41 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
 	return Save()
+}
+
+// GetDefaultEffort 返回无思考信号请求的默认 effort 注入档;空串=不注入。
+func GetDefaultEffort() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.DefaultEffort)
+}
+
+// UpdateDefaultEffort 设置无信号请求的默认 effort;空串=关闭注入。
+// 非法档位在这里就拒绝,避免存进配置后每次请求才被 resolveModelEffort 静默回退。
+// cfg 未加载(单测环境)时只改内存默认实例并跳过落盘,语义与 getter 的 nil 保护一致。
+func UpdateDefaultEffort(effort string) error {
+	effort = strings.TrimSpace(strings.ToLower(effort))
+	if effort != "" && !validEffortTiers[effort] {
+		return fmt.Errorf("invalid defaultEffort %q: must be one of low, medium, high, xhigh", effort)
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		// 单测/未加载环境:落一份内存实例,值语义与正常路径一致,只跳过落盘。
+		cfg = &Config{Accounts: []Account{}, DefaultEffort: effort}
+		return nil
+	}
+	cfg.DefaultEffort = effort
+	return Save()
+}
+
+// validEffortTiers 是 DefaultEffort 的合法档位。"max" 刻意不含:那是 Kiro 原生
+// 语义档,标准客户端没有对应表达,不作为全局默认开放。
+var validEffortTiers = map[string]bool{
+	"low": true, "medium": true, "high": true, "xhigh": true,
 }
 
 // GetPreferredEndpoint 获取首选端点配置

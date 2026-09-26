@@ -1107,6 +1107,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	// DefaultEffort:Kiro IDE agent 流量(不发 thinking、不发 effort)在原生后端思考是
+	// 协议内部的,兼容层上它等价于"永远不思考"(生产 fulllog:83% 工具轮零思考)。
+	// 配置了默认档时把这类请求视同显式 thinking:请求侧(<thinking_mode> 标签 +
+	// output_config.effort)与响应门一齐打开。显式 disabled 仍一票否决。
+	if !thinking && config.GetDefaultEffort() != "" &&
+		!(req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled")) {
+		thinking = true
+	}
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
@@ -1137,6 +1145,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 但响应门必须**额外**认 output_config.effort —— 原生 Kiro/插件默认 auto 档只发 effort,
 	// 若响应门只看 thinking,后端产出的思考会被整个丢弃(实测 effort-only=0 段思考)。
 	// 对齐旧 Rust 反代 `thinking_enabled = thinking.is_enabled() || output_config.is_some()`。
+	// DefaultEffort 打开的 thinking 已在上方并入,这里保持原判定即可。
 	forwardReasoning := thinking || claudeEffortRequested(&req)
 
 	// Stream or non-stream. r.Context() is threaded down to the upstream call so
@@ -5560,6 +5569,7 @@ func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 		"suffix":       cfg.Suffix,
 		"openaiFormat": cfg.OpenAIFormat,
 		"claudeFormat": cfg.ClaudeFormat,
+		"defaultEffort": config.GetDefaultEffort(),
 	})
 }
 
@@ -5569,6 +5579,9 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		Suffix       string `json:"suffix"`
 		OpenAIFormat string `json:"openaiFormat"`
 		ClaudeFormat string `json:"claudeFormat"`
+		// DefaultEffort 用指针:旧前端不认识该字段、提交时不带 → nil → 不动现值,
+		// 避免"面板保存一次就把默认档清空"。
+		DefaultEffort *string `json:"defaultEffort,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5593,6 +5606,14 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+
+	if req.DefaultEffort != nil {
+		if err := config.UpdateDefaultEffort(*req.DefaultEffort); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

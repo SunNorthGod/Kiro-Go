@@ -1004,7 +1004,7 @@ var reasoningEffortLevels = map[string]bool{
 
 // resolveReasoningEffort 解析 reasoning-schema 模型(GPT)的 effort:
 // 客户端显式关思考(thinking.type=="disabled")→ none;否则取 output_config.effort,
-// 缺省 high;非法档位回退 high。
+// 再 budget_tokens 映射;都缺省时取全局 DefaultEffort,未配置则 high;非法档位回退 high。
 func resolveReasoningEffort(req *ClaudeRequest) string {
 	if req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled") {
 		return "none"
@@ -1018,6 +1018,9 @@ func resolveReasoningEffort(req *ClaudeRequest) string {
 	// translation; resolveModelEffort then clamps it to the model's real tiers.
 	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
 		return budgetToEffort(req.Thinking.BudgetTokens)
+	}
+	if de := config.GetDefaultEffort(); de != "" {
+		return de
 	}
 	return "high"
 }
@@ -1118,6 +1121,12 @@ func buildAdditionalModelRequestFields(req *ClaudeRequest, thinking bool) map[st
 	kiroID := MapModel(req.Model)
 	modelLower := strings.ToLower(kiroID)
 
+	fields := buildAdditionalModelRequestFieldsInner(req, thinking, kiroID, modelLower)
+	logger.Debugf("[EffortInject] model=%s schemaPath=%s thinking=%v fields=%v", kiroID, resolveSchemaPath(kiroID), thinking, fields)
+	return fields
+}
+
+func buildAdditionalModelRequestFieldsInner(req *ClaudeRequest, thinking bool, kiroID, modelLower string) map[string]interface{} {
 	switch resolveSchemaPath(kiroID) {
 	case "reasoning":
 		// GPT reasoning schema 除 effort 外还带 mode(standard/pro)。支持该字段才发 mode。
@@ -1140,15 +1149,20 @@ func buildAdditionalModelRequestFields(req *ClaudeRequest, thinking bool) map[st
 			fields["thinking"] = map[string]interface{}{"type": "disabled"}
 		}
 
-		// effort 注入的判定:两类信号都算"请求思考",任一满足即注入(除非显式 disabled)。
+		// effort 注入的判定:三类信号都算"请求思考",任一满足即注入(除非显式 disabled)。
 		//   1) thinking bool —— 老路径:模型名带 -thinking 后缀,或 thinking.type=="enabled"。
 		//   2) 客户端直接带了 output_config.effort —— 这正是**原生 Kiro 自己的思考信号**:
 		//      Kiro 客户端(及对齐它的插件)默认 auto 档**只发** output_config.effort,既不发
 		//      thinking 字段、模型名也不带后缀。此前只认 thinking bool → 这份 effort 被整个丢弃,
 		//      Claude effort 家族(opus-4.8 等)后端收不到任何思考指令,导致"完全不思考"。
-		// 注入时统一走 resolveReasoningEffort 校验(非法档位回退 high),不再直接透传未校验的 effort。
+		//   3) 全局 DefaultEffort 已配置 —— Kiro IDE 的 agent 流量(实测 219 条,23 工具多轮)
+		//      thinking/output_config 全都不发:原生后端里思考是协议内部的,客户端无需表达。
+		//      在 Anthropic 兼容层上这等价于"永远不思考"(生产 fulllog:83% 工具轮零思考)。
+		//      DefaultEffort 补上这个位,对齐原版 Kiro 的"始终有思考"体验;空串=关闭,退回
+		//      严格 Anthropic 语义(无信号→不思考)。档位统一过 resolveModelEffort 按模型收敛。
 		hasExplicitEffort := req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != ""
-		if !disabled && (thinking || hasExplicitEffort) {
+		defaultEffortOn := config.GetDefaultEffort() != ""
+		if !disabled && (thinking || hasExplicitEffort || defaultEffortOn) {
 			fields["output_config"] = map[string]interface{}{"effort": resolveModelEffort(req, kiroID)}
 		}
 
