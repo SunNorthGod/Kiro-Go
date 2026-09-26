@@ -9,16 +9,23 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"kiro-go/logger"
 )
 
 const defaultPromptCacheTTL = 5 * time.Minute
 
-// Anthropic requires cached prefixes to reach a minimum token count before
-// caching takes effect. Breakpoints below this threshold are excluded from
-// matching and storage to avoid reporting unrealistic 100% cache hits on
-// short requests.
+// The local simulation never sends cache_control upstream, so Anthropic's
+// "minimum cacheable prefix" API limits (2048/4096) do NOT apply here — those
+// gate an API feature; this tracker only records repeat prefixes for the usage
+// panels. The threshold therefore lives in the ESTIMATED token space (the same
+// estimateApproxTokens space the breakpoints are compared in) and is kept small:
+// its only job is to skip bookkeeping for trivially short prompts. The former
+// opus-specific 4096 threshold was a category error: the estimate runs ~15%
+// below real tokenizer counts, so real ~4.5k-token opus prefixes estimated
+// under 4096 and NEVER hit — measured 0/5 on production with a 7.6k-token
+// (real) prefix.
 const defaultMinCacheableTokens = 1024
-const opusMinCacheableTokens = 4096
 
 type promptCacheUsage struct {
 	CacheCreationInputTokens   int
@@ -39,11 +46,7 @@ type promptCacheProfile struct {
 	Model            string
 }
 
-func minCacheableTokensForModel(model string) int {
-	lower := strings.ToLower(model)
-	if strings.Contains(lower, "opus") {
-		return opusMinCacheableTokens
-	}
+func minCacheableTokensForModel(string) int {
 	return defaultMinCacheableTokens
 }
 
@@ -161,6 +164,11 @@ func buildPromptCacheProfile(blocks []cacheablePromptBlock, totalInputTokens int
 // read+creation <= TotalInputTokens and 5m+1h == creation.
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+		bps := 0
+		if profile != nil {
+			bps = len(profile.Breakpoints)
+		}
+		logger.Debugf("[CacheProbe] compute skip: nilT=%v nilProfile=%v bps=%d acctEmpty=%v", t == nil, profile == nil, bps, accountID == "")
 		return promptCacheUsage{}
 	}
 
@@ -168,6 +176,7 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
 	lastTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
 	if lastTokens < minTokens {
+		logger.Debugf("[CacheProbe] compute skip small: lastTokens=%d min=%d", lastTokens, minTokens)
 		return promptCacheUsage{}
 	}
 	now := time.Now()
@@ -207,6 +216,11 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 
 func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+		bps := 0
+		if profile != nil {
+			bps = len(profile.Breakpoints)
+		}
+		logger.Debugf("[CacheProbe] update skip: nilT=%v nilProfile=%v bps=%d acctEmpty=%v", t == nil, profile == nil, bps, accountID == "")
 		return
 	}
 

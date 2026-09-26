@@ -158,7 +158,7 @@ function OverviewBody({ d, samples }: { d: Overview; samples: { rpm: number[]; t
         <Kpi
           icon={<DatabaseZap />}
           tone="teal"
-          label={`缓存命中率 · ${pc.windowDays || 7} 天`}
+          label={pc.windowDays ? `缓存命中率 · ${pc.windowDays} 天` : '缓存命中率 · 累计'}
           value={typeof pc.hitRate === 'number' ? <AnimatedNumber value={pc.hitRate * 100} format={(v) => v.toFixed(1)} /> : '—'}
           unit={typeof pc.hitRate === 'number' ? '%' : undefined}
         >

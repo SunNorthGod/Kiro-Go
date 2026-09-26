@@ -234,20 +234,18 @@ func (h *Handler) overviewPromptCache() map[string]interface{} {
 }
 
 // computePromptCacheBlock builds the deployment-wide prompt-cache stats block
-// over a RECENT WINDOW (last 7 days), computed from the display-only
-// usage_records log rather than the lifetime billing ledger. This reflects
-// CURRENT cache behaviour so a large historical base of un-cached input can't
-// peg the number low forever. hitRate is null when there's no input in the
-// window (the UI shows a dash rather than a misleading 0%). DB mode only; in
-// JSON mode the zero-value block is returned as before.
+// over ALL HISTORY (owner decision 2026-09-27: drop the 7-day window, operators
+// reconcile this number against the lifetime billing ledger). Computed from the
+// display-only usage_records log; hitRate is null when there's no input at all
+// (the UI shows a dash rather than a misleading 0%). DB mode only; in JSON mode
+// the zero-value block is returned as before.
 func (h *Handler) computePromptCacheBlock() map[string]interface{} {
-	const cacheWindowDays = 7
-	promptCache := map[string]interface{}{"hitRate": nil, "readTokens": 0, "creationTokens": 0, "inputTokens": 0, "windowDays": cacheWindowDays}
+	// windowDays 0 = lifetime aggregate; the UI labels the KPI "累计".
+	promptCache := map[string]interface{}{"hitRate": nil, "readTokens": 0, "creationTokens": 0, "inputTokens": 0, "windowDays": 0}
 	if pool := config.DatabasePool(); pool != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		since := time.Now().Unix() - int64(cacheWindowDays)*86400
-		if gs, err := db.GetRecentCacheStats(ctx, pool, since); err == nil {
+		if gs, err := db.GetRecentCacheStats(ctx, pool, 0); err == nil {
 			promptCache["readTokens"] = gs.CacheReadTokens
 			promptCache["creationTokens"] = gs.CacheCreationTokens
 			promptCache["inputTokens"] = gs.InputTokens
