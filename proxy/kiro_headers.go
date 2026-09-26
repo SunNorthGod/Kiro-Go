@@ -5,6 +5,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -57,8 +58,22 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 }
 
 func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kiroHeaderValues) {
-	if account != nil && account.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+	token := accountBearerToken(account)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	// Kiro requires external identity-provider access tokens and API keys to be
+	// identified explicitly. Keep this in the shared header path so streaming
+	// and REST requests cannot drift apart.
+	req.Header.Del("TokenType")
+	req.Header.Del("tokentype")
+	if account != nil {
+		if config.IsAPIKeyAccount(account) {
+			// Upstream accepts either casing; CLI captures use lowercase "tokentype".
+			req.Header.Set("tokentype", "API_KEY")
+		} else if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+			req.Header.Set("TokenType", "EXTERNAL_IDP")
+		}
 	}
 	req.Header.Set("User-Agent", values.UserAgent)
 	req.Header.Set("x-amz-user-agent", values.AmzUserAgent)
@@ -93,4 +108,18 @@ func applyAuthTypeHeaders(req *http.Request, account *config.Account) {
 	case auth.IsApiKeyAccount(account):
 		req.Header[tokenTypeHeaderLower] = []string{auth.KiroApiKeyTokenTypeValue}
 	}
+}
+
+// accountBearerToken returns the token used for Authorization: Bearer.
+// API Key accounts prefer KiroApiKey; OAuth accounts use AccessToken.
+func accountBearerToken(account *config.Account) string {
+	if account == nil {
+		return ""
+	}
+	if config.IsAPIKeyAccount(account) {
+		if key := strings.TrimSpace(account.KiroApiKey); key != "" {
+			return key
+		}
+	}
+	return strings.TrimSpace(account.AccessToken)
 }

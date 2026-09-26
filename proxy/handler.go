@@ -27,18 +27,41 @@ const tokenRefreshSkewSeconds int64 = 120
 // prevent memory exhaustion from oversized payloads.
 const maxAPIBodyBytes = 32 << 20
 
+const (
+	microsoftProfileSelectionTTL          = 10 * time.Minute
+	microsoftMaxPendingProfileSelections  = 64
+	microsoftCanceledSessionTTL           = 10 * time.Minute
+	microsoftMaxCanceledSessionTombstones = 128
+	microsoftProfileDiscoveryTimeout      = 30 * time.Second
+)
+
+// looksLikeKiroAPIKey is a lightweight heuristic for plain-text imports.
+// Official keys currently use the ksk_ prefix; future formats can still be
+// imported via explicit authMethod/kiroApiKey fields.
+func looksLikeKiroAPIKey(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	// Convenience form: ksk_xxx|region
+	if idx := strings.IndexByte(value, '|'); idx > 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return strings.HasPrefix(value, "ksk_")
+}
+
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -79,6 +102,7 @@ type Handler struct {
 	// account id; entries are created on demand and kept (bounded by account count).
 	tokenRefreshMu    sync.Mutex // guards the tokenRefreshLocks map only
 	tokenRefreshLocks map[string]*sync.Mutex
+	credentialImportMu sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -94,6 +118,26 @@ type Handler struct {
 	// 统计落盘去抖:记录上次已持久化的计数快照,无变化时跳过 30s 定时写(避免空转重写整份配置文件)。
 	lastSavedStats savedStatsSnapshot
 	lastSavedMu    sync.Mutex
+
+	microsoftSelections   map[string]*microsoftProfileSelection
+	microsoftSelectionsMu sync.Mutex
+	microsoftFlowMu       sync.Mutex
+	microsoftCanceled     map[string]time.Time
+	microsoftDiscoveries  map[string]*microsoftProfileDiscovery
+}
+
+type microsoftProfileSelection struct {
+	SessionID string
+	Account   config.Account
+	Profiles  []KiroProfile
+	ExpiresAt time.Time
+	timer     *time.Timer
+	mu        sync.Mutex
+	canceled  atomic.Bool
+}
+
+type microsoftProfileDiscovery struct {
+	cancel context.CancelFunc
 }
 
 type thinkingStreamSource int
@@ -282,6 +326,9 @@ func NewHandler() *Handler {
 		stopStatsSaver:    make(chan struct{}),
 		promptCache:       newPromptCacheTracker(defaultPromptCacheTTL),
 		tokenRefreshLocks: make(map[string]*sync.Mutex),
+		microsoftSelections:  make(map[string]*microsoftProfileSelection),
+		microsoftCanceled:    make(map[string]time.Time),
+		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -345,28 +392,22 @@ func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		if !account.Enabled {
+			continue
+		}
+		if accountBearerToken(account) == "" {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				h.handleAccountFailure(account, err)
-				continue
-			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
-			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
+		// API Key accounts skip OAuth refresh; still sync usage/subscription.
+		if !config.IsAPIKeyAccount(account) {
+			// 检查 token 是否需要刷新
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				if _, err := h.refreshAccountToken(account, false); err != nil {
+					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+					h.handleAccountFailure(account, err)
+					continue
+				}
 			}
 		}
 
@@ -1040,6 +1081,22 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
+	apiKeyID := apiKeyIDFromContext(r.Context())
+
+	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
+	if hasWebSearchTool(&req) {
+		h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID)
+		return
+	}
+
+	// Mixed tools including native web_search: agentic loop digests web_search internally
+	// and returns client tool_use blocks as-is.
+	if hasWebSearchAmongTools(&req) {
+		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
+		h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
+		return
+	}
+
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
@@ -1052,12 +1109,63 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream. r.Context() is threaded down to the upstream call so
 	// a client disconnect cancels the upstream request (see CallKiroAPI).
-	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
 		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
 		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, forwardReasoning, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
+}
+
+// runKiroWithSelfHealAndIntegrity 是 runKiroWithIntegrityRetry(#143/#146 上游)的本地
+// 适配版:重试预算/完整性分类/返回契约与它完全一致,仅把内层调用换成
+// callKiroWithSelfHeal(本地:可自愈 400 剥字段后同账号重试一次)。两条重试链正交组合:
+// self-heal 管"请求校验期 400",integrity 管"传输成功但流被截断/为空"。
+func runKiroWithSelfHealAndIntegrity(
+	ctx context.Context,
+	account *config.Account,
+	payload *KiroPayload,
+	callback *KiroStreamCallback,
+	measure func() (contentChars, toolCount int, stopReason string, sawReasoning bool),
+	reset func(),
+	canRetry func() bool,
+) error {
+	for attempt := 0; attempt <= maxSameAccountStreamRetries; attempt++ {
+		if attempt > 0 && reset != nil {
+			reset()
+		}
+
+		err := callKiroWithSelfHeal(ctx, account, payload, callback)
+		if err != nil {
+			return err
+		}
+
+		contentChars, toolCount, stopReason, sawReasoning := measure()
+		integrityErr := classifyStreamIntegrity(contentChars, toolCount, stopReason, sawReasoning)
+		if integrityErr == nil {
+			return nil
+		}
+
+		// A canceled client is not an integrity failure: the turn is over and
+		// reissuing it would only burn upstream quota.
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		retryable := canRetry == nil || canRetry()
+		if retryable && attempt < maxSameAccountStreamRetries {
+			logger.Warnf("[StreamIntegrity] %v on %s; retrying same account (%d/%d)",
+				integrityErr, account.Email, attempt+1, maxSameAccountStreamRetries)
+			continue
+		}
+		if !retryable {
+			// Bytes already reached the client; reissuing would duplicate output.
+			logger.Warnf("[StreamIntegrity] %v after client flush; signaling error (no retry)", integrityErr)
+		} else {
+			logger.Warnf("[StreamIntegrity] giving up after retries: %v", integrityErr)
+		}
+		return integrityErr
+	}
+	return errUpstreamTruncatedResponse
 }
 
 // handleClaudeStream Claude 流式响应
@@ -1189,6 +1297,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		var contextFull bool
 		var outputTruncated bool
 		var toolUses []KiroToolUse
+		var upstreamStopReason string
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1567,9 +1676,40 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				meteringCacheRead, meteringCacheCreation = read, creation
 				hasCacheMetering = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
+		// #143/#146(上游并入): measure/reset 供完整性重试使用 —— 传输成功但流被截断
+		// (有内容无终止信号)时同账号有界重试;reset 清掉所有累加器与 thinking 标签
+		// 解析状态(processClaudeText 至多缓冲 50 rune,短截断尝试可能留下半个标签,
+		// 不清会拼到重试的首个 chunk 前)。
+		measure := func() (int, int, string, bool) {
+			return rawContentBuilder.Len(), len(toolUses), upstreamStopReason, rawThinkingBuilder.Len() > 0
+		}
+
+		reset := func() {
+			rawContentBuilder.Reset()
+			rawThinkingBuilder.Reset()
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+			textBuffer = ""
+			inThinkingBlock = false
+			dropTagThinking = false
+			thinkingSource = thinkingSourceUnknown
+			thinkingStarted = false
+			eventThinkingOpen = false
+		}
+
+		// 同账号完整性重试仅在未向客户端发出任何内容事件前进行(messageStarted 为栅栏);
+		// commitStream 已提交 200 头的窗口不重试,保持本地既有护栏语义。
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset,
+			func() bool { return !messageStarted })
 		if err != nil {
 			// Client disconnected: the error is just our own cancellation, not an
 			// account fault. Release and return silently — no exclude/retry, no
@@ -1584,7 +1724,10 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(&account, err)
+			}
 			// 换号重跑的护栏必须用 streamCommitted(200 头已 flush)而非 messageStarted
 			// (首个内容事件)。二者之间存在窗口:上游已返回 2xx、commitStream 已提交 200
 			// 并启动心跳、但尚未吐首个 delta。此时若换号重跑,第二轮内容会续在同一个已
@@ -1653,6 +1796,14 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := resolveClaudeStopReason(len(toolUses) > 0, contextFull, inputTokens, model)
+		// #145(上游): 上游显式下发的 stop_reason 优先于本地推断(空/未知仍走本地推断);
+		// tool_use 恒为最高优先,不受覆盖。
+		if len(toolUses) == 0 {
+			switch mapped := mapClaudeStopReason(upstreamStopReason, 0); mapped {
+			case "max_tokens", "model_context_window_exceeded", "refusal", "stop_sequence", "pause_turn":
+				stopReason = mapped
+			}
+		}
 		if outputTruncated && len(toolUses) == 0 {
 			stopReason = "max_tokens" // output-cap truncation surfaced via OnException
 		}
@@ -2057,6 +2208,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		// #5: 收集上游原生思考签名(reasoningContentEvent.signature),用于给非流式
 		// 响应的 thinking 块透传真实签名(与流式 emitSignatureDelta 对齐)。
 		var nativeSignature string
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2088,9 +2240,29 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				meteringCacheRead, meteringCacheCreation = read, creation
 				hasCacheMetering = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, thinkingContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			thinkingContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output.
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset, nil)
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
@@ -2103,7 +2275,10 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(&account, err)
+			}
 			if isRequestShapeErrorMessage(err.Error()) {
 				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
 			}
@@ -2169,7 +2344,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
 		// #5: 给非流式 thinking 块透传上游真实签名(provenance 包装,与流式
 		// emitSignatureDelta 的 wrapProvenanceSignature 完全对齐)。仅当上游确实下发了
 		// 真实签名、且响应确实含 thinking 块(default 格式,未并进正文)时设置;无签名
@@ -2177,8 +2352,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		// SelfHeal"的语义)。provenance 标记使下一轮回传的签名可判定同账号(保留)/
 		// 跨账号(applyThinkingProvenance 剥离),不引入跨账号回放 400 风险。
 		applyResponseThinkingSignature(resp.Content, nativeSignature, account.ID)
-		// 上下文写满时用更准确的 stop_reason(否则恒 end_turn/tool_use)。
-		resp.StopReason = resolveClaudeStopReason(len(toolUses) > 0, false, inputTokens, model)
+		// stop_reason 已由 KiroToClaudeResponse 内部按上游真实值映射(#145),
+		// 取代本地旧的 resolveClaudeStopReason 推断。
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2350,6 +2525,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
+		var upstreamStopReason string
 		var toolCalls []ToolCall
 		var toolCallIndex int
 		var inputTokens, outputTokens int
@@ -2390,6 +2566,17 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			}
 			data, _ := json.Marshal(roleChunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+		}
+
+		sendStreamError := func(err error) {
+			data, _ := json.Marshal(map[string]interface{}{
+				"error": map[string]string{
+					"message": err.Error(),
+					"type":    "server_error",
+				},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 
@@ -2651,6 +2838,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
 				outputTokens = outTok
@@ -2673,7 +2863,35 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			},
 		}
 
-		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
+		// #143/#146(上游并入): measure/reset 供完整性重试使用 —— 传输成功但流被截断
+		// (有内容无终止信号)时同账号有界重试;reset 清掉所有累加器与 thinking 标签
+		// 解析状态(processText 至多缓冲 50 rune,短截断尝试可能留下半个标签,
+		// 不清会拼到重试的首个 chunk 前)。
+		measure := func() (int, int, string, bool) {
+			return rawContentBuilder.Len(), len(toolCalls), upstreamStopReason, rawReasoningBuilder.Len() > 0
+		}
+
+		reset := func() {
+			rawContentBuilder.Reset()
+			rawReasoningBuilder.Reset()
+			toolCalls = nil
+			toolCallIndex = 0
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+			textBuffer = ""
+			inThinkingBlock = false
+			dropTagThinking = false
+			thinkingSource = thinkingSourceUnknown
+			thinkingStarted = false
+			eventThinkingOpen = false
+		}
+
+		// 同账号完整性重试仅在 commitStream 之前进行(200 头未 flush;保持本地护栏语义)。
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset,
+			func() bool { return !streamCommitted })
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
@@ -2686,8 +2904,11 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
-			// 护栏用 streamCommitted(200 已 flush)而非 responseStarted(首个 chunk):
+			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(&account, err)
+			}
+			// 护栏用 streamCommitted(200 已 flush)而非首个 chunk:
 			// 二者间存在窗口,commit 后换号重跑会让第二轮内容续在同一个流里 →"答两遍"。
 			// commit 之后一律收尾,只有 commit 之前才允许静默换号重试。
 			if !streamCommitted {
@@ -2697,6 +2918,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				continue
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
+			sendStreamError(err)
 			return
 		}
 
@@ -2744,8 +2966,15 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		releaseSlot()
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
-
 		finishReason := openAIFinishReason(len(toolCalls) > 0, false, inputTokens, model)
+		// #145(上游): 上游显式下发的 stop_reason 优先于本地推断(空/未知仍走本地推断);
+		// tool_calls 恒为最高优先,不受覆盖。
+		if len(toolCalls) == 0 {
+			switch mapped := mapOpenAIFinishReason(upstreamStopReason, 0); mapped {
+			case "length", "content_filter":
+				finishReason = mapped
+			}
+		}
 		if outputTruncated && len(toolCalls) == 0 {
 			finishReason = "length" // output-cap truncation surfaced via OnException
 		}
@@ -2848,6 +3077,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		var realInputTokens int
 		var meteringCacheRead, meteringCacheCreation int
 		var hasCacheMetering bool
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2867,9 +3097,29 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 				meteringCacheRead, meteringCacheCreation = read, creation
 				hasCacheMetering = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			reasoningContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output.
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset, nil)
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
@@ -2882,7 +3132,10 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(&account, err)
+			}
 			if isRequestShapeErrorMessage(err.Error()) {
 				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
 			}
@@ -2928,7 +3181,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, cacheUsage)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason, cacheUsage)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -2987,10 +3240,14 @@ func (h *Handler) accountRefreshLock(id string) *sync.Mutex {
 	return mu
 }
 
-// ensureValidToken 确保 token 有效
-func (h *Handler) ensureValidToken(account *config.Account) error {
-	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
-		return nil
+// refreshAccountToken serializes the complete refresh-token rotation lifecycle:
+// load the latest persisted credential, refresh it, persist any rotation, and
+// only then publish it to the runtime pool.
+// 本地魔改:锁粒度从上游的全局单锁改为按账号串行(accountRefreshLock)——
+// 慢刷新只阻塞同账号请求,不阻塞其它账号。
+func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool, error) {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return false, fmt.Errorf("account is required for token refresh")
 	}
 
 	// Serialize refreshes for THIS account only, so a slow refresh of one account
@@ -2999,38 +3256,99 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Another concurrent request may have refreshed this account while we waited.
-	if latest := h.pool.GetByID(account.ID); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-		if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
-			return nil
+	var latest *config.Account
+	accounts := config.GetAccounts()
+	for i := range accounts {
+		if accounts[i].ID == account.ID {
+			latest = &accounts[i]
+			break
 		}
 	}
+	if latest == nil {
+		return false, fmt.Errorf("account %s no longer exists", account.ID)
+	}
+	working := *latest
 
-	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(account)
+	// API Key credentials never expire and cannot be OAuth-refreshed.
+	if config.IsAPIKeyAccount(&working) {
+		token := strings.TrimSpace(working.KiroApiKey)
+		if token == "" {
+			token = strings.TrimSpace(working.AccessToken)
+		}
+		if token == "" {
+			return false, fmt.Errorf("account %s has no kiroApiKey", working.ID)
+		}
+		h.pool.UpdateCredentialState(
+			account,
+			working.ID,
+			token,
+			"",
+			0,
+			"",
+		)
+		return false, nil
+	}
+
+	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-tokenRefreshSkewSeconds) {
+		h.pool.UpdateCredentialState(
+			account,
+			working.ID,
+			working.AccessToken,
+			working.RefreshToken,
+			working.ExpiresAt,
+			working.ProfileArn,
+		)
+		return false, nil
+	}
+	if strings.TrimSpace(working.RefreshToken) == "" {
+		return false, fmt.Errorf("account %s has no refresh token", working.ID)
+	}
+
+	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(&working)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if refreshToken == "" {
+		refreshToken = working.RefreshToken
 	}
 
-	// 更新内存
-	h.pool.UpdateToken(account.ID, accessToken, refreshToken, expiresAt)
-	account.AccessToken = accessToken
-	if refreshToken != "" {
-		account.RefreshToken = refreshToken
-	}
-	account.ExpiresAt = expiresAt
-	if profileArn != "" {
-		account.ProfileArn = profileArn
-		config.UpdateAccountProfileArn(account.ID, profileArn)
+	if err := config.UpdateAccountCredentialState(
+		working.ID,
+		accessToken,
+		refreshToken,
+		expiresAt,
+		profileArn,
+	); err != nil {
+		return false, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, err)
 	}
 
-	// 持久化
-	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
+	// Do not expose a rotated credential through the pool until persistence has
+	// succeeded. This ordering prevents a later refresh from reading stale state.
+	h.pool.UpdateCredentialState(
+		account,
+		working.ID,
+		accessToken,
+		refreshToken,
+		expiresAt,
+		profileArn,
+	)
+	return true, nil
+}
 
-	return nil
+// ensureValidToken 确保 token 有效
+func (h *Handler) ensureValidToken(account *config.Account) error {
+	if config.IsAPIKeyAccount(account) {
+		if accountBearerToken(account) == "" {
+			return fmt.Errorf("account %s has no kiroApiKey", account.ID)
+		}
+		return nil
+	}
+	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+		return nil
+	}
+
+	_, err := h.refreshAccountToken(account, false)
+	return err
 }
 
 // ==================== 管理 API ====================
@@ -3101,6 +3419,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartIamSso(w, r)
 	case path == "/auth/iam-sso/complete" && r.Method == "POST":
 		h.apiCompleteIamSso(w, r)
+	case path == "/auth/microsoft-sso/start" && r.Method == "POST":
+		h.apiStartMicrosoftSSO(w, r)
+	case path == "/auth/microsoft-sso/complete" && r.Method == "POST":
+		h.apiCompleteMicrosoftSSO(w, r)
+	case path == "/auth/microsoft-sso/select-profile" && r.Method == "POST":
+		h.apiSelectMicrosoftSSOProfile(w, r)
+	case path == "/auth/microsoft-sso/cancel" && r.Method == "POST":
+		h.apiCancelMicrosoftSSO(w, r)
 	case path == "/auth/builderid/start" && r.Method == "POST":
 		h.apiStartBuilderIdLogin(w, r)
 	case path == "/auth/builderid/poll" && r.Method == "POST":
@@ -3602,6 +3928,505 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) apiStartMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
+	sessionID, authorizeURL, expiresIn, err := auth.StartMicrosoftSSOLogin()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":    sessionID,
+		"authorizeUrl": authorizeURL,
+		"expiresIn":    expiresIn,
+		"stage":        "kiro",
+	})
+}
+
+func (h *Handler) apiCompleteMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		CallbackURL string `json:"callbackUrl"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.CallbackURL) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and callbackUrl are required"})
+		return
+	}
+
+	progress, err := auth.ContinueMicrosoftSSOLogin(req.SessionID, req.CallbackURL)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if h.microsoftSessionCanceled(req.SessionID) {
+		auth.CancelMicrosoftSSOLogin(req.SessionID)
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	if progress.AuthorizationURL != "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"stage":        "microsoft",
+			"authorizeUrl": progress.AuthorizationURL,
+		})
+		return
+	}
+	if progress.Result == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft SSO returned no credential"})
+		return
+	}
+
+	result := progress.Result
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		UserId:        result.UserID,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    auth.MicrosoftSSOAuthMethod,
+		Provider:      auth.MicrosoftSSOProvider,
+		Region:        "us-east-1",
+		ExpiresAt:     result.ExpiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerUrl:     result.IssuerURL,
+		Scopes:        result.Scopes,
+	}
+
+	discoveryContext, discovery, ok := h.beginMicrosoftProfileDiscovery(r.Context(), req.SessionID)
+	if !ok {
+		clearMicrosoftAccountCredential(&account)
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	profiles, profileErr := DiscoverKiroProfilesContext(discoveryContext, &account)
+	discoveryErr := discoveryContext.Err()
+	h.endMicrosoftProfileDiscovery(req.SessionID, discovery)
+
+	h.microsoftFlowMu.Lock()
+	if h.microsoftSessionCanceledLocked(req.SessionID, time.Now()) {
+		h.microsoftFlowMu.Unlock()
+		clearMicrosoftAccountCredential(&account)
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	if discoveryErr != nil {
+		h.microsoftFlowMu.Unlock()
+		clearMicrosoftAccountCredential(&account)
+		w.WriteHeader(http.StatusGatewayTimeout)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft profile discovery was canceled or timed out"})
+		return
+	}
+	if len(profiles) > 1 {
+		selectionID, expiredSelections, err := h.storeMicrosoftProfileSelection(req.SessionID, account, profiles)
+		h.microsoftFlowMu.Unlock()
+		discardDetachedMicrosoftProfileSelections(expiredSelections)
+		if err != nil {
+			clearMicrosoftAccountCredential(&account)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":                  true,
+			"stage":                    "profile",
+			"requiresProfileSelection": true,
+			"selectionId":              selectionID,
+			"profiles":                 profiles,
+		})
+		return
+	}
+	if len(profiles) == 1 {
+		account.ProfileArn = profiles[0].ARN
+	}
+	if err := config.AddAccount(account); err != nil {
+		h.microsoftFlowMu.Unlock()
+		h.writeAddAccountError(w, err)
+		return
+	}
+	delete(h.microsoftCanceled, strings.TrimSpace(req.SessionID))
+	h.microsoftFlowMu.Unlock()
+	h.pool.Reload()
+
+	response := map[string]interface{}{
+		"success": true,
+		"stage":   "complete",
+		"account": map[string]interface{}{"id": account.ID, "email": account.Email},
+	}
+	if profileErr != nil {
+		response["warning"] = "The account was added, but its Kiro profile could not be resolved yet"
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+func (h *Handler) apiSelectMicrosoftSSOProfile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SelectionID string `json:"selectionId"`
+		ProfileARN  string `json:"profileArn"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	selectionID := strings.TrimSpace(req.SelectionID)
+	selection := h.getMicrosoftProfileSelection(selectionID)
+	if selection == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft profile selection not found or expired"})
+		return
+	}
+
+	selection.mu.Lock()
+	if selection.canceled.Load() || !time.Now().Before(selection.ExpiresAt) {
+		selection.mu.Unlock()
+		h.removeMicrosoftProfileSelection(selectionID, selection)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft profile selection not found or expired"})
+		return
+	}
+
+	profileARN := strings.TrimSpace(req.ProfileARN)
+	allowed := false
+	for _, profile := range selection.Profiles {
+		if profile.ARN == profileARN {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		selection.mu.Unlock()
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Selected Kiro profile was not offered for this login"})
+		return
+	}
+
+	account := selection.Account
+	account.ProfileArn = profileARN
+	h.microsoftFlowMu.Lock()
+	now := time.Now()
+	if selection.canceled.Load() ||
+		!now.Before(selection.ExpiresAt) ||
+		h.microsoftSessionCanceledLocked(selection.SessionID, now) {
+		h.microsoftFlowMu.Unlock()
+		h.detachMicrosoftProfileSelection(selectionID, selection)
+		selection.canceled.Store(true)
+		selection.Account = config.Account{}
+		selection.Profiles = nil
+		selection.mu.Unlock()
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	if err := config.AddAccount(account); err != nil {
+		h.microsoftFlowMu.Unlock()
+		selection.mu.Unlock()
+		h.writeAddAccountError(w, err)
+		return
+	}
+	h.detachMicrosoftProfileSelection(selectionID, selection)
+	selection.canceled.Store(true)
+	selection.Account = config.Account{}
+	selection.Profiles = nil
+	delete(h.microsoftCanceled, selection.SessionID)
+	h.microsoftFlowMu.Unlock()
+	selection.mu.Unlock()
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"stage":   "complete",
+		"account": map[string]interface{}{"id": account.ID, "email": account.Email},
+	})
+}
+
+func (h *Handler) apiCancelMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		SelectionID string `json:"selectionId"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	selectionID := strings.TrimSpace(req.SelectionID)
+	if sessionID == "" && selectionID != "" {
+		if selection := h.getMicrosoftProfileSelection(selectionID); selection != nil {
+			sessionID = selection.SessionID
+		}
+	}
+	if sessionID != "" {
+		h.markMicrosoftSessionCanceled(sessionID)
+	}
+	auth.CancelMicrosoftSSOLogin(sessionID)
+	if selectionID != "" {
+		h.removeMicrosoftProfileSelection(selectionID, nil)
+	}
+	if sessionID != "" {
+		h.removeMicrosoftProfileSelectionsForSession(sessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) storeMicrosoftProfileSelection(
+	sessionID string,
+	account config.Account,
+	profiles []KiroProfile,
+) (string, []*microsoftProfileSelection, error) {
+	now := time.Now()
+	expiresAt := now.Add(microsoftProfileSelectionTTL)
+	tokenExpiry := time.Unix(account.ExpiresAt, 0)
+	if account.ExpiresAt > 0 && tokenExpiry.Before(expiresAt) {
+		expiresAt = tokenExpiry
+	}
+	if !expiresAt.After(now) {
+		return "", nil, fmt.Errorf("Microsoft credential expired before profile selection")
+	}
+	selectionID := uuid.NewString()
+	selection := &microsoftProfileSelection{
+		SessionID: strings.TrimSpace(sessionID),
+		Account:   account,
+		Profiles:  append([]KiroProfile(nil), profiles...),
+		ExpiresAt: expiresAt,
+	}
+	var expired []*microsoftProfileSelection
+
+	h.microsoftSelectionsMu.Lock()
+	if h.microsoftSelections == nil {
+		h.microsoftSelections = make(map[string]*microsoftProfileSelection)
+	}
+	for id, current := range h.microsoftSelections {
+		if !now.Before(current.ExpiresAt) {
+			delete(h.microsoftSelections, id)
+			current.canceled.Store(true)
+			if current.timer != nil {
+				current.timer.Stop()
+				current.timer = nil
+			}
+			expired = append(expired, current)
+		}
+	}
+	if len(h.microsoftSelections) >= microsoftMaxPendingProfileSelections {
+		h.microsoftSelectionsMu.Unlock()
+		return "", expired, fmt.Errorf("too many pending Microsoft profile selections; cancel one and try again")
+	}
+	h.microsoftSelections[selectionID] = selection
+	selection.timer = time.AfterFunc(time.Until(expiresAt), func() {
+		h.removeMicrosoftProfileSelection(selectionID, selection)
+	})
+	h.microsoftSelectionsMu.Unlock()
+	return selectionID, expired, nil
+}
+
+func (h *Handler) getMicrosoftProfileSelection(selectionID string) *microsoftProfileSelection {
+	if selectionID == "" {
+		return nil
+	}
+	h.microsoftSelectionsMu.Lock()
+	selection := h.microsoftSelections[selectionID]
+	if selection != nil && !time.Now().Before(selection.ExpiresAt) {
+		delete(h.microsoftSelections, selectionID)
+		selection.canceled.Store(true)
+		if selection.timer != nil {
+			selection.timer.Stop()
+			selection.timer = nil
+		}
+		h.microsoftSelectionsMu.Unlock()
+		discardDetachedMicrosoftProfileSelection(selection)
+		return nil
+	}
+	h.microsoftSelectionsMu.Unlock()
+	return selection
+}
+
+func (h *Handler) detachMicrosoftProfileSelection(
+	selectionID string,
+	expected *microsoftProfileSelection,
+) *microsoftProfileSelection {
+	selectionID = strings.TrimSpace(selectionID)
+	if selectionID == "" {
+		return nil
+	}
+	h.microsoftSelectionsMu.Lock()
+	current := h.microsoftSelections[selectionID]
+	if current != nil && (expected == nil || current == expected) {
+		delete(h.microsoftSelections, selectionID)
+		current.canceled.Store(true)
+		if current.timer != nil {
+			current.timer.Stop()
+			current.timer = nil
+		}
+	} else {
+		current = nil
+	}
+	h.microsoftSelectionsMu.Unlock()
+	return current
+}
+
+func (h *Handler) removeMicrosoftProfileSelection(selectionID string, expected *microsoftProfileSelection) {
+	if selection := h.detachMicrosoftProfileSelection(selectionID, expected); selection != nil {
+		discardDetachedMicrosoftProfileSelection(selection)
+	}
+}
+
+func (h *Handler) removeMicrosoftProfileSelectionsForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	var removed []*microsoftProfileSelection
+	h.microsoftSelectionsMu.Lock()
+	for selectionID, selection := range h.microsoftSelections {
+		if selection.SessionID == sessionID {
+			delete(h.microsoftSelections, selectionID)
+			selection.canceled.Store(true)
+			if selection.timer != nil {
+				selection.timer.Stop()
+				selection.timer = nil
+			}
+			removed = append(removed, selection)
+		}
+	}
+	h.microsoftSelectionsMu.Unlock()
+	for _, selection := range removed {
+		discardDetachedMicrosoftProfileSelection(selection)
+	}
+}
+
+func discardDetachedMicrosoftProfileSelection(selection *microsoftProfileSelection) {
+	selection.mu.Lock()
+	selection.Account = config.Account{}
+	selection.Profiles = nil
+	selection.mu.Unlock()
+}
+
+func discardDetachedMicrosoftProfileSelections(selections []*microsoftProfileSelection) {
+	for _, selection := range selections {
+		discardDetachedMicrosoftProfileSelection(selection)
+	}
+}
+
+func clearMicrosoftAccountCredential(account *config.Account) {
+	account.AccessToken = ""
+	account.RefreshToken = ""
+	account.ClientSecret = ""
+}
+
+func (h *Handler) markMicrosoftSessionCanceled(sessionID string) {
+	now := time.Now()
+	h.microsoftFlowMu.Lock()
+	if h.microsoftCanceled == nil {
+		h.microsoftCanceled = make(map[string]time.Time)
+	}
+	h.cleanupMicrosoftCanceledLocked(now)
+	if len(h.microsoftCanceled) >= microsoftMaxCanceledSessionTombstones {
+		var oldestID string
+		var oldestExpiry time.Time
+		for id, expiry := range h.microsoftCanceled {
+			if oldestID == "" || expiry.Before(oldestExpiry) {
+				oldestID = id
+				oldestExpiry = expiry
+			}
+		}
+		delete(h.microsoftCanceled, oldestID)
+	}
+	h.microsoftCanceled[sessionID] = now.Add(microsoftCanceledSessionTTL)
+	if discovery := h.microsoftDiscoveries[sessionID]; discovery != nil {
+		discovery.cancel()
+	}
+	h.microsoftFlowMu.Unlock()
+}
+
+func (h *Handler) beginMicrosoftProfileDiscovery(
+	parent context.Context,
+	sessionID string,
+) (context.Context, *microsoftProfileDiscovery, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	h.microsoftFlowMu.Lock()
+	defer h.microsoftFlowMu.Unlock()
+	if h.microsoftSessionCanceledLocked(sessionID, time.Now()) {
+		return nil, nil, false
+	}
+	if h.microsoftDiscoveries == nil {
+		h.microsoftDiscoveries = make(map[string]*microsoftProfileDiscovery)
+	}
+	if h.microsoftDiscoveries[sessionID] != nil {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithTimeout(parent, microsoftProfileDiscoveryTimeout)
+	discovery := &microsoftProfileDiscovery{cancel: cancel}
+	h.microsoftDiscoveries[sessionID] = discovery
+	return ctx, discovery, true
+}
+
+func (h *Handler) endMicrosoftProfileDiscovery(sessionID string, expected *microsoftProfileDiscovery) {
+	expected.cancel()
+	h.microsoftFlowMu.Lock()
+	if h.microsoftDiscoveries[strings.TrimSpace(sessionID)] == expected {
+		delete(h.microsoftDiscoveries, strings.TrimSpace(sessionID))
+	}
+	h.microsoftFlowMu.Unlock()
+}
+
+func (h *Handler) microsoftSessionCanceled(sessionID string) bool {
+	h.microsoftFlowMu.Lock()
+	defer h.microsoftFlowMu.Unlock()
+	return h.microsoftSessionCanceledLocked(sessionID, time.Now())
+}
+
+func (h *Handler) microsoftSessionCanceledLocked(sessionID string, now time.Time) bool {
+	h.cleanupMicrosoftCanceledLocked(now)
+	expiry, exists := h.microsoftCanceled[strings.TrimSpace(sessionID)]
+	return exists && now.Before(expiry)
+}
+
+func (h *Handler) cleanupMicrosoftCanceledLocked(now time.Time) {
+	for sessionID, expiry := range h.microsoftCanceled {
+		if !now.Before(expiry) {
+			delete(h.microsoftCanceled, sessionID)
+		}
+	}
+}
+
+func (h *Handler) writeMicrosoftSSOCanceled(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusConflict)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft SSO login was canceled"})
+}
+
+func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error, rotatedRefreshToken ...string) {
+	if errors.Is(err, config.ErrDuplicateAccountID) ||
+		errors.Is(err, config.ErrDuplicateRefreshToken) ||
+		errors.Is(err, config.ErrDuplicateAPIKey) {
+		w.WriteHeader(http.StatusConflict)
+	} else {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	payload := map[string]string{"error": err.Error()}
+	if len(rotatedRefreshToken) > 0 {
+		if rotated := strings.TrimSpace(rotatedRefreshToken[0]); rotated != "" {
+			// Microsoft may have already invalidated the original refresh token.
+			// Surface the rotated value so operators can retry import without a
+			// full interactive re-login.
+			payload["rotatedRefreshToken"] = rotated
+			payload["hint"] = "The identity provider rotated the refresh token before persistence failed; retry import with rotatedRefreshToken"
+		}
+	}
+	json.NewEncoder(w).Encode(payload)
+}
+
 func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Region string `json:"region"`
@@ -3777,60 +4602,235 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-		AuthMethod   string `json:"authMethod"`
-		Provider     string `json:"provider"`
-		Region       string `json:"region"`
+		ID            string `json:"id"`
+		Email         string `json:"email"`
+		UserID        string `json:"userId"`
+		Nickname      string `json:"nickname"`
+		ProfileARN    string `json:"profileArn"`
+		AccessToken   string `json:"accessToken"`
+		RefreshToken  string `json:"refreshToken"`
+		KiroApiKey    string `json:"kiroApiKey"`
+		ClientID      string `json:"clientId"`
+		ClientSecret  string `json:"clientSecret"`
+		AuthMethod    string `json:"authMethod"`
+		Provider      string `json:"provider"`
+		Region        string `json:"region"`
+		TokenEndpoint string `json:"tokenEndpoint"`
+		IssuerURL     string `json:"issuerUrl"`
+		Scopes        string `json:"scopes"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
-	if req.RefreshToken == "" {
+	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
+	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	methodHint := strings.ToLower(strings.TrimSpace(req.AuthMethod))
+	isAPIKeyImport := req.KiroApiKey != "" ||
+		methodHint == "api_key" || methodHint == "apikey" ||
+		(req.RefreshToken == "" && looksLikeKiroAPIKey(req.AccessToken))
+	if isAPIKeyImport && req.KiroApiKey == "" {
+		// Allow plain-text / AccessToken-only API key imports.
+		req.KiroApiKey = req.AccessToken
+	}
+	if !isAPIKeyImport && req.RefreshToken == "" {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken is required"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken or kiroApiKey is required"})
+		return
+	}
+	if len(req.RefreshToken) > 512<<10 || len(req.AccessToken) > 512<<10 || len(req.KiroApiKey) > 512<<10 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "credential token is too long"})
+		return
+	}
+	originalRefreshToken := req.RefreshToken
+	h.credentialImportMu.Lock()
+	defer h.credentialImportMu.Unlock()
+	accountID := strings.TrimSpace(req.ID)
+	if accountID != "" {
+		if _, err := uuid.Parse(accountID); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "id must be a UUID"})
+			return
+		}
+		if config.AccountIDExists(accountID) {
+			h.writeAddAccountError(w, config.ErrDuplicateAccountID)
+			return
+		}
+	}
+
+	// API Key import path: no OAuth refresh, no profileArn.
+	if isAPIKeyImport {
+		if accountID == "" {
+			accountID = auth.GenerateAccountID()
+		}
+		account := config.Account{
+			ID:         accountID,
+			Email:      strings.TrimSpace(req.Email),
+			UserId:     strings.TrimSpace(req.UserID),
+			Nickname:   strings.TrimSpace(req.Nickname),
+			KiroApiKey: req.KiroApiKey,
+			AuthMethod: "api_key",
+			Provider:   strings.TrimSpace(req.Provider),
+			Region:     strings.TrimSpace(req.Region),
+			Enabled:    true,
+		}
+		if err := config.NormalizeAPIKeyAccount(&account); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if config.AccountAPIKeyExists(account.KiroApiKey) {
+			h.writeAddAccountError(w, config.ErrDuplicateAPIKey)
+			return
+		}
+		if err := config.AddAccount(account); err != nil {
+			h.writeAddAccountError(w, err)
+			return
+		}
+		h.pool.Reload()
+		if account.Enabled && account.AccessToken != "" {
+			go func(acc config.Account) {
+				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for new API key account %s: %v", acc.Email, err)
+				}
+			}(account)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"account": map[string]interface{}{
+				"id":    account.ID,
+				"email": account.Email,
+			},
+		})
+		return
+	}
+
+	if config.AccountCredentialExists(originalRefreshToken) {
+		h.writeAddAccountError(w, config.ErrDuplicateRefreshToken)
 		return
 	}
 
 	// 设置默认值
+	req.Region = strings.TrimSpace(req.Region)
 	if req.Region == "" {
 		req.Region = "us-east-1"
 	}
-	if req.AuthMethod == "" {
-		if req.ClientID != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
-	}
-	// 标准化 authMethod
-	switch strings.ToLower(req.AuthMethod) {
-	case "idc", "builderid", "enterprise":
+	method := strings.ToLower(strings.TrimSpace(req.AuthMethod))
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	derivedTokenEndpoint, derivedIssuer, derivedScopes := auth.DeriveExternalIdpEndpoints(
+		req.UserID, req.ClientID, req.AccessToken,
+	)
+	// Explicit AWS/social methods win over incidental tokenEndpoint/issuerUrl
+	// fields so mixed JSON templates cannot force the external-IdP path.
+	explicitMicrosoft := method == "external_idp" || method == "external-idp" ||
+		method == "external" || method == "microsoft" || method == "m365" || method == "office365" ||
+		method == "azure" || method == "azuread" || method == "azure-ad" || method == "azure_ad" ||
+		method == "entra" || method == "entra-id" ||
+		provider == "external" || provider == "microsoft" || provider == "m365" || provider == "office365" ||
+		provider == "azure" || provider == "azuread" || provider == "azure-ad" || provider == "azure_ad" ||
+		provider == "entra" || provider == "entra-id"
+	implicitExternal := method == "" && provider == "" &&
+		(derivedTokenEndpoint != "" ||
+			strings.TrimSpace(req.TokenEndpoint) != "" ||
+			strings.TrimSpace(req.IssuerURL) != "")
+	switch {
+	case method == "api_key" || method == "apikey":
+		req.AuthMethod = "api_key"
+	case method == "idc" || method == "builderid" || method == "enterprise":
 		req.AuthMethod = "idc"
-	case "social", "google", "github":
+	case method == "social" || method == "google" || method == "github":
 		req.AuthMethod = "social"
+	case explicitMicrosoft || implicitExternal:
+		req.AuthMethod = auth.MicrosoftSSOAuthMethod
+	case req.ClientID != "" && req.ClientSecret != "":
+		req.AuthMethod = "idc"
 	default:
-		if req.ClientID != "" && req.ClientSecret != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
+		req.AuthMethod = "social"
 	}
 
 	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.TokenEndpoint = strings.TrimSpace(req.TokenEndpoint)
+	req.IssuerURL = strings.TrimRight(strings.TrimSpace(req.IssuerURL), "/")
+	req.Scopes = strings.TrimSpace(req.Scopes)
+
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod {
+		if req.IssuerURL == "" {
+			req.IssuerURL = derivedIssuer
+		}
+		if req.IssuerURL == "" && req.TokenEndpoint != "" {
+			normalizedTokenEndpoint, tokenIssuer, tokenScopes := auth.ExternalIdpConfigurationFromTokenEndpoint(
+				req.TokenEndpoint, req.ClientID,
+			)
+			if normalizedTokenEndpoint != "" {
+				req.TokenEndpoint = normalizedTokenEndpoint
+				req.IssuerURL = tokenIssuer
+				if req.Scopes == "" {
+					req.Scopes = tokenScopes
+				}
+			}
+		}
+		if req.IssuerURL != "" {
+			builtTokenEndpoint, normalizedIssuer, builtScopes := auth.ExternalIdpConfigurationFromIssuer(req.IssuerURL, req.ClientID)
+			if req.TokenEndpoint == "" {
+				req.TokenEndpoint = builtTokenEndpoint
+			}
+			if normalizedIssuer != "" {
+				req.IssuerURL = normalizedIssuer
+			}
+			if req.Scopes == "" {
+				req.Scopes = builtScopes
+			}
+		}
+		if req.TokenEndpoint == "" {
+			req.TokenEndpoint = derivedTokenEndpoint
+		}
+		if req.Scopes == "" {
+			req.Scopes = derivedScopes
+		}
+		normalizedScopes, err := auth.NormalizeExternalIdpScopes(req.Scopes, req.ClientID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		req.Scopes = normalizedScopes
+		if err := auth.ValidateExternalIdpConfiguration(req.ClientID, req.TokenEndpoint, req.IssuerURL, req.Scopes); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		req.Provider = auth.MicrosoftSSOProvider
+		req.ClientSecret = ""
+	}
+
+	profileARN := strings.TrimSpace(req.ProfileARN)
+	if profileARN != "" {
+		canonicalARN, _, ok := parseKiroProfileArn(profileARN)
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is invalid"})
+			return
+		}
+		profileARN = canonicalARN
+	}
+
 	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerUrl:     req.IssuerURL,
+		Scopes:        req.Scopes,
 	}
 	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
@@ -3841,30 +4841,91 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if newRefreshToken != "" {
 		req.RefreshToken = newRefreshToken
 	}
+	rotatedRefreshToken := ""
+	if req.RefreshToken != "" && req.RefreshToken != originalRefreshToken {
+		rotatedRefreshToken = req.RefreshToken
+	}
 
 	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
+	email := strings.TrimSpace(req.Email)
+	userID := strings.TrimSpace(req.UserID)
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod {
+		tokenEmail, tokenUserID := auth.ExternalIdpTokenIdentity(accessToken)
+		if tokenEmail != "" {
+			email = tokenEmail
+		}
+		if tokenUserID != "" {
+			userID = tokenUserID
+		}
+	} else if tokenEmail, _, _ := auth.GetUserInfo(accessToken); tokenEmail != "" {
+		email = tokenEmail
+	}
+
+	if accountID == "" {
+		accountID = auth.GenerateAccountID()
+	}
+	if profileARN == "" {
+		profileARN = newProfileArn
+	}
+	// Interactive Microsoft login only accepts profiles discovered for the
+	// refreshed token. Import keeps the same trust boundary so a client cannot
+	// pin an arbitrary data-plane ARN onto a working credential.
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod && profileARN != "" {
+		probeAccount := *tempAccount
+		probeAccount.AccessToken = accessToken
+		probeAccount.RefreshToken = req.RefreshToken
+		probeAccount.ExpiresAt = expiresAt
+		offeredProfiles, discoverErr := DiscoverKiroProfiles(&probeAccount)
+		if discoverErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Unable to verify profileArn against Kiro profiles: " + discoverErr.Error(),
+			})
+			return
+		}
+		offered := false
+		for _, profile := range offeredProfiles {
+			if profile.ARN == profileARN {
+				offered = true
+				break
+			}
+		}
+		if !offered {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "profileArn was not offered for this credential",
+			})
+			return
+		}
+	}
 
 	// 创建账号
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
+		ID:                      accountID,
+		Email:                   email,
+		UserId:                  userID,
+		Nickname:                strings.TrimSpace(req.Nickname),
+		AccessToken:             accessToken,
+		RefreshToken:            req.RefreshToken,
+		RefreshTokenFingerprint: config.RefreshTokenFingerprint(originalRefreshToken),
+		ClientID:                req.ClientID,
+		ClientSecret:            req.ClientSecret,
+		AuthMethod:              req.AuthMethod,
+		Provider:                req.Provider,
+		Region:                  req.Region,
+		ExpiresAt:               expiresAt,
+		Enabled:                 true,
+		MachineId:               config.GenerateMachineId(),
+		ProfileArn:              profileARN,
+		TokenEndpoint:           req.TokenEndpoint,
+		IssuerUrl:               req.IssuerURL,
+		Scopes:                  req.Scopes,
 	}
 
+	// 本地 AddOrReplaceAccount:同 ID/同刷新令牌重复导入 = 原地替换(幂等),运维重导不报错;
+	// 错误路径沿用本地 writeAddAccountError(重复→409,其余→500,透传 rotatedRefreshToken)。
 	if err := config.AddOrReplaceAccount(&account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		h.writeAddAccountError(w, err, rotatedRefreshToken)
 		return
 	}
 
@@ -4305,6 +5366,9 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	err := CallKiroAPI(r.Context(), account, kiroPayload, callback)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -4324,6 +5388,8 @@ func (h *Handler) hydrateNewAccount(account *config.Account) {
 	if account == nil {
 		return
 	}
+	// 本地语义:建号后 best-effort 同步拉取一次额度/订阅并写回(取代上游的
+	// "先强制刷 token 再拉信息"手动刷新链路;token 有效性由 ensureValidToken 统一负责)。
 	if info, err := RefreshAccountInfo(account); err != nil {
 		logger.Warnf("[NewAccount] 拉取额度/订阅失败 %s: %v", account.Email, err)
 	} else if info != nil {
@@ -4339,6 +5405,56 @@ func (h *Handler) hydrateNewAccount(account *config.Account) {
 // pool 里只存 modelId 集合;这里与聚合模型缓存(cachedModels,后台每 30min 刷新)
 // join 出名称/倍率/描述等元数据,让详情弹窗无需实时端点也能渲染完整模型卡。
 // join 不到的 id(极短暂的缓存不同步窗口)退化为只含 modelId 的条目。
+func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id string) {
+	accounts := config.GetAccounts()
+	poolAccounts := h.pool.GetAllAccounts()
+
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	var stats config.Account
+	for _, a := range poolAccounts {
+		if a.ID == id {
+			stats = a
+			break
+		}
+	}
+	result := map[string]interface{}{
+		"id": account.ID, "email": account.Email, "userId": account.UserId, "nickname": account.Nickname,
+		"accessToken": account.AccessToken, "refreshToken": account.RefreshToken,
+		"clientId": account.ClientID, "clientSecret": account.ClientSecret,
+		"authMethod": account.AuthMethod, "provider": account.Provider, "region": account.Region,
+		"profileArn": account.ProfileArn, "tokenEndpoint": account.TokenEndpoint,
+		"issuerUrl": account.IssuerUrl, "scopes": account.Scopes, "expiresAt": account.ExpiresAt,
+		"machineId": account.MachineId, "weight": account.Weight,
+		"overageStatus": account.OverageStatus, "overageCapability": account.OverageCapability,
+		"overageCap": account.OverageCap, "overageRate": account.OverageRate,
+		"currentOverages": account.CurrentOverages, "overageCheckedAt": account.OverageCheckedAt,
+		"proxyURL": account.ProxyURL, "enabled": account.Enabled,
+		"banStatus": account.BanStatus, "banReason": account.BanReason, "banTime": account.BanTime,
+		"subscriptionType": account.SubscriptionType, "subscriptionTitle": account.SubscriptionTitle,
+		"daysRemaining": account.DaysRemaining, "usageCurrent": account.UsageCurrent,
+		"usageLimit": account.UsageLimit, "usagePercent": account.UsagePercent,
+		"nextResetDate": account.NextResetDate, "lastRefresh": account.LastRefresh,
+		"trialUsageCurrent": account.TrialUsageCurrent, "trialUsageLimit": account.TrialUsageLimit,
+		"trialUsagePercent": account.TrialUsagePercent, "trialStatus": account.TrialStatus,
+		"trialExpiresAt": account.TrialExpiresAt,
+		"requestCount": stats.RequestCount, "errorCount": stats.ErrorCount,
+		"totalTokens": stats.TotalTokens, "totalCredits": stats.TotalCredits,
+		"lastUsed": stats.LastUsed,
+	}
+	json.NewEncoder(w).Encode(result)
+}
+
 func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Request, id string) {
 	ids := h.pool.GetModelList(id)
 
@@ -4576,6 +5692,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		ProfileArn    string `json:"profileArn,omitempty"`
 		TokenEndpoint string `json:"tokenEndpoint,omitempty"`
 		IssuerUrl     string `json:"issuerUrl,omitempty"`
+		Scopes        string `json:"scopes,omitempty"`
 		KiroApiKey    string `json:"kiroApiKey,omitempty"`
 	}
 
@@ -4597,6 +5714,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		Nickname     string             `json:"nickname,omitempty"`
 		Idp          string             `json:"idp"`
 		UserId       string             `json:"userId,omitempty"`
+		ProfileArn   string             `json:"profileArn,omitempty"`
 		MachineId    string             `json:"machineId,omitempty"`
 		Credentials  ExportCredentials  `json:"credentials"`
 		Subscription ExportSubscription `json:"subscription"`
@@ -4617,11 +5735,47 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	exportAccounts := make([]ExportAccount, 0, len(accounts))
 	for _, a := range accounts {
+		// API Key accounts are not OAuth credentials; export a flat-compatible shape.
+		if config.IsAPIKeyAccount(&a) {
+			exportAccounts = append(exportAccounts, ExportAccount{
+				ID:        a.ID,
+				Email:     a.Email,
+				Nickname:  a.Nickname,
+				Idp:       "APIKey",
+				UserId:    a.UserId,
+				MachineId: a.MachineId,
+				Credentials: ExportCredentials{
+					AccessToken:  a.KiroApiKey,
+					RefreshToken: "",
+					Region:       a.Region,
+					AuthMethod:   "api_key",
+					Provider:     "APIKey",
+				},
+				Subscription: ExportSubscription{
+					Type:  a.SubscriptionType,
+					Title: a.SubscriptionTitle,
+				},
+				Usage: ExportUsage{
+					Current:     a.UsageCurrent,
+					Limit:       a.UsageLimit,
+					PercentUsed: a.UsagePercent,
+					LastUpdated: a.LastRefresh,
+				},
+				Tags:       []string{"api_key"},
+				Status:     "active",
+				CreatedAt:  0,
+				LastUsedAt: a.LastUsed,
+			})
+			continue
+		}
+
 		// 映射 provider 到 idp
 		idp := a.Provider
 		if idp == "" {
 			if a.AuthMethod == "social" {
 				idp = "Google"
+			} else if a.AuthMethod == auth.MicrosoftSSOAuthMethod {
+				idp = auth.MicrosoftSSOProvider
 			} else {
 				idp = "BuilderId"
 			}
@@ -4645,12 +5799,13 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 
 		exportAccounts = append(exportAccounts, ExportAccount{
-			ID:        a.ID,
-			Email:     a.Email,
-			Nickname:  a.Nickname,
-			Idp:       idp,
-			UserId:    a.UserId,
-			MachineId: a.MachineId,
+			ID:         a.ID,
+			Email:      a.Email,
+			Nickname:   a.Nickname,
+			Idp:        idp,
+			UserId:     a.UserId,
+			ProfileArn: a.ProfileArn,
+			MachineId:  a.MachineId,
 			Credentials: ExportCredentials{
 				AccessToken:   a.AccessToken,
 				CsrfToken:     "",
@@ -4665,6 +5820,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				ProfileArn:    a.ProfileArn,
 				TokenEndpoint: a.TokenEndpoint,
 				IssuerUrl:     a.IssuerUrl,
+				Scopes:        a.Scopes,
 				KiroApiKey:    a.KiroApiKey,
 			},
 			Subscription: ExportSubscription{

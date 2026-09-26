@@ -213,6 +213,9 @@ func TestClaudeStreamEarlyHeadersAndKeepalive(t *testing.T) {
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "hello after silence",
 		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "END_TURN",
+		}))
 	}))
 	defer server.Close()
 

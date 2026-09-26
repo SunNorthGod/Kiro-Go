@@ -7,6 +7,74 @@ import (
 	"testing"
 )
 
+func TestNormalizeAPIKeyAccountPipeRegionAndMachineId(t *testing.T) {
+	account := Account{
+		KiroApiKey: " ksk_test_key|eu-central-1 ",
+		AuthMethod: "API KEY",
+	}
+	if err := NormalizeAPIKeyAccount(&account); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if account.KiroApiKey != "ksk_test_key" {
+		t.Fatalf("key = %q", account.KiroApiKey)
+	}
+	if account.AccessToken != "ksk_test_key" {
+		t.Fatalf("accessToken should mirror api key, got %q", account.AccessToken)
+	}
+	if account.AuthMethod != "api_key" {
+		t.Fatalf("authMethod = %q", account.AuthMethod)
+	}
+	if account.Region != "eu-central-1" {
+		t.Fatalf("region = %q", account.Region)
+	}
+	if account.RefreshToken != "" || account.ProfileArn != "" || account.ExpiresAt != 0 {
+		t.Fatalf("oauth fields should be cleared: %+v", account)
+	}
+	wantMachine := MachineIdFromAPIKey("ksk_test_key")
+	if account.MachineId != wantMachine {
+		t.Fatalf("machineId = %q, want %q", account.MachineId, wantMachine)
+	}
+	if !IsAPIKeyAccount(&account) {
+		t.Fatal("expected IsAPIKeyAccount true")
+	}
+}
+
+func TestAddAccountSameAPIKeyReplacesInPlace(t *testing.T) {
+	// Local semantics: re-importing an account with the same ksk_ key updates
+	// the existing entry in place (AddOrReplaceAccount) instead of erroring.
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	first := Account{ID: "api-1", KiroApiKey: "ksk_dup", AuthMethod: "api_key", Enabled: true}
+	if err := AddOrReplaceAccount(&first); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	second := Account{ID: "api-2", KiroApiKey: "ksk_dup", AuthMethod: "api_key", Enabled: true}
+	if err := AddOrReplaceAccount(&second); err != nil {
+		t.Fatalf("same-key re-import should replace in place: %v", err)
+	}
+	got := GetAccounts()
+	if len(got) != 1 {
+		t.Fatalf("expected in-place replacement, got %d accounts", len(got))
+	}
+	if got[0].ID != "api-1" {
+		t.Fatalf("replacement must keep the existing id, got %q", got[0].ID)
+	}
+}
+
+func TestSplitKiroAPIKeyAndRegionValidation(t *testing.T) {
+	key, region, err := SplitKiroAPIKeyAndRegion("ksk_abc|us-east-1")
+	if err != nil || key != "ksk_abc" || region != "us-east-1" {
+		t.Fatalf("got key=%q region=%q err=%v", key, region, err)
+	}
+	if _, _, err := SplitKiroAPIKeyAndRegion("ksk_abc|us-east-1|extra"); err == nil {
+		t.Fatal("expected multi-pipe error")
+	}
+	if _, _, err := SplitKiroAPIKeyAndRegion("|us-east-1"); err == nil {
+		t.Fatal("expected empty key error")
+	}
+}
+
 func TestUpdateSettingsPatchPreservesOmittedAPIKeyFields(t *testing.T) {
 	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("init config: %v", err)
@@ -55,6 +123,62 @@ func TestAuthAlwaysRequiredEvenWhenPatchedOff(t *testing.T) {
 	}
 	if got := GetPassword(); got != "admin-password" {
 		t.Fatalf("expected password to be preserved, got %q", got)
+	}
+}
+
+func TestUpdateAccountStaleSnapshotPreservesCredentialRotation(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	account := Account{
+		ID:            "rotation-account",
+		AccessToken:   "access-1",
+		RefreshToken:  "refresh-1",
+		ClientID:      "client",
+		AuthMethod:    "external_idp",
+		Region:        "us-east-1",
+		ExpiresAt:     100,
+		ProfileArn:    "arn:aws:codewhisperer:us-east-1:123456789012:profile/one",
+		TokenEndpoint: "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+		IssuerUrl:     "https://login.microsoftonline.com/tenant/v2.0",
+		Scopes:        "scope-one",
+		Enabled:       true,
+	}
+	if err := AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	stale := GetAccounts()[0]
+
+	const rotatedProfile = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/two"
+	if err := UpdateAccountCredentialState(
+		account.ID,
+		"access-2",
+		"refresh-2",
+		200,
+		rotatedProfile,
+	); err != nil {
+		t.Fatalf("rotate credential: %v", err)
+	}
+
+	stale.Enabled = false
+	stale.BanStatus = "BANNED"
+	stale.BanReason = "stale status update"
+	if err := UpdateAccount(account.ID, stale); err != nil {
+		t.Fatalf("apply stale status snapshot: %v", err)
+	}
+
+	got := GetAccounts()[0]
+	if got.AccessToken != "access-2" ||
+		got.RefreshToken != "refresh-2" ||
+		got.ExpiresAt != 200 ||
+		got.ProfileArn != rotatedProfile {
+		t.Fatalf("stale status update reverted credential state: %+v", got)
+	}
+	if got.RefreshTokenFingerprint != RefreshTokenFingerprint("refresh-1") {
+		t.Fatalf("original refresh token fingerprint = %q", got.RefreshTokenFingerprint)
+	}
+	if got.Enabled || got.BanStatus != "BANNED" || got.BanReason != "stale status update" {
+		t.Fatalf("status fields were not applied: %+v", got)
 	}
 }
 

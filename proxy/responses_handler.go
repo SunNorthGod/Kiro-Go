@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"kiro-go/logger"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -187,6 +188,7 @@ func (h *Handler) handleResponsesNonStream(
 		var realInputTokens int
 		var meteringCacheRead, meteringCacheCreation int
 		var hasCacheMetering bool
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -206,9 +208,30 @@ func (h *Handler) handleResponsesNonStream(
 				meteringCacheRead, meteringCacheCreation = read, creation
 				hasCacheMetering = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			reasoningContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered path: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output. (#143/#146 上游并入,
+		// 内层保留本地 callKiroWithSelfHeal 的 400 自愈。)
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset, nil)
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
@@ -221,7 +244,10 @@ func (h *Handler) handleResponsesNonStream(
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(&account, err)
+			}
 			if isRequestShapeErrorMessage(err.Error()) {
 				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
 			}
@@ -264,7 +290,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.Usage.InputTokensDetails = &ResponsesInputTokensDetails{CachedTokens: cacheUsage.CacheReadInputTokens}
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
@@ -288,9 +314,20 @@ func (h *Handler) handleResponsesNonStream(
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
+func mapResponsesCompletion(reason string) (status, incompleteReason string) {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "max_output_tokens", "length", "model_context_window_exceeded", "context_window_exceeded":
+		return "incomplete", "max_output_tokens"
+	case "refusal", "content_filter", "content_filtered", "guardrail_intervened":
+		return "incomplete", "content_filter"
+	default:
+		return "completed", ""
+	}
+}
+
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
-	inputTokens, outputTokens int, req *ResponsesRequest,
+	inputTokens, outputTokens int, req *ResponsesRequest, upstreamStopReason string,
 ) *ResponsesObject {
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
@@ -332,16 +369,23 @@ func buildResponsesObject(
 		})
 	}
 
+	status, incompleteReason := mapResponsesCompletion(upstreamStopReason)
+	var incompleteDetails *ResponsesIncompleteDetails
+	if incompleteReason != "" {
+		incompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}
+	}
+
 	return &ResponsesObject{
 		ID:                 id,
 		Object:             "response",
 		CreatedAt:          time.Now().Unix(),
-		Status:             "completed",
+		Status:             status,
 		Model:              model,
 		Output:             output,
 		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+		IncompleteDetails:  incompleteDetails,
 	}
 }
 
@@ -463,6 +507,7 @@ func (h *Handler) handleResponsesStream(
 			meteringCacheRead     int
 			meteringCacheCreation int
 			hasCacheMetering      bool
+			upstreamStopReason    string
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -591,9 +636,23 @@ func (h *Handler) handleResponsesStream(
 				meteringCacheRead, meteringCacheCreation = read, creation
 				hasCacheMetering = true
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
+		// #146(上游并入,检测半): responses 流在进入账号循环前就已发 response.created
+		// (200 头已提交),本地设计为不再换号/同账号重跑(见下方错误路径注释),
+		// 故这里只做完整性检测:传输成功但流被截断(有内容/思考、无终止信号、无工具)
+		// → 按 response.failed 收尾,不再伪造 response.completed。
+		// (#143 的同账号重试预算只用于非流式/未提交路径,见 handler.go。)
 		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
+		if err == nil {
+			if ierr := classifyStreamIntegrity(fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0); ierr != nil && ctx.Err() == nil {
+				err = ierr
+				logger.Warnf("[StreamIntegrity] %v on %s; signaling response.failed (stream already committed)", ierr, account.Email)
+			}
+		}
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone):
 			// no exclude/retry, no account-failure signal, no response.failed event
@@ -613,7 +672,10 @@ func (h *Handler) handleResponsesStream(
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			// #146(上游): 截断流是上游抖动,不记账号故障;仅传输类错误才拉黑账号。
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(&account, err)
+			}
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
@@ -700,7 +762,7 @@ func (h *Handler) handleResponsesStream(
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.Usage.InputTokensDetails = &ResponsesInputTokensDetails{CachedTokens: cacheUsage.CacheReadInputTokens}
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput

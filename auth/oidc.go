@@ -39,6 +39,8 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	client := GetAuthClientForProxy(proxyURL)
 
 	switch strings.ToLower(strings.TrimSpace(account.AuthMethod)) {
+		// 上游 Microsoft Enterprise SSO 导入的账号 authMethod 同为 "external_idp",
+		// 刷新统一走本地 external_idp 实现(tokenEndpoint/issuerUrl/scopes 字段一致)。
 	case "social":
 		return refreshSocialToken(account.RefreshToken, client)
 	case ExternalIdpAuthMethod: // "external_idp": Microsoft Entra / Kiro 企业版

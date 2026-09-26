@@ -74,6 +74,7 @@ func TestClaudeStreamObservesTruncatedDelivery(t *testing.T) {
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "part one "}),
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "part two "}),
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "part three"}),
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "END_TURN"}),
 	}
 
 	h, restore := newTestStreamHandler(t, frames...)

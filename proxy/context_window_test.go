@@ -4,11 +4,8 @@ import "testing"
 
 // TestGetContextWindowSize verifies models are classified into the correct
 // context window. This drives the input-token count that clients use to decide
-// when to compact; misclassifying opus-4.8 (1M) as 200K under-reports tokens by
-// 5x and prevents timely compaction.
-//
-// 5 代模型(claude-opus-5 / claude-sonnet-5)不带小版本号,旧的两段式版本正则整个
-// 匹配不上,会被误判成 200K —— 这里显式覆盖。
+// when to compact; misclassifying opus-4.8 or opus-5 (1M) as 200K under-reports
+// tokens by 5x and prevents timely compaction.
 func TestGetContextWindowSize(t *testing.T) {
 	resetModelMetaRegistry(t)
 
@@ -28,6 +25,14 @@ func TestGetContextWindowSize(t *testing.T) {
 		{"claude-sonnet-4.6", 1_000_000},
 		{"claude-opus-4.8-thinking", 1_000_000},
 		{"CLAUDE-OPUS-4.8", 1_000_000},
+		{"claude-opus-5", 1_000_000},
+		{"claude-opus-5-thinking", 1_000_000},
+		{"CLAUDE-OPUS-5", 1_000_000},
+		{"claude-opus-5.1", 1_000_000},
+		{"claude-opus-5-1", 1_000_000},
+		{"claude-sonnet-5", 1_000_000},
+		{"claude-haiku-5", 1_000_000},
+		{"claude-opus-6", 1_000_000},
 		{"claude-opus-4.5", 200_000},
 		{"claude-sonnet-4.5", 200_000},
 		{"claude-sonnet-4", 200_000},

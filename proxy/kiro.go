@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -25,6 +27,24 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	// streamRetryBackoff spaces out a retry of a stream that died before
+	// delivering any output callback. Upstream drops cluster in time, so an
+	// immediate retry tends to hit the same blip.
+	streamRetryBackoff           = 700 * time.Millisecond
+	maxStreamAttemptsPerEndpoint = 2
+	maxEventStreamMessageSize    = 16 * 1024 * 1024
+)
+
+var (
+	errEmptyKiroStream         = errors.New("upstream stream ended before any output")
+	errIncompleteKiroToolInput = errors.New("upstream stream ended with incomplete tool input")
+	errInvalidKiroEventStream  = errors.New("invalid upstream event stream")
+	errKiroEventStreamUpstream = errors.New("upstream event stream error")
+	streamRetryWait            = waitForStreamRetry
+	resolveKiroEndpoints       = endpointsForAccount
+)
+
 // Endpoint configuration (auto-fallback on quota exhaustion).
 type kiroEndpoint struct {
 	URL       string
@@ -37,10 +57,6 @@ type kiroEndpoint struct {
 // length is untrusted (corruption / a hostile upstream), so it must not drive an
 // unbounded allocation. 16 MiB is far above any real Kiro event.
 const maxEventFrameBytes = 16 << 20
-
-// maxNormalizeOverlapBytes bounds the suffix/prefix overlap search in
-// normalizeChunk so it can't degrade to O(n^2) on very large chunks.
-const maxNormalizeOverlapBytes = 256
 
 var kiroEndpoints = []kiroEndpoint{
 	{
@@ -61,6 +77,15 @@ var kiroEndpoints = []kiroEndpoint{
 		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
 		Name:      "AmazonQ",
 	},
+}
+
+// kiroCLIEndpoint is the headless / API Key path used by Kiro CLI:
+// POST https://runtime.{region}.kiro.dev/ with AWS JSON 1.0 protocol.
+var kiroCLIEndpoint = kiroEndpoint{
+	URL:       "https://runtime.us-east-1.kiro.dev/",
+	Origin:    "KIRO_CLI",
+	AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+	Name:      "Kiro CLI",
 }
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
@@ -393,6 +418,7 @@ type KiroStreamCallback struct {
 	// cacheWriteInputTokens). These are the upstream truth: when present they
 	// take precedence over the local prompt-cache simulation.
 	OnCacheMetering func(readTokens, creationTokens int)
+	OnStopReason    func(reason string)
 }
 
 // ==================== API Call ====================
@@ -402,12 +428,39 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 		return
 	}
 
+	// API Key credentials must not carry IDE/profile semantics.
+	if config.IsAPIKeyAccount(account) {
+		payload.ProfileArn = ""
+		return
+	}
+
 	payload.ProfileArn = strings.TrimSpace(payload.ProfileArn)
 	if account != nil {
 		if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 			payload.ProfileArn = profileArn
 		}
 	}
+}
+
+// endpointsForAccount returns the upstream endpoint list for a credential.
+// API Key accounts always use the CLI runtime protocol; OAuth accounts keep
+// the configured preferred-endpoint fallback chain.
+func endpointsForAccount(account *config.Account) []kiroEndpoint {
+	if config.IsAPIKeyAccount(account) {
+		return []kiroEndpoint{kiroCLIEndpoint}
+	}
+	return getSortedEndpoints(config.GetPreferredEndpoint())
+}
+
+// cliRuntimeURL builds the regional Kiro CLI runtime URL.
+func cliRuntimeURL(account *config.Account) string {
+	region := "us-east-1"
+	if account != nil {
+		if r := strings.TrimSpace(account.Region); r != "" {
+			region = r
+		}
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
@@ -482,7 +535,7 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 		callback = &wrapped
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" && !config.IsAPIKeyAccount(account) {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else if isProfileArnResolutionSoftError(err) {
@@ -494,7 +547,8 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 
 	// Build endpoint list. external_idp(Microsoft Entra / Kiro 企业版)账号走 Kiro 数据面
 	// runtime.{region}.kiro.dev 单端点(其 Bearer 是客户 IdP 直签 token,不能走 AWS 直连,
-	// 也无 AWS 三端点回退);其余账号(idc/social/api_key)走 AWS q.{region}.amazonaws.com 并按配置回退。
+	// 也无 AWS 三端点回退);API Key 账号由 resolveKiroEndpoints 路由到 Kiro CLI runtime
+	// 协议单端点;其余账号(idc/social)走 AWS q.{region}.amazonaws.com 并按配置回退。
 	var endpoints []kiroEndpoint
 	if auth.IsExternalIdpAccount(account) {
 		endpoints = []kiroEndpoint{{
@@ -503,8 +557,9 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 			Name:   "ExternalIdP",
 		}}
 	} else {
-		endpoints = getSortedEndpoints(config.GetPreferredEndpoint())
+		endpoints = resolveKiroEndpoints(account)
 	}
+	isAPIKey := config.IsAPIKeyAccount(account)
 
 	// Retry the WHOLE endpoint cycle — not the next endpoint — when the upstream
 	// reports a capacity problem. The three endpoints are separate API surfaces in
@@ -518,12 +573,18 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 	var lastErr error
 	for cycle := 0; ; cycle++ {
 		lastErr = nil
-		for _, ep := range endpoints {
+		for epIndex, ep := range endpoints {
 			// Update the origin field for the selected endpoint.
 			payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
-			// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
+			// Target the profile's data-plane region; endpoint URLs are declared for
+			// us-east-1. API Key accounts use the CLI runtime host instead of IDE/Q
+			// hosts.
 			epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+			if isAPIKey {
+				epURL = cliRuntimeURL(account)
+			}
+
 			reqBody, mErr := json.Marshal(payload)
 			if mErr != nil {
 				lastErr = mErr
@@ -533,87 +594,152 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 				logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
 			}
 
+			host := ""
+			if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
+				host = parsedURL.Host
+			}
+			headerValues := buildStreamingHeaderValues(account, host)
+			// One invocation id per endpoint, shared across the stream attempts below.
+			invocationID := uuid.New().String()
+
 			// Per-endpoint attempt in a closure so the derived cancel is always
 			// released (defer), whether we fail fast or stream to completion.
-			terminal, err := func() (terminal bool, err error) {
+			// A stream that died before any output reached the client (#143) is
+			// retried on the SAME endpoint, bounded by maxStreamAttemptsPerEndpoint,
+			// before the loop falls back to the next endpoint.
+		var terminal, retrySame bool
+		var err error
+		for streamAttempt := 1; ; streamAttempt++ {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			terminal, retrySame, err = func() (terminal, retrySame bool, err error) {
 				reqCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
+				// Requests and bodies cannot be reused after an HTTP attempt.
 				req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
 				if err != nil {
-					return false, err
+					return false, false, err
 				}
-
-				host := ""
-				if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
-					host = parsedURL.Host
-				}
-				headerValues := buildStreamingHeaderValues(account, host)
 
 				req.Header.Set("Content-Type", "application/json")
+				if isAPIKey {
+					req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+				}
 				req.Header.Set("Accept", "*/*")
 				if ep.AmzTarget != "" {
 					req.Header.Set("X-Amz-Target", ep.AmzTarget)
 				}
 				applyKiroBaseHeaders(req, account, headerValues)
-				req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-				req.Header.Set("x-amzn-codewhisperer-optout", "true")
-				req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-				req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+				if !isAPIKey {
+					req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+				}
+				// CLI captures use optout=false; IDE path keeps true.
+				if isAPIKey {
+					req.Header.Set("x-amzn-codewhisperer-optout", "false")
+				} else {
+					req.Header.Set("x-amzn-codewhisperer-optout", "true")
+				}
+				req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", streamAttempt, maxStreamAttemptsPerEndpoint))
+				req.Header.Set("Amz-Sdk-Invocation-Id", invocationID)
 
 				resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 				if err != nil {
 					logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-					return false, err
-				}
-
-				if resp.StatusCode == 429 {
-					resp.Body.Close()
-					logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-					return false, fmt.Errorf("quota exhausted on %s", ep.Name)
-				}
-
-				if resp.StatusCode != 200 {
-					errBody, _ := io.ReadAll(resp.Body)
-					resp.Body.Close()
-					e := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-					// Authentication and payment errors are not retried across endpoints.
-					if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
-						return true, e
+					// A deadline that expired before the request could complete is
+					// terminal: the caller's budget is gone, falling back to another
+					// endpoint cannot help.
+					if !isRetryableStreamError(err) {
+						return true, false, err
 					}
-					// Neither are rejections of the payload itself: every endpoint will
-					// reject the same bytes, so falling back only burns round-trips before
-					// the caller's self-heal / error path can even run. Logged with the
-					// serialized request size, which is the one number needed to tell an
-					// oversized-input 400 apart from a malformed-payload 400.
-					if isRequestShapeErrorMessage(e.Error()) {
-						logger.Warnf("[KiroAPI] Endpoint %s rejected the request itself (no endpoint fallback): reqBytes=%d history=%d model=%s err=%v",
-							ep.Name, len(reqBody), len(payload.ConversationState.History),
-							payload.ConversationState.CurrentMessage.UserInputMessage.ModelID, e)
-						return true, e
+					return false, false, err
+				}
+
+					if resp.StatusCode == 429 {
+						resp.Body.Close()
+						logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+						return false, false, fmt.Errorf("quota exhausted on %s", ep.Name)
 					}
-					logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
-					return false, e
-				}
 
-				// The upstream stream is established: let the handler flush its
-				// response headers / start its keepalive before the first content
-				// event arrives.
-				if callback != nil && callback.OnStreamStart != nil {
-					callback.OnStreamStart()
-				}
+					if resp.StatusCode != 200 {
+						errBody, _ := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						e := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+						// Authentication and payment errors are not retried across endpoints.
+						if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+							return true, false, e
+						}
+						// Neither are rejections of the payload itself: every endpoint will
+						// reject the same bytes, so falling back only burns round-trips before
+						// the caller's self-heal / error path can even run. Logged with the
+						// serialized request size, which is the one number needed to tell an
+						// oversized-input 400 apart from a malformed-payload 400.
+						if isRequestShapeErrorMessage(e.Error()) {
+							logger.Warnf("[KiroAPI] Endpoint %s rejected the request itself (no endpoint fallback): reqBytes=%d history=%d model=%s err=%v",
+								ep.Name, len(reqBody), len(payload.ConversationState.History),
+								payload.ConversationState.CurrentMessage.UserInputMessage.ModelID, e)
+							return true, false, e
+						}
+						logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
+						return false, false, e
+					}
 
-				// Success: stream with a per-read idle deadline. On idle, cancel
-				// aborts the upstream request so the blocked Read returns an error.
-				body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, cancel)
-				defer body.Close()
-				return true, parseEventStream(reqCtx, body, callback)
+					// The upstream stream is established: let the handler flush its
+					// response headers / start its keepalive before the first content
+					// event arrives.
+					if callback != nil && callback.OnStreamStart != nil {
+						callback.OnStreamStart()
+					}
+
+					// Success: stream with a per-read idle deadline. On idle, cancel
+					// aborts the upstream request so the blocked Read returns an error.
+					body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, cancel)
+					defer body.Close()
+					emitted, perr := parseEventStream(reqCtx, body, callback)
+					if perr == nil {
+						return true, false, nil
+					}
+					// Once any output callback ran, the attempt must stand or fail as a
+					// whole: retrying would duplicate caller-visible state. A dead stream
+					// with zero output is the one safe retry, and only a retryable error
+					// (transport blip, empty stream) qualifies - client cancellation and
+					// idle timeouts surface immediately.
+					if emitted || !isRetryableStreamError(perr) {
+						return true, false, perr
+					}
+					return false, true, perr
 			}()
 
 			if terminal {
 				return err
 			}
-			lastErr = err
+			if !retrySame {
+				// This endpoint failed the ordinary way (transport, quota, non-200):
+				// no dead-stream wait, just fall back to the next endpoint.
+				break
+			}
+			// A cancelled client must not trigger another wait or retry.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			hasSameEndpointRetry := streamAttempt < maxStreamAttemptsPerEndpoint
+			hasEndpointFallback := epIndex+1 < len(endpoints)
+			if !hasSameEndpointRetry && !hasEndpointFallback {
+				return err
+			}
+			logger.Warnf("[KiroAPI] Endpoint %s stream died before any output (attempt %d/%d); retrying in %s: %v",
+				ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, streamRetryBackoff, err)
+			// Honours cancellation while waiting: a client that has already
+			// gone away must not hold an account slot for another backoff.
+			if waitErr := streamRetryWait(ctx, streamRetryBackoff); waitErr != nil {
+				return waitErr
+			}
+			if !hasSameEndpointRetry {
+				break // same-endpoint attempts exhausted: try the next endpoint
+			}
+		}
+		lastErr = err
 		}
 
 		if lastErr == nil || cycle >= upstreamOverloadRetries || !isUpstreamOverloadErrorMessage(lastErr.Error()) {
@@ -637,6 +763,21 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 	return fmt.Errorf("all endpoints failed")
 }
 
+// CallKiroAPIContext is CallKiroAPI under the upstream-facing name. The stream
+// integrity retry (runKiroWithIntegrityRetry) and the handlers call it; the
+// context-first signature is the single entry point for both.
+func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPI(ctx, account, payload, callback)
+}
+
+func isRetryableStreamError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var netErr net.Error
+	return !errors.As(err, &netErr) || !netErr.Timeout()
+}
+
 func accountEmailForLog(account *config.Account) string {
 	if account == nil {
 		return "<nil>"
@@ -644,13 +785,27 @@ func accountEmailForLog(account *config.Account) string {
 	return account.Email
 }
 
-// ==================== Event Stream Parsing ====================
+func waitForStreamRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
+// ==================== Event Stream Parsing ====================
 // parseEventStream decodes an AWS binary Event Stream response body. ctx lets a
 // read error be reported as a clean cancellation (client disconnect or idle
 // timeout) instead of a raw transport error; either way an error return means
 // the handler's failure path runs and the request is NOT billed.
-func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamCallback) error {
+//
+// It also reports whether any output callback ran. A failure before the first
+// output callback is safe to retry (the dead-stream retry in CallKiroAPI), and
+// a stream that ends without any output at all is an error, not success.
+func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamCallback) (emitted bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -661,11 +816,23 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
 	var totalCredits float64
-	var currentToolUse *toolUseState
-	var lastAssistantContent string
-	var lastReasoningContent string
 	var meteringCacheRead, meteringCacheCreation int
 	var hasCacheMetering bool
+	var sawOutput bool
+	pending := &pendingToolUses{}
+
+	// Track tool-use output through the callback wrapper so sawOutput/emitted
+	// stay true regardless of how a tool frame arrives.
+	trackedCallback := *callback
+	originalOnToolUse := trackedCallback.OnToolUse
+	trackedCallback.OnToolUse = func(toolUse KiroToolUse) {
+		sawOutput = true
+		if originalOnToolUse != nil {
+			emitted = true
+			originalOnToolUse(toolUse)
+		}
+	}
+	callback = &trackedCallback
 
 	// Reused across frames so a long stream doesn't allocate a fresh prelude +
 	// message buffer per event.
@@ -684,9 +851,9 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 			// the interruption clearly. Not billed either way (early return skips
 			// OnCredits/OnComplete below).
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+				return emitted, ctxErr
 			}
-			return err
+			return emitted, err
 		}
 
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
@@ -703,7 +870,7 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 		// value would try to allocate up to ~4 GiB and OOM the process. Legit Kiro
 		// frames are far below 16 MiB.
 		if totalLength > maxEventFrameBytes {
-			return fmt.Errorf("event stream frame too large: %d bytes (cap %d)", totalLength, maxEventFrameBytes)
+			return emitted, fmt.Errorf("event stream frame too large: %d bytes (cap %d)", totalLength, maxEventFrameBytes)
 		}
 
 		// Read the remaining message bytes into the reused buffer (grown on demand).
@@ -716,9 +883,9 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+				return emitted, ctxErr
 			}
-			return err
+			return emitted, err
 		}
 
 		// headersLength is parsed from untrusted bytes: a negative value (high bit
@@ -734,7 +901,7 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 
 		// Mid-stream error/exception frames: the Kiro backend can emit these AFTER
 		// a 200 + partial stream. The event switch below only matches `event`
-		// frames, so previously these were silently dropped — truncated answers
+		// frames, so previously these were silently dropped - truncated answers
 		// looked complete and transient upstream faults got billed as success with
 		// no failover. Surface them here.
 		if messageType == "exception" || messageType == "error" {
@@ -754,11 +921,11 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 			}
 			// Any other mid-stream exception/error is fatal for this attempt.
 			// Returning an error runs the handler's failure path (SSE error frame if
-			// the stream already committed, else account failover) — like a non-200.
+			// the stream already committed, else account failover) - like a non-200.
 			if kind == "" {
 				kind = "UpstreamError"
 			}
-			return fmt.Errorf("%s: %s", kind, msg)
+			return emitted, fmt.Errorf("%s: %s", kind, msg)
 		}
 
 		if len(payloadBytes) == 0 {
@@ -775,17 +942,22 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 		// Dispatch by event type.
 		switch eventType {
 		case "assistantResponseEvent":
+			// Content is relayed verbatim: upstream deltas that repeat or extend
+			// earlier text are legitimate model output, and collapsing them here
+			// silently dropped real content from the response stream.
 			if content, ok := event["content"].(string); ok && content != "" {
-				normalized := normalizeChunk(content, &lastAssistantContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, false)
+				sawOutput = true
+				if callback.OnText != nil {
+					emitted = true
+					callback.OnText(content, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
-				normalized := normalizeChunk(text, &lastReasoningContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, true)
+				sawOutput = true
+				if callback.OnText != nil {
+					emitted = true
+					callback.OnText(text, true)
 				}
 			}
 			// Native reasoning signature (opus-4.8 等原生思考模型在推理结束时下发一次)。
@@ -796,7 +968,9 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 				}
 			}
 		case "toolUseEvent":
-			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
+			if toolErr := handleToolUseEvent(event, pending, callback); toolErr != nil {
+				return emitted, toolErr
+			}
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
@@ -815,13 +989,28 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 					callback.OnContextUsage(pct)
 				}
 			}
+		case "metadataEvent":
+			// stopReason rides inside metadataEvent on the wire; there is no
+			// standalone stop reason event type. Its absence after content is
+			// how callers detect a truncated stream.
+			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
+				callback.OnStopReason(reason)
+			}
 		}
 	}
 
-	if currentToolUse != nil {
-		finishToolUse(currentToolUse, callback)
+	// Flush tools that never received a stop frame, in arrival order.
+	if err := pending.flushAll(callback); err != nil {
+		return emitted, err
 	}
-
+	// A stream that ends without producing anything is not a success: surface it
+	// so the caller can retry or fail over instead of billing an empty response.
+	// Streams that carried upstream accounting (credits / token counts / prompt
+	// cache metering) did real work even with no assistant output — usage-only
+	// responses are a legitimate shape and must not be rejected as empty.
+	if !sawOutput && totalCredits == 0 && inputTokens == 0 && outputTokens == 0 && !hasCacheMetering {
+		return emitted, errEmptyKiroStream
+	}
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
 	}
@@ -836,9 +1025,8 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
-	return nil
+	return emitted, nil
 }
-
 // extractCacheMeteringFromEvent looks for prompt-cache token fields on a
 // meteringEvent payload (flat or inside any nested usage map). ok is true when
 // at least one of the fields is present; an absent field reads as 0.
@@ -1000,58 +1188,6 @@ func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
 	}
 }
 
-func normalizeChunk(chunk string, previous *string) string {
-	if chunk == "" {
-		return ""
-	}
-
-	prev := *previous
-	if prev == "" {
-		*previous = chunk
-		return chunk
-	}
-
-	if chunk == prev {
-		return ""
-	}
-
-	if strings.HasPrefix(chunk, prev) {
-		delta := chunk[len(prev):]
-		*previous = chunk
-		return delta
-	}
-
-	if strings.HasPrefix(prev, chunk) {
-		return ""
-	}
-
-	maxOverlap := 0
-	maxLen := len(prev)
-	if len(chunk) < maxLen {
-		maxLen = len(chunk)
-	}
-	// Cap the overlap search: it is O(maxLen^2) worst case (each HasSuffix is
-	// O(i)), and streaming deltas that overlap by more than a couple hundred
-	// bytes don't occur in practice. Bounding it keeps a pathologically large
-	// prev/chunk pair from turning this into a hot spot.
-	if maxLen > maxNormalizeOverlapBytes {
-		maxLen = maxNormalizeOverlapBytes
-	}
-	for i := maxLen; i > 0; i-- {
-		if strings.HasSuffix(prev, chunk[:i]) {
-			maxOverlap = i
-			break
-		}
-	}
-
-	*previous = chunk
-	if maxOverlap > 0 {
-		return chunk[maxOverlap:]
-	}
-
-	return chunk
-}
-
 func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
 	for _, k := range keys {
 		v, ok := m[k]
@@ -1090,67 +1226,183 @@ type toolUseState struct {
 	GeneratedID bool
 }
 
-func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) *toolUseState {
+// pendingToolUses tracks the tool calls in flight for one stream. Entries are
+// keyed by toolUseId so interleaved parallel frames accumulate independently,
+// and `order` preserves arrival sequence: tool call order is semantic for
+// clients, so a bare map range (randomised in Go) must never decide it.
+type pendingToolUses struct {
+	byID   map[string]*toolUseState
+	order  []string
+	lastID string
+}
+
+func (p *pendingToolUses) get(id string) *toolUseState {
+	if p.byID == nil {
+		return nil
+	}
+	return p.byID[id]
+}
+
+func (p *pendingToolUses) add(state *toolUseState) {
+	if p.byID == nil {
+		p.byID = make(map[string]*toolUseState)
+	}
+	p.byID[state.ToolUseID] = state
+	p.order = append(p.order, state.ToolUseID)
+	p.lastID = state.ToolUseID
+}
+
+// rekey moves an entry from a locally generated id to the real id from
+// upstream, keeping its position in the arrival order.
+func (p *pendingToolUses) rekey(state *toolUseState, newID string) {
+	oldID := state.ToolUseID
+	delete(p.byID, oldID)
+	for i, id := range p.order {
+		if id == oldID {
+			p.order[i] = newID
+			break
+		}
+	}
+	state.ToolUseID = newID
+	state.GeneratedID = false
+	p.byID[newID] = state
+	if p.lastID == oldID {
+		p.lastID = newID
+	}
+}
+
+func (p *pendingToolUses) remove(id string) {
+	delete(p.byID, id)
+	for i, existing := range p.order {
+		if existing == id {
+			p.order = append(p.order[:i], p.order[i+1:]...)
+			break
+		}
+	}
+	if p.lastID == id {
+		p.lastID = ""
+	}
+}
+
+// flushAll emits every tool still open when the stream ended, in arrival order.
+// It stops at the first incomplete tool so the caller can retry the request
+// rather than deliver a call with missing arguments.
+func (p *pendingToolUses) flushAll(callback *KiroStreamCallback) error {
+	order := p.order
+	byID := p.byID
+	p.byID = nil
+	p.order = nil
+	p.lastID = ""
+	for _, id := range order {
+		state := byID[id]
+		if state == nil {
+			continue
+		}
+		if err := finishToolUse(state, callback); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handleToolUseEvent accumulates one toolUseEvent frame into pending.
+// Frames for different toolUseIds stay open concurrently so interleaved
+// parallel tool calls reassemble correctly; a fragment that omits toolUseId
+// continues the most recently seen tool.
+func handleToolUseEvent(event map[string]interface{}, pending *pendingToolUses, callback *KiroStreamCallback) error {
 	toolUseID := firstStringField(event, "toolUseId", "toolUseID", "tool_use_id", "id")
 	name := firstStringField(event, "name", "toolName", "tool_name")
 	isStop := firstBoolField(event, "stop", "isStop", "done")
 
-	if toolUseID != "" && name != "" {
-		if current == nil {
-			current = &toolUseState{ToolUseID: toolUseID, Name: name}
-		} else if current.ToolUseID != toolUseID {
-			if current.GeneratedID && current.Name == name {
-				current.ToolUseID = toolUseID
-				current.GeneratedID = false
-			} else {
-				finishToolUse(current, callback)
-				current = &toolUseState{ToolUseID: toolUseID, Name: name}
+	var state *toolUseState
+
+	switch {
+	case toolUseID != "":
+		state = pending.get(toolUseID)
+		if state == nil && pending.lastID != "" {
+			// Upstream may send the opening fragment without an id and only
+			// reveal the real one later. Adopt the synthetic entry we opened
+			// for it instead of splitting one logical call across two entries
+			// (which also splits its argument JSON, so neither half parses).
+			if prev := pending.get(pending.lastID); prev != nil && prev.GeneratedID && (name == "" || prev.Name == name) {
+				pending.rekey(prev, toolUseID)
+				state = prev
 			}
 		}
-	} else if name != "" && current == nil {
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
-	} else if name != "" && current != nil && current.Name != name {
-		finishToolUse(current, callback)
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
-	}
-
-	if current != nil {
-		if input, ok := event["input"].(string); ok {
-			current.InputBuffer.WriteString(input)
-		} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
-			data, _ := json.Marshal(inputObj)
-			current.InputBuffer.Reset()
-			current.InputBuffer.Write(data)
+		if state == nil {
+			if name == "" {
+				// Orphan fragment: an id never seen before and no name to open with.
+				return nil
+			}
+			state = &toolUseState{ToolUseID: toolUseID, Name: name}
+			pending.add(state)
+		} else {
+			if name != "" && state.Name == "" {
+				state.Name = name
+			}
+			pending.lastID = state.ToolUseID
 		}
-	}
-
-	if isStop && current != nil {
-		finishToolUse(current, callback)
+	case pending.lastID != "" && pending.get(pending.lastID) != nil:
+		state = pending.get(pending.lastID)
+		if name != "" && state.Name != name {
+			// Name changed with no id: close the tool in flight rather than
+			// appending foreign arguments to it, then open a new one.
+			if err := finishToolUse(state, callback); err != nil {
+				return err
+			}
+			pending.remove(state.ToolUseID)
+			state = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+			pending.add(state)
+		}
+	case name != "":
+		state = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		pending.add(state)
+	default:
 		return nil
 	}
 
-	return current
+	if input, ok := event["input"].(string); ok {
+		state.InputBuffer.WriteString(input)
+	} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
+		data, _ := json.Marshal(inputObj)
+		state.InputBuffer.Reset()
+		state.InputBuffer.Write(data)
+	}
+
+	if isStop {
+		if err := finishToolUse(state, callback); err != nil {
+			return err
+		}
+		pending.remove(state.ToolUseID)
+	}
+	return nil
 }
 
-func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
-	if state == nil || state.Name == "" || callback == nil || callback.OnToolUse == nil {
-		return
+func finishToolUse(state *toolUseState, callback *KiroStreamCallback) error {
+	if state == nil || state.Name == "" {
+		return nil
 	}
 	if state.ToolUseID == "" {
 		state.ToolUseID = "toolu_" + uuid.New().String()
 	}
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {
-		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
+		if err := json.Unmarshal([]byte(state.InputBuffer.String()), &input); err != nil {
+			return fmt.Errorf("%w: %v", errIncompleteKiroToolInput, err)
+		}
 	}
 	if input == nil {
 		input = make(map[string]interface{})
+	}
+	if callback == nil || callback.OnToolUse == nil {
+		return nil
 	}
 	callback.OnToolUse(KiroToolUse{
 		ToolUseID: state.ToolUseID,
 		Name:      state.Name,
 		Input:     input,
 	})
+	return nil
 }
 
 // FakeSignatureMarker 是兜底伪造签名的前缀标记。
@@ -1206,58 +1458,60 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 	return false
 }
 
-// extractEventType extracts the event type string from AWS Event Stream message headers.
-func extractEventType(headers []byte) string {
-	offset := 0
-	for offset < len(headers) {
-		if offset >= len(headers) {
-			break
-		}
-		nameLen := int(headers[offset])
+func eventStreamUint32(data []byte) uint32 {
+	return uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
+}
+
+func eventStreamChecksum(prelude, message []byte) uint32 {
+	checksum := crc32.Update(0, crc32.IEEETable, prelude)
+	return crc32.Update(checksum, crc32.IEEETable, message)
+}
+
+func parseEventStreamHeaders(data []byte) (map[string]string, error) {
+	headers := make(map[string]string)
+	for offset := 0; offset < len(data); {
+		nameLength := int(data[offset])
 		offset++
-		if offset+nameLen > len(headers) {
-			break
+		if nameLength == 0 || offset+nameLength >= len(data) {
+			return nil, errors.New("malformed event header name")
 		}
-		name := string(headers[offset : offset+nameLen])
-		offset += nameLen
-		if offset >= len(headers) {
-			break
-		}
-		valueType := headers[offset]
+		name := string(data[offset : offset+nameLength])
+		offset += nameLength
+		valueType := data[offset]
 		offset++
 
-		if valueType == 7 { // String
-			if offset+2 > len(headers) {
-				break
-			}
-			valueLen := int(headers[offset])<<8 | int(headers[offset+1])
-			offset += 2
-			if offset+valueLen > len(headers) {
-				break
-			}
-			value := string(headers[offset : offset+valueLen])
-			offset += valueLen
-			if name == ":event-type" {
-				return value
-			}
+		valueLength := 0
+		switch valueType {
+		case 0, 1:
 			continue
-		}
-
-		// Skip other value types by their fixed byte widths.
-		skipSizes := map[byte]int{0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
-		if valueType == 6 {
-			if offset+2 > len(headers) {
-				break
+		case 2:
+			valueLength = 1
+		case 3:
+			valueLength = 2
+		case 4:
+			valueLength = 4
+		case 5, 8:
+			valueLength = 8
+		case 9:
+			valueLength = 16
+		case 6, 7:
+			if offset+2 > len(data) {
+				return nil, errors.New("malformed variable event header")
 			}
-			l := int(headers[offset])<<8 | int(headers[offset+1])
-			offset += 2 + l
-		} else if skip, ok := skipSizes[valueType]; ok {
-			offset += skip
-		} else {
-			break
+			valueLength = int(data[offset])<<8 | int(data[offset+1])
+			offset += 2
+		default:
+			return nil, fmt.Errorf("unsupported event header type %d", valueType)
 		}
+		if offset+valueLength > len(data) {
+			return nil, errors.New("truncated event header value")
+		}
+		if valueType == 7 {
+			headers[name] = string(data[offset : offset+valueLength])
+		}
+		offset += valueLength
 	}
-	return ""
+	return headers, nil
 }
 
 // extractFrameMeta extracts the AWS Event Stream routing headers in a single
