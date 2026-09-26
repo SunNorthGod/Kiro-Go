@@ -1002,9 +1002,24 @@ var reasoningEffortLevels = map[string]bool{
 	"none": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
 }
 
+// defaultEffortTier 是无思考信号请求(裸模型名,不带后缀/thinking/effort)注入的
+// 固定档位,写死 high(2026-09-27 主人拍板,不做配置化)。
+const defaultEffortTier = "high"
+
+// resolveEffectiveThinking 决定请求的最终 thinking 形态:裸模型名请求(不带
+// 后缀/thinking 字段/effort,即 Kiro IDE agent 流量——原生后端里思考是协议内部的)
+// 写死视同显式思考,使请求侧(<thinking_mode> 标签 + output_config.effort)与响应门
+// 一齐打开;显式 thinking.type=="disabled" 一票否决。
+func resolveEffectiveThinking(thinking bool, req *ClaudeRequest) bool {
+	if thinking {
+		return true
+	}
+	return !(req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled"))
+}
+
 // resolveReasoningEffort 解析 reasoning-schema 模型(GPT)的 effort:
 // 客户端显式关思考(thinking.type=="disabled")→ none;否则取 output_config.effort,
-// 再 budget_tokens 映射;都缺省时取全局 DefaultEffort,未配置则 high;非法档位回退 high。
+// 再 budget_tokens 映射;都缺省时固定 high;非法档位回退 high。
 func resolveReasoningEffort(req *ClaudeRequest) string {
 	if req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled") {
 		return "none"
@@ -1019,10 +1034,7 @@ func resolveReasoningEffort(req *ClaudeRequest) string {
 	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
 		return budgetToEffort(req.Thinking.BudgetTokens)
 	}
-	if de := config.GetDefaultEffort(); de != "" {
-		return de
-	}
-	return "high"
+	return defaultEffortTier
 }
 
 // resolveModelEffort 在 resolveReasoningEffort(已知超集校验)之上,再按注册表登记的
@@ -1155,14 +1167,12 @@ func buildAdditionalModelRequestFieldsInner(req *ClaudeRequest, thinking bool, k
 		//      Kiro 客户端(及对齐它的插件)默认 auto 档**只发** output_config.effort,既不发
 		//      thinking 字段、模型名也不带后缀。此前只认 thinking bool → 这份 effort 被整个丢弃,
 		//      Claude effort 家族(opus-4.8 等)后端收不到任何思考指令,导致"完全不思考"。
-		//   3) 全局 DefaultEffort 已配置 —— Kiro IDE 的 agent 流量(实测 219 条,23 工具多轮)
-		//      thinking/output_config 全都不发:原生后端里思考是协议内部的,客户端无需表达。
-		//      在 Anthropic 兼容层上这等价于"永远不思考"(生产 fulllog:83% 工具轮零思考)。
-		//      DefaultEffort 补上这个位,对齐原版 Kiro 的"始终有思考"体验;空串=关闭,退回
-		//      严格 Anthropic 语义(无信号→不思考)。档位统一过 resolveModelEffort 按模型收敛。
+		//   3) 裸模型名请求写死注入(档位 defaultEffortTier=high)—— Kiro IDE agent 流量
+		//      (实测 219 条,23 工具多轮)thinking/output_config 全都不发:原生后端里思考是
+		//      协议内部的,客户端无需表达。在 Anthropic 兼容层上这等价于"永远不思考"(生产
+		//      fulllog:83% 工具轮零思考)。档位统一过 resolveModelEffort 按模型收敛。
 		hasExplicitEffort := req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != ""
-		defaultEffortOn := config.GetDefaultEffort() != ""
-		if !disabled && (thinking || hasExplicitEffort || defaultEffortOn) {
+		if !disabled && (thinking || hasExplicitEffort) {
 			fields["output_config"] = map[string]interface{}{"effort": resolveModelEffort(req, kiroID)}
 		}
 

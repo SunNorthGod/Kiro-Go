@@ -24,9 +24,6 @@ export function SettingsPage() {
         <Section title="卡密默认限制" desc="没有单独设置的卡密会使用这里的值。填 0 表示不限制。">
           <LimitsForm />
         </Section>
-        <Section title="思考模式" desc="客户端请求未携带思考参数时注入的默认档位；带 -thinking 后缀或显式传参的请求不受影响。">
-          <ThinkingForm />
-        </Section>
       </div>
 
       <button
@@ -91,82 +88,6 @@ function SaveRow({ busy, onClick, label = '保存', disabled }: { busy: boolean;
         {label}
       </Button>
     </div>
-  )
-}
-
-/* ---------------- thinking ---------------- */
-type EffortTier = '' | 'low' | 'medium' | 'high' | 'xhigh'
-const FORMAT_OPTIONS = [
-  { value: 'reasoning_content', label: 'reasoning_content' },
-  { value: 'thinking', label: 'thinking' },
-  { value: 'think', label: 'think' },
-]
-
-function ThinkingForm() {
-  const [loaded, setLoaded] = useState(false)
-  const [suffix, setSuffix] = useState('-thinking')
-  const [openaiFormat, setOpenaiFormat] = useState('reasoning_content')
-  const [claudeFormat, setClaudeFormat] = useState('thinking')
-  const [effort, setEffort] = useState<EffortTier>('')
-  const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    api<{ suffix: string; openaiFormat: string; claudeFormat: string; defaultEffort: string | null }>('/thinking')
-      .then((d) => {
-        setSuffix(d.suffix || '-thinking')
-        setOpenaiFormat(d.openaiFormat || 'reasoning_content')
-        setClaudeFormat(d.claudeFormat || 'thinking')
-        setEffort((d.defaultEffort as EffortTier) || '')
-      })
-      .catch((e) => toast.error('读取思考设置失败：' + (e as Error).message))
-      .finally(() => setLoaded(true))
-  }, [])
-
-  const save = async () => {
-    if (!suffix.trim()) return toast.warning('后缀不能为空')
-    setBusy(true)
-    try {
-      await api('/thinking', {
-        method: 'POST',
-        body: { suffix: suffix.trim(), openaiFormat, claudeFormat, defaultEffort: effort },
-      })
-      toast.success('思考设置已保存')
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
-  if (!loaded) return <Skeleton h={96} />
-  return (
-    <>
-      <div className="grid grid-2" style={{ gap: 12 }}>
-        <Field label="思考后缀" hint="模型名带该后缀时强制开启思考，如 claude-opus-5.5-thinking">
-          <Input value={suffix} onChange={(e) => setSuffix(e.target.value)} placeholder="-thinking" />
-        </Field>
-        <Field label="默认思考档位" hint="对不带任何思考参数的请求生效（如 Kiro IDE 的 agent 流量）；选「关闭」恢复严格按请求行事的语义。">
-          <Select<EffortTier>
-            value={effort}
-            onChange={setEffort}
-            style={{ width: '100%' }}
-            options={[
-              { value: '', label: '关闭（不注入）' },
-              { value: 'low', label: 'Low' },
-              { value: 'medium', label: 'Medium' },
-              { value: 'high', label: 'High（推荐）' },
-              { value: 'xhigh', label: 'XHigh' },
-            ]}
-          />
-        </Field>
-        <Field label="OpenAI 输出格式" hint="思考内容经 OpenAI 协议下发时的字段名。">
-          <Select value={openaiFormat} onChange={setOpenaiFormat} style={{ width: '100%' }} options={FORMAT_OPTIONS} />
-        </Field>
-        <Field label="Claude 输出格式" hint="思考内容经 Anthropic 协议下发时的字段名。">
-          <Select value={claudeFormat} onChange={setClaudeFormat} style={{ width: '100%' }} options={FORMAT_OPTIONS} />
-        </Field>
-      </div>
-      <SaveRow busy={busy} onClick={save} />
-    </>
   )
 }
 
