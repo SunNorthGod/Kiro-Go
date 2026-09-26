@@ -738,3 +738,39 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 		t.Fatalf("tool image should not leak into a later user message, got %d on current", len(cur.Images))
 	}
 }
+
+func TestBudgetToEffortMapping(t *testing.T) {
+	cases := map[int]string{
+		1024: "low", 8191: "low",
+		8192: "medium", 16383: "medium",
+		16384: "high", 32767: "high",
+		32768: "xhigh", 65536: "xhigh",
+	}
+	for budget, want := range cases {
+		if got := budgetToEffort(budget); got != want {
+			t.Fatalf("budgetToEffort(%d) = %q, want %q", budget, got, want)
+		}
+	}
+}
+
+// A standard-Anthropic client (thinking.enabled + budget_tokens, no
+// output_config) must still drive the effort tier through the mapping, then
+// fall through the existing per-model clamp.
+func TestResolveReasoningEffortFromBudget(t *testing.T) {
+	req := &ClaudeRequest{
+		Thinking: &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 9000},
+	}
+	if got := resolveReasoningEffort(req); got != "medium" {
+		t.Fatalf("effort from budget 9000 = %q, want medium", got)
+	}
+	// Explicit output_config still wins over the budget.
+	req.OutputConfig = &ClaudeOutputConfig{Effort: "low"}
+	if got := resolveReasoningEffort(req); got != "low" {
+		t.Fatalf("explicit effort overridden by budget, got %q", got)
+	}
+	// Disabled thinking wins over everything.
+	req.Thinking.Type = "disabled"
+	if got := resolveReasoningEffort(req); got != "none" {
+		t.Fatalf("disabled thinking = %q, want none", got)
+	}
+}

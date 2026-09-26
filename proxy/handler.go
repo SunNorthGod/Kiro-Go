@@ -1781,6 +1781,10 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 
+		// 思考重注入缓存:记住本会话最后一轮的思考+溯源签名。OpenAI 协议线的客户端
+		// 无法回传思考,下一轮由 thinking_cache 在构建上游历史时按内容哈希补回。
+		rememberThinkingForReplay(payload.ConversationState.ConversationID,
+			rawContentBuilder.String(), rawThinkingBuilder.String(), nativeSignature, account.ID)
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
 			sendText("", 3)
@@ -2386,6 +2390,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		// SelfHeal"的语义)。provenance 标记使下一轮回传的签名可判定同账号(保留)/
 		// 跨账号(applyThinkingProvenance 剥离),不引入跨账号回放 400 风险。
 		applyResponseThinkingSignature(resp.Content, nativeSignature, account.ID)
+		// 思考重注入缓存(同流式路径):仅记成功响应。
+		rememberThinkingForReplay(payload.ConversationState.ConversationID, finalContent, responseThinkingContent, nativeSignature, account.ID)
 		// stop_reason 已由 KiroToClaudeResponse 内部按上游真实值映射(#145),
 		// 取代本地旧的 resolveClaudeStopReason 推断。
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)

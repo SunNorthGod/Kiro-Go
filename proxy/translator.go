@@ -393,6 +393,22 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	history = trimLeadingAssistantHistory(history)
+	claudeSessionHint := ""
+	if req.Metadata != nil {
+		claudeSessionHint = req.Metadata.UserID
+	}
+	conversationID := deriveConversationID(claudeSessionHint, modelID, systemPrompt, claudeToolNames(req.Tools), firstClaudeConversationAnchor(req.Messages))
+	// 思考重注入(OpenAI 协议线的思考连续性):客户端(插件经 NewAPI)回传不了
+	// 上一轮 assistant 的思考块,由 thinking_cache 按会话补回——内容哈希必须命中
+	//(客户端原样回传了上一轮回复),注入的候选随后走 provenance 裁决管线。
+	if len(history) > 0 {
+		if last := history[len(history)-1].AssistantResponseMessage; last != nil && last.ReasoningCandidate == nil && last.Content != "" {
+			if reasoning, wrappedSig, producerTok, ok := replayThinkingCandidate(conversationID, last.Content); ok {
+				last.ReasoningCandidate = &KiroReasoningContent{ReasoningText: KiroReasoningText{Text: reasoning, Signature: wrappedSig}}
+				last.ReasoningProducer = producerTok
+			}
+		}
+	}
 
 	// Keep system instructions in history instead of user content.
 	if systemPrompt != "" {
@@ -454,11 +470,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 确定性会话身份:session id > system+tools 哈希 > system+锚点 派生。
 	// agentContinuationId 从 conversationId 派生,同一会话稳定 → 命中 Kiro 前缀缓存。
 	// 旧实现 uuid.New() 每请求随机,前缀缓存永不命中。
-	claudeSessionHint := ""
-	if req.Metadata != nil {
-		claudeSessionHint = req.Metadata.UserID
-	}
-	conversationID := deriveConversationID(claudeSessionHint, modelID, systemPrompt, claudeToolNames(req.Tools), firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.ConversationID = conversationID
 	payload.ConversationState.AgentContinuationId = deriveAgentContinuationID(conversationID)
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
@@ -998,12 +1009,15 @@ func resolveReasoningEffort(req *ClaudeRequest) string {
 	if req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Type), "disabled") {
 		return "none"
 	}
-	raw := "high"
 	if req.OutputConfig != nil && req.OutputConfig.Effort != "" {
-		raw = req.OutputConfig.Effort
+		return req.OutputConfig.Effort
 	}
-	if reasoningEffortLevels[raw] {
-		return raw
+	// Standard-Anthropic clients (Claude Code, official SDKs) express thinking
+	// strength as budget_tokens and never send the Kiro-native output_config.
+	// Map the budget onto an effort tier so their intent survives the protocol
+	// translation; resolveModelEffort then clamps it to the model's real tiers.
+	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
+		return budgetToEffort(req.Thinking.BudgetTokens)
 	}
 	return "high"
 }
@@ -1014,6 +1028,23 @@ func resolveReasoningEffort(req *ClaudeRequest) string {
 // 各模型的 effort 枚举并不一致(实测:sonnet-5 / opus-4.8 有 xhigh,opus-4.6 /
 // sonnet-4.6 没有),客户端把不支持的档位发上去会被上游 400。注册表登记了合法档位时,
 // 非法值退回该模型的官方默认档;未登记则保持原行为(超集校验)。
+// budgetToEffort maps an Anthropic thinking budget_tokens value onto the Kiro
+// effort tiers. Thresholds (tokens): <8k low, <16k medium, <32k high, >=32k
+// xhigh. The "max" tier is deliberately never produced here - its semantics
+// are Kiro-native and no standard client can ask for it by budget.
+func budgetToEffort(budget int) string {
+	switch {
+	case budget < 8192:
+		return "low"
+	case budget < 16384:
+		return "medium"
+	case budget < 32768:
+		return "high"
+	default:
+		return "xhigh"
+	}
+}
+
 func resolveModelEffort(req *ClaudeRequest, kiroID string) string {
 	effort := resolveReasoningEffort(req)
 	allowed, known := effortAllowedByModel(kiroID, effort)
