@@ -73,19 +73,15 @@ func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string,
 	if toolCallCount > 0 {
 		return nil
 	}
-	if contentChars > 0 || sawReasoning {
+	// Production divergence from upstream #146 (71k-request measurement): the
+	// real Kiro stream regularly ends with EOF and NO stopReason frame on fully
+	// successful turns. Treating content-without-stopReason as truncated would
+	// triple-burn credits on healthy traffic. Only reasoning-with-no-answer -
+	// the invisible failure this proxy exists to catch - stays truncated.
+	if contentChars == 0 && sawReasoning {
 		return errUpstreamTruncatedResponse
 	}
-	// No content, no reasoning, no tools: unreachable through the wired paths
-	// (errEmptyKiroStream fires first, see above). Treated as truncated rather
-	// than complete so a future caller that bypasses that guard still cannot
-	// ship an empty turn as a success.
-	return errUpstreamTruncatedResponse
-	// No content, no reasoning, no tools: unreachable through the wired paths
-	// (errEmptyKiroStream fires first, see above). Treated as truncated rather
-	// than complete so a future caller that bypasses that guard still cannot
-	// ship an empty turn as a success.
-	return errUpstreamTruncatedResponse
+	return nil
 }
 
 // isStreamIntegrityError reports whether err is a soft integrity failure.

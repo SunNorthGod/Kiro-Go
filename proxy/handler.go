@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -502,6 +503,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"/v1/chat/completions", "/chat/completions",
 		"/v1/responses", "/responses":
 		r.Body = http.MaxBytesReader(w, r.Body, maxAPIBodyBytes)
+	}
+
+	// 全量请求/响应捕获(fullLog,config.FullLog 开关):仅对中继 API 端点生效。
+	// 本处理器位于 WithGzip 内侧(main.go 外层中间件),captureWriter 捕获的是
+	// 未压缩明文,SSE 即原始事件流文本。请求体先整体读入再以 NopCloser 原样
+	// 替换,下游 handler 不感知;上方 MaxBytesReader 上限照常生效,读体失败的
+	// 请求(超限)不捕获,直接保留原 body 语义。请求完成(状态码+耗时已知,
+	// 含 panic 提前返回)后异步投递记录。
+	if config.GetFullLogEnabled() && isFulllogCapturePath(path) && r.Method != http.MethodOptions {
+		if body, err := io.ReadAll(r.Body); err == nil {
+			_ = r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			meta := &fulllogRequestMeta{}
+			r = r.WithContext(context.WithValue(r.Context(), fulllogCtxKey{}, meta))
+			cw := newCaptureWriter(w, fulllogMaxResponseBytes)
+			w = cw
+			start := time.Now()
+			defer func() {
+				enqueueFulllogRecord(fulllogRecord{
+					ts:         start,
+					method:     r.Method,
+					path:       path,
+					apiKeyID:   apiKeyIDFromContext(r.Context()),
+					accountID:  meta.account(),
+					status:     cw.capturedStatus(),
+					durationMs: time.Since(start).Milliseconds(),
+					request:    body,
+					response:   cw.capturedBytes(),
+				})
+			}()
+		}
 	}
 
 	// 路由
@@ -1278,6 +1310,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		if aerr != nil {
 			break // ErrNoAccount → 无可用账号
 		}
+		fulllogNoteAccount(ctx, account.ID)
 		if err := h.ensureValidToken(&account); err != nil {
 			releaseSlot()
 			lastErr = err
@@ -2186,6 +2219,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		if aerr != nil {
 			break // ErrNoAccount → 无可用账号
 		}
+		fulllogNoteAccount(ctx, account.ID)
 		if err := h.ensureValidToken(&account); err != nil {
 			releaseSlot()
 			lastErr = err
@@ -2516,6 +2550,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		if aerr != nil {
 			break // ErrNoAccount → 无可用账号
 		}
+		fulllogNoteAccount(ctx, account.ID)
 		if err := h.ensureValidToken(&account); err != nil {
 			releaseSlot()
 			lastErr = err
@@ -3060,6 +3095,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		if aerr != nil {
 			break // ErrNoAccount → 无可用账号
 		}
+		fulllogNoteAccount(ctx, account.ID)
 		if err := h.ensureValidToken(&account); err != nil {
 			releaseSlot()
 			lastErr = err
@@ -3458,6 +3494,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
 		h.apiClearLogs(w, r)
+	case path == "/fulllog" && r.Method == "GET":
+		h.apiFulllogList(w, r)
+	case path == "/fulllog/download" && r.Method == "GET":
+		h.apiFulllogDownload(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":

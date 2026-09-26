@@ -278,6 +278,13 @@ type Config struct {
 	// Can be overridden by the LOG_LEVEL environment variable.
 	LogLevel string `json:"logLevel,omitempty"`
 
+	// FullLog enables full request/response body capture on the relay API
+	// endpoints (/v1/messages, /v1/chat/completions, /v1/responses). Records
+	// are written asynchronously as JSONL under <data>/fulllog/ for
+	// troubleshooting and distillation. Disabled by default; bodies may
+	// contain user prompt content, so the switch must stay opt-in.
+	FullLog bool `json:"fullLog,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -1470,6 +1477,28 @@ func GetLogLevel() string {
 		return "info"
 	}
 	return cfg.LogLevel
+}
+
+// GetFullLogEnabled returns whether full request/response capture is enabled.
+// Defaults to false, also before Init has run.
+func GetFullLogEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FullLog
+}
+
+// SetFullLog toggles full request/response capture and persists the change.
+func SetFullLog(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	cfg.FullLog = enabled
+	return Save()
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.

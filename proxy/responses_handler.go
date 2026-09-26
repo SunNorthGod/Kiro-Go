@@ -172,6 +172,7 @@ func (h *Handler) handleResponsesNonStream(
 		if aerr != nil {
 			break
 		}
+		fulllogNoteAccount(ctx, account.ID)
 		if err := h.ensureValidToken(&account); err != nil {
 			releaseSlot()
 			lastErr = err
@@ -482,6 +483,7 @@ func (h *Handler) handleResponsesStream(
 		if aerr != nil {
 			break
 		}
+		fulllogNoteAccount(ctx, account.ID)
 		if err := h.ensureValidToken(&account); err != nil {
 			releaseSlot()
 			lastErr = err
