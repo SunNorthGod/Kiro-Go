@@ -25,3 +25,5 @@ PR-*.md
 
 # Build output (cross-compiled binaries land here)
 /dist/
+# Frontend toolchain (build output goes to web/, which IS committed)
+/frontend/node_modules/

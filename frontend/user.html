@@ -6,12 +6,11 @@
     <meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#0b0c0f" media="(prefers-color-scheme: dark)" />
     <meta name="color-scheme" content="light dark" />
-    <title>Kiro-Go 管理后台</title>
+    <title>Kiro-Go 用户中心</title>
     <link rel="icon" type="image/png" sizes="32x32" href="/admin/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="64x64" href="/admin/favicon-64.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/admin/favicon-180.png" />
     <script>
-      // Resolve the theme before first paint so there is no light flash in dark mode.
       (function () {
         try {
           var p = localStorage.getItem('kiro_theme');
@@ -20,11 +19,9 @@
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="/admin/assets/index-u4eMis0k.js"></script>
-    <link rel="modulepreload" crossorigin href="/admin/assets/media-yymVPjSQ.js">
-    <link rel="stylesheet" crossorigin href="/admin/assets/media-DX1h1Nqd.css">
   </head>
   <body>
     <div id="root"></div>
+    <script type="module" src="/src/user/main.tsx"></script>
   </body>
 </html>

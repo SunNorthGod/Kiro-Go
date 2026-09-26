@@ -1,0 +1,122 @@
+/*
+ * Design tokens. One neutral ramp, one accent, four status hues.
+ * Light and dark share every name; components never hard-code colours.
+ */
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #f3f4f7;
+  --surface-3: #eceef2;
+  --overlay: rgb(12 14 18 / 0.36);
+
+  --border: #e3e5ea;
+  --border-strong: #d2d5dc;
+  --divider: #eceef1;
+
+  --text: #0f1216;
+  --text-2: #3b414b;
+  --muted: #697180;
+  --faint: #9aa0ab;
+
+  --ink: #14171c;
+  --ink-hover: #2a2f37;
+  --ink-fg: #ffffff;
+
+  --accent: #2f66f5;
+  --accent-hover: #2556d8;
+  --accent-fg: #ffffff;
+  --accent-soft: rgb(47 102 245 / 0.09);
+  --accent-line: rgb(47 102 245 / 0.28);
+
+  --ok: #13905a;
+  --ok-soft: rgb(19 144 90 / 0.1);
+  --warn: #b86a00;
+  --warn-soft: rgb(214 130 0 / 0.12);
+  --bad: #d63a3f;
+  --bad-hover: #bd2f34;
+  --bad-soft: rgb(214 58 63 / 0.09);
+  --pink: #d9467a;
+  --pink-soft: rgb(217 70 122 / 0.1);
+  --teal: #0e8c8c;
+  --teal-soft: rgb(14 140 140 / 0.1);
+
+  --chart-1: #2f66f5;
+  --chart-2: #0e8c8c;
+
+  --ring: 0 0 0 3px rgb(47 102 245 / 0.22);
+
+  --shadow-xs: 0 1px 1px rgb(15 18 22 / 0.03);
+  --shadow-sm: 0 1px 2px rgb(15 18 22 / 0.04), 0 1px 3px -1px rgb(15 18 22 / 0.05);
+  --shadow-md: 0 6px 16px -6px rgb(15 18 22 / 0.12), 0 2px 4px -2px rgb(15 18 22 / 0.05);
+  --shadow-pop: 0 18px 44px -14px rgb(15 18 22 / 0.26), 0 4px 10px -4px rgb(15 18 22 / 0.08);
+
+  --radius-xs: 5px;
+  --radius-sm: 7px;
+  --radius: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --font-sans: "Geist Variable", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Noto Sans SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.36, 0.64, 1);
+
+  --sidebar-w: 236px;
+  --topbar-h: 60px;
+
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #0b0c0f;
+  --surface: #121418;
+  --surface-2: #171a1f;
+  --surface-3: #1e2127;
+  --overlay: rgb(0 0 0 / 0.6);
+
+  --border: #22252c;
+  --border-strong: #2e323a;
+  --divider: #1c1f25;
+
+  --text: #eceef2;
+  --text-2: #c3c8d0;
+  --muted: #8a909b;
+  --faint: #5d636e;
+
+  --ink: #eceef2;
+  --ink-hover: #ffffff;
+  --ink-fg: #0b0c0f;
+
+  --accent: #5b87ff;
+  --accent-hover: #7298ff;
+  --accent-fg: #0b0c0f;
+  --accent-soft: rgb(91 135 255 / 0.13);
+  --accent-line: rgb(91 135 255 / 0.35);
+
+  --ok: #3cc27f;
+  --ok-soft: rgb(60 194 127 / 0.12);
+  --warn: #e9a23b;
+  --warn-soft: rgb(233 162 59 / 0.13);
+  --bad: #f06a6e;
+  --bad-hover: #f58386;
+  --bad-soft: rgb(240 106 110 / 0.12);
+  --pink: #f07aa3;
+  --pink-soft: rgb(240 122 163 / 0.12);
+  --teal: #37c1bf;
+  --teal-soft: rgb(55 193 191 / 0.12);
+
+  --chart-1: #6b93ff;
+  --chart-2: #37c1bf;
+
+  --ring: 0 0 0 3px rgb(91 135 255 / 0.3);
+
+  --shadow-xs: none;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-md: 0 8px 20px -8px rgb(0 0 0 / 0.6);
+  --shadow-pop: 0 22px 50px -12px rgb(0 0 0 / 0.75), 0 0 0 1px var(--border-strong);
+
+  color-scheme: dark;
+}
