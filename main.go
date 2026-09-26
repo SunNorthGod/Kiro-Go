@@ -90,7 +90,7 @@ func main() {
 	// guard against slowloris-style header/body stalls.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           proxy.WithGzip(handler),
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
