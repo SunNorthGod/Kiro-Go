@@ -80,12 +80,12 @@ type Handler struct {
 	// keepalivePings 计数三条流式路径已发出的 SSE 心跳(防中间层空闲读超时切流,
 	// 见 sse_keepalive.go)。仅观测,挂在 /admin/api/status 与 /admin/api/stats。
 	keepalivePings int64
-	totalTokens       int64
-	totalCredits    float64 // float64 需要用锁保护
-	creditsMu       sync.RWMutex
-	startTime       int64
-	stopRefresh     chan struct{}
-	stopStatsSaver  chan struct{}
+	totalTokens    int64
+	totalCredits   float64 // float64 需要用锁保护
+	creditsMu      sync.RWMutex
+	startTime      int64
+	stopRefresh    chan struct{}
+	stopStatsSaver chan struct{}
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
@@ -94,15 +94,15 @@ type Handler struct {
 	// all-accounts refresh so a burst of /v1/models on an empty cache triggers ONE
 	// refresh (others coalesce), and modelsLastColdAttempt is a short negative
 	// cache so a failing refresh isn't retried on every request.
-	modelsColdMu         sync.Mutex
+	modelsColdMu          sync.Mutex
 	modelsLastColdAttempt int64
-	promptCache     *promptCacheTracker
+	promptCache           *promptCacheTracker
 	// tokenRefreshLocks serializes token refreshes PER ACCOUNT (not globally): a
 	// single shared mutex meant a slow refresh for one account blocked every
 	// other account's requests from even checking their own token. Keyed by
 	// account id; entries are created on demand and kept (bounded by account count).
-	tokenRefreshMu    sync.Mutex // guards the tokenRefreshLocks map only
-	tokenRefreshLocks map[string]*sync.Mutex
+	tokenRefreshMu     sync.Mutex // guards the tokenRefreshLocks map only
+	tokenRefreshLocks  map[string]*sync.Mutex
 	credentialImportMu sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
@@ -316,17 +316,17 @@ func NewHandler() *Handler {
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
-		pool:            pool.GetPool(),
-		totalRequests:   int64(totalReq),
-		successRequests: int64(successReq),
-		failedRequests:  int64(failedReq),
-		totalTokens:     int64(totalTokens),
-		totalCredits:    totalCredits,
-		startTime:       time.Now().Unix(),
-		stopRefresh:       make(chan struct{}),
-		stopStatsSaver:    make(chan struct{}),
-		promptCache:       newPromptCacheTracker(defaultPromptCacheTTL),
-		tokenRefreshLocks: make(map[string]*sync.Mutex),
+		pool:                 pool.GetPool(),
+		totalRequests:        int64(totalReq),
+		successRequests:      int64(successReq),
+		failedRequests:       int64(failedReq),
+		totalTokens:          int64(totalTokens),
+		totalCredits:         totalCredits,
+		startTime:            time.Now().Unix(),
+		stopRefresh:          make(chan struct{}),
+		stopStatsSaver:       make(chan struct{}),
+		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
+		tokenRefreshLocks:    make(map[string]*sync.Mutex),
 		microsoftSelections:  make(map[string]*microsoftProfileSelection),
 		microsoftCanceled:    make(map[string]time.Time),
 		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
@@ -1264,7 +1264,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				// credits=0 at message_start: the upstream meteringEvent has not
 				// arrived yet, so no per-turn credits are known. The final
 				// message_delta carries the real credits (see below).
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil, 0),
+				"usage": buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil, 0),
 			},
 		})
 		messageStarted = true
@@ -5219,9 +5219,9 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	// Counters are mutated concurrently by request handlers; read them atomically
 	// (and credits through its mutex) rather than racing on the plain fields.
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"version":         config.Version,
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
+		"version":           config.Version,
+		"accounts":          h.pool.Count(),
+		"available":         h.pool.AvailableCount(),
 		"totalRequests":     atomic.LoadInt64(&h.totalRequests),
 		"successRequests":   atomic.LoadInt64(&h.successRequests),
 		"failedRequests":    atomic.LoadInt64(&h.failedRequests),
@@ -5488,7 +5488,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"trialUsageCurrent": account.TrialUsageCurrent, "trialUsageLimit": account.TrialUsageLimit,
 		"trialUsagePercent": account.TrialUsagePercent, "trialStatus": account.TrialStatus,
 		"trialExpiresAt": account.TrialExpiresAt,
-		"requestCount": stats.RequestCount, "errorCount": stats.ErrorCount,
+		"requestCount":   stats.RequestCount, "errorCount": stats.ErrorCount,
 		"totalTokens": stats.TotalTokens, "totalCredits": stats.TotalCredits,
 		"lastUsed": stats.LastUsed,
 	}

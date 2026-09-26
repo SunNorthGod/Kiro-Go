@@ -224,11 +224,11 @@ func TestMarshalRecordDefaultsStatusZeroTo500(t *testing.T) {
 func TestFulllogFileSinkHourlyFilesAndRotation(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.Local)
-	sink := newFulllogFileSink(dir, 128) // tiny cap to force rotation
+	sink := newFulllogFileSink(dir, 256) // small cap; one record fits, two rotate
 	clock := now
 	sink.now = func() time.Time { return clock }
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 3; i++ {
 		if err := sink.WriteRecord(fulllogRecord{
 			ts: clock, method: "POST", path: "/v1/messages", status: 200,
 			request: []byte(`{"model":"m","messages":[]}`),
@@ -242,9 +242,6 @@ func TestFulllogFileSinkHourlyFilesAndRotation(t *testing.T) {
 	if err := sink.WriteRecord(fulllogRecord{ts: clock, method: "POST", path: "/v1/messages", status: 200}); err != nil {
 		t.Fatalf("write next-hour record: %v", err)
 	}
-	if err := sink.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
 
 	files, err := fulllogListFiles(dir)
 	if err != nil {
@@ -255,8 +252,8 @@ func TestFulllogFileSinkHourlyFilesAndRotation(t *testing.T) {
 		byName[f.Name] = f
 	}
 	base1 := byName["fulllog-20260926-10.log"]
-	if base1.Name == "" || base1.Lines < 1 {
-		t.Fatalf("hourly base file missing or empty: %+v (all: %v)", base1, files)
+	if base1.Name == "" || base1.Lines != 1 {
+		t.Fatalf("hourly base file must hold the post-rotation record: %+v (all: %v)", base1, files)
 	}
 	rotated := false
 	for name, f := range byName {
@@ -406,7 +403,11 @@ func TestFulllogAdminListAndDownload(t *testing.T) {
 // ==================== queue saturation ====================
 
 func TestFulllogQueueDropCounting(t *testing.T) {
+	enqueueFulllogRecord(fulllogRecord{}) // ensure the writer (and queue) exist
 	saved := fulllogQueue
+	if saved == nil {
+		t.Fatal("enqueueFulllogRecord must initialize the queue")
+	}
 	defer func() { fulllogQueue = saved }()
 	// A fresh channel nobody drains: enqueue must drop instead of blocking.
 	fulllogQueue = make(chan fulllogRecord, 1)

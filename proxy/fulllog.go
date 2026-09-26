@@ -207,8 +207,11 @@ func encodeFulllogPayload(b []byte, limit int) json.RawMessage {
 	if len(b) > limit {
 		b = b[:limit]
 		truncated = true
-		for len(b) > 0 && !utf8.Valid(b) {
-			b = b[:len(b)-1] // drop a partial trailing rune (at most 3 bytes)
+		// Drop a partial trailing rune (at most utf8.UTFMax-1 bytes) so
+		// truncated text stays valid UTF-8; genuinely binary data remains
+		// invalid and falls through to base64.
+		for i := 0; i < utf8.UTFMax-1 && len(b) > 0 && !utf8.Valid(b); i++ {
+			b = b[:len(b)-1]
 		}
 	}
 	if !truncated {
@@ -225,9 +228,9 @@ func encodeFulllogPayload(b []byte, limit int) json.RawMessage {
 		return out
 	}
 	out, _ := json.Marshal(struct {
-		Encoding   string `json:"encoding"`
-		Data       string `json:"data"`
-		Truncated  bool   `json:"truncated,omitempty"`
+		Encoding  string `json:"encoding"`
+		Data      string `json:"data"`
+		Truncated bool   `json:"truncated,omitempty"`
 	}{Encoding: "base64", Data: base64.StdEncoding.EncodeToString(b), Truncated: truncated})
 	return out
 }
@@ -270,16 +273,15 @@ func marshalRecord(rec fulllogRecord) []byte {
 
 // ==================== file sink (hourly file + rotation) ====================
 
-// fulllogFileSink owns the currently open hourly capture file. Not safe for
-// concurrent use; the single writer goroutine owns it (tests drive it directly).
+// fulllogFileSink appends records to the hourly capture file. It holds no
+// persistent file handle: each record is one open/append/close cycle, so
+// readers (admin download) only ever see complete lines and the rename-based
+// rotation works on Windows. Not safe for concurrent use; the single writer
+// goroutine owns it (tests drive it directly).
 type fulllogFileSink struct {
 	dir          string
 	maxFileBytes int64
 	now          func() time.Time // injectable clock for tests
-
-	f    *os.File
-	name string
-	size int64
 }
 
 func newFulllogFileSink(dir string, maxFileBytes int64) *fulllogFileSink {
@@ -300,9 +302,10 @@ func fulllogValidFilename(name string) bool {
 	return fulllogFilenameRe.MatchString(name)
 }
 
-// WriteRecord appends one record to the current hourly file, opening or
-// rotating files as needed. A rotate rename error is reported but does not
-// lose the record (the base file keeps growing until rotation succeeds).
+// WriteRecord appends one record to the current hourly file, rotating the
+// file to its next -N suffix when it exceeds maxFileBytes. A failed rotation
+// is reported but does not lose the record (the base file keeps growing until
+// rotation succeeds).
 func (s *fulllogFileSink) WriteRecord(rec fulllogRecord) error {
 	line := marshalRecord(rec)
 	if line == nil {
@@ -312,74 +315,45 @@ func (s *fulllogFileSink) WriteRecord(rec fulllogRecord) error {
 		return fmt.Errorf("fulllog: mkdir %s: %w", s.dir, err)
 	}
 	name := fulllogFileName(s.now())
-	if s.f == nil || s.name != name {
-		if err := s.open(name); err != nil {
-			return err
-		}
-	}
-	if _, err := s.f.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("fulllog: write %s: %w", s.name, err)
-	}
-	s.size += int64(len(line)) + 1
-	if s.size >= s.maxFileBytes {
-		s.rotate()
-	}
-	return nil
-}
-
-func (s *fulllogFileSink) open(name string) error {
-	s.closeFile()
 	path := filepath.Join(s.dir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("fulllog: open %s: %w", path, err)
 	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return fmt.Errorf("fulllog: stat %s: %w", path, err)
+	info, statErr := f.Stat()
+	_, writeErr := f.Write(append(line, '\n'))
+	// Close before any rotation: rename of an open file fails on Windows.
+	closeErr := f.Close()
+	if statErr != nil {
+		return fmt.Errorf("fulllog: stat %s: %w", path, statErr)
 	}
-	s.f = f
-	s.name = name
-	s.size = info.Size()
+	if writeErr != nil {
+		return fmt.Errorf("fulllog: write %s: %w", name, writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("fulllog: close %s: %w", name, closeErr)
+	}
+	if info.Size()+int64(len(line)+1) >= s.maxFileBytes {
+		s.rotate(name)
+	}
 	return nil
 }
 
 // rotate renames the current hourly file to its next free -N suffix; the next
-// record reopens the base name. The file must be closed before renaming
-// (rename of an open file fails on Windows).
-func (s *fulllogFileSink) rotate() {
-	if s.f == nil {
-		return
-	}
-	s.closeFile()
-	base := strings.TrimSuffix(s.name, ".log")
+// record recreates the base-named file.
+func (s *fulllogFileSink) rotate(name string) {
+	base := strings.TrimSuffix(name, ".log")
 	for n := 1; ; n++ {
 		rotated := fmt.Sprintf("%s-%d.log", base, n)
 		target := filepath.Join(s.dir, rotated)
 		if _, err := os.Stat(target); err == nil {
 			continue
 		}
-		if err := os.Rename(filepath.Join(s.dir, s.name), target); err != nil {
-			logger.Warnf("[FullLog] rotate %s -> %s failed: %v", s.name, rotated, err)
+		if err := os.Rename(filepath.Join(s.dir, name), target); err != nil {
+			logger.Warnf("[FullLog] rotate %s -> %s failed: %v", name, rotated, err)
 		}
 		break
 	}
-	s.name = ""
-	s.size = 0
-}
-
-func (s *fulllogFileSink) closeFile() {
-	if s.f != nil {
-		s.f.Close()
-		s.f = nil
-	}
-}
-
-// Close flushes and closes the current file.
-func (s *fulllogFileSink) Close() error {
-	s.closeFile()
-	return nil
 }
 
 // ==================== retention ====================
@@ -416,32 +390,25 @@ var (
 func startFulllogWriter() {
 	fulllogQueue = make(chan fulllogRecord, fulllogQueueCap)
 	fulllogCleanupDir(fulllogDir())
-	go fulllogWriterLoop()
+	go fulllogWriterLoop(fulllogQueue)
 }
 
-// fulllogWriterLoop drains the queue into the hourly capture file. The config
-// directory is re-resolved per record so a re-pointed config (tests) switches
-// files; the hourly ticker also runs retention cleanup.
-func fulllogWriterLoop() {
+// fulllogWriterLoop drains the queue into the hourly capture file. It serves
+// exactly the channel it was started with. The config directory is
+// re-resolved per record so a re-pointed config (tests) switches files; the
+// hourly ticker also runs retention cleanup.
+func fulllogWriterLoop(queue <-chan fulllogRecord) {
 	var sink *fulllogFileSink
-	defer func() {
-		if sink != nil {
-			sink.Close()
-		}
-	}()
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
 		select {
-		case rec, ok := <-fulllogQueue:
+		case rec, ok := <-queue:
 			if !ok {
 				return
 			}
 			dir := fulllogDir()
 			if sink == nil || sink.dir != dir {
-				if sink != nil {
-					sink.Close()
-				}
 				sink = newFulllogFileSink(dir, fulllogMaxFileBytes)
 			}
 			if err := sink.WriteRecord(rec); err != nil {
