@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -71,9 +73,64 @@ const maxPayloadBytes = 900 * 1024
 // fit within maxPayloadBytes.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
 
-// minRecentHistoryTurns is the number of most-recent history entries always kept
-// (in addition to system priming and the active tool turn) when truncating.
+// minRecentHistoryTurns is the number of most-recent history entries kept when
+// truncating (in addition to system priming and the active tool turn).
+//
+// This is a SOFT floor on turn COUNT, and it must never win over the byte limit.
+// A single recent turn can carry megabytes (a big file read / grep / diff whose
+// tool result is narrated into the user turn by narrateToolResults), so honoring
+// the floor unconditionally used to pin the payload far above maxPayloadBytes
+// with nothing left to trim — the request then went upstream oversized and came
+// back HTTP 400 "Input is too long.". Measured before the fix: no system prompt
+// plus two 1 MiB turns produced a 2,097,806-byte payload, 2.28x the limit.
+// truncatePayloadToLimit therefore runs a convergence pipeline (drop old turns →
+// shrink the current message → shrink the retained turns) instead of trusting
+// this floor.
 const minRecentHistoryTurns = 4
+
+// minPreservedCurrentBytes is the smallest window always left for the current
+// message when the budget is exhausted.
+//
+// The current message carries the client's ACTUAL instruction — for an
+// auto-compaction request it is literally "summarize the conversation above".
+// Replacing it with minimalFallbackUserContent (".") destroys the request's
+// intent: the model is asked "." , answers with near-nothing, and the empty
+// response guard then classifies the turn as "context too large" and returns
+// 400 telling the client to compact — while the client was already compacting.
+// That self-referential loop is why compaction appeared to fail with a 400.
+const minPreservedCurrentBytes = 8 * 1024
+
+// payloadBudgetReserveBytes is held back from maxPayloadBytes as the TARGET for
+// shrinking, covering bytes that are appended after truncation has measured the
+// payload: setPayloadProfileArnForAccount writes profileArn in CallKiroAPI (see
+// kiro.go), well after ClaudeToKiro ran, and the shrink allocation itself carries
+// small integer-rounding and placeholder deltas. Without it a payload measured at
+// exactly the limit could still cross it on the wire.
+const payloadBudgetReserveBytes = 2 * 1024
+
+// payloadBudget is the size the convergence stages shrink TOWARDS. The trigger
+// threshold stays maxPayloadBytes so payloads that already fit are never touched.
+func payloadBudget() int { return maxPayloadBytes - payloadBudgetReserveBytes }
+
+// toolResultMinPreservedBytes is the smallest window left for a single structured
+// tool result body.
+//
+// Tool results are the bulkiest and least irreplaceable text in a payload (file
+// reads, greps, diffs — machine output), so they are shrunk before any
+// conversation text, but they are never emptied: the model is mid tool-loop, and
+// an empty result reads as "the tool returned nothing", which it dutifully
+// reports back to the user as a failure.
+const toolResultMinPreservedBytes = 2 * 1024
+
+// toolResultTruncationPlaceholder marks the elision inside a shrunk tool result.
+// Deliberately distinct from truncationPlaceholder, which talks about
+// conversation history and would be nonsense in the middle of a command's output.
+const toolResultTruncationPlaceholder = "[Tool output was truncated to fit the model's input limit.]"
+
+// imageOnlyUserContent is the body synthesized for a user turn that carried an
+// image and no text. Named so the truncation path can recognize it as "no real
+// text" and replace it outright when the image it refers to is dropped.
+const imageOnlyUserContent = "Please analyze the attached image."
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
@@ -892,13 +949,25 @@ func extractClaudeAssistantContent(content interface{}) (text string, toolUses [
 // Kiro-Go 无动态 schema 注册表,故用 fallbackSchemaPath 按模型家族硬编码兜底。
 
 // modelMaxOutputTokens 返回 Kiro 对该模型允许的 max_tokens 上限。
-// opus-4.7 / opus-4.8 支持 128000,其余 reasoning 模型 64000。
-// 入参可为客户端别名或归一 kiro_id(小写包含匹配,两种写法都命中)。
+//
+// 取值优先级:
+//  1. Kiro ListAvailableModels 透出的 tokenLimits.maxOutputTokens(权威值,见
+//     model_registry.go)。低于上游 1024 下限的异常值忽略,走兜底。
+//  2. 按版本号推断:opus 4.7 / 4.8 与 opus 5 代及以后为 128000,其余 64000。
+//
+// 入参可为客户端别名或归一 kiro_id。
 func modelMaxOutputTokens(model string) int {
-	m := strings.ToLower(model)
-	if strings.Contains(m, "opus-4-7") || strings.Contains(m, "opus-4.7") ||
-		strings.Contains(m, "opus-4-8") || strings.Contains(m, "opus-4.8") {
-		return 128000
+	const minAdditionalMaxTokens = 1024
+	if meta, ok := lookupModelMeta(model); ok && meta.maxOutputTokens >= minAdditionalMaxTokens {
+		return meta.maxOutputTokens
+	}
+	if strings.Contains(strings.ToLower(model), "opus") {
+		if major, minor, ok := parseClaudeVersion(model); ok {
+			// claude-opus-5 无小版本号 → (5, 0),同样落到 128000。
+			if major > 4 || (major == 4 && minor >= 7) {
+				return 128000
+			}
+		}
 	}
 	return 64000
 }
@@ -926,6 +995,25 @@ func resolveReasoningEffort(req *ClaudeRequest) string {
 	return "high"
 }
 
+// resolveModelEffort 在 resolveReasoningEffort(已知超集校验)之上,再按注册表登记的
+// 该模型真实合法档位收敛一次。
+//
+// 各模型的 effort 枚举并不一致(实测:sonnet-5 / opus-4.8 有 xhigh,opus-4.6 /
+// sonnet-4.6 没有),客户端把不支持的档位发上去会被上游 400。注册表登记了合法档位时,
+// 非法值退回该模型的官方默认档;未登记则保持原行为(超集校验)。
+func resolveModelEffort(req *ClaudeRequest, kiroID string) string {
+	effort := resolveReasoningEffort(req)
+	allowed, known := effortAllowedByModel(kiroID, effort)
+	if !known || allowed {
+		return effort
+	}
+	if meta, ok := lookupModelMeta(kiroID); ok && meta.defaultEffort != "" {
+		logger.Debugf("[Effort] %s 不支持档位 %s,回退官方默认 %s", kiroID, effort, meta.defaultEffort)
+		return meta.defaultEffort
+	}
+	return "high"
+}
+
 // resolveReasoningMode 解析 GPT reasoning 的 mode(standard/pro)。
 // 仅 GPT 家族支持 mode;其余模型返回 ("", false) → 调用方不发 mode 字段
 // (上游 schema default=standard 兜底)。output_config.mode 非法/缺省回退 standard。
@@ -940,22 +1028,39 @@ func resolveReasoningMode(req *ClaudeRequest, modelLower string) (string, bool) 
 	return "standard", true
 }
 
-// fallbackSchemaPath 按模型家族硬编码 additionalModelRequestFields 的承载路径
-// (镜像 Kiro 已知模型目录)。入参应为已 MapModel 归一后的 kiro_id(小写)。
+// fallbackSchemaPath 按模型家族推断 additionalModelRequestFields 的承载路径,
+// 仅用于注册表未登记时的冷启动兜底(见 model_registry.go)。
+// 入参应为已 MapModel 归一后的 kiro_id(小写)。
 //   - gpt 家族 → "reasoning"(GPT 5.6)
-//   - Claude effort 家族(sonnet-5 / opus-4.8·4.7·4.6 / sonnet-4.6)→ "output_config"
-//   - 其余(sonnet-4.5 / opus-4.5 / sonnet-4 / haiku / deepseek / minimax / glm / qwen …)→ ""
-//     这些模型 schema 为空,发 additionalModelRequestFields 会被上游 400。
+//   - Claude effort 家族:opus / sonnet 且版本 >= 4.6(含 5 代及以后无小版本号的
+//     claude-opus-5 / claude-sonnet-5)→ "output_config"
+//   - 其余(sonnet-4.5 / opus-4.5 / sonnet-4 / haiku / fable / deepseek / minimax /
+//     glm / qwen …)→ "":这些模型 schema 为空,发 additionalModelRequestFields 会被上游 400。
+//
+// 按版本号判定而非枚举模型名,新版本上线(如 claude-opus-5)不必再改这里——旧实现
+// 漏登记会让该模型整个收不到 output_config.effort,思考档位被静默丢弃。
 func fallbackSchemaPath(kiroIDLower string) string {
 	if strings.Contains(kiroIDLower, "gpt") {
 		return "reasoning"
 	}
-	switch kiroIDLower {
-	case "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6":
-		return "output_config"
-	default:
-		return ""
+	if strings.Contains(kiroIDLower, "opus") || strings.Contains(kiroIDLower, "sonnet") {
+		if major, minor, ok := parseClaudeVersion(kiroIDLower); ok {
+			if major > 4 || (major == 4 && minor >= 6) {
+				return "output_config"
+			}
+		}
 	}
+	return ""
+}
+
+// resolveSchemaPath 决定该模型 additionalModelRequestFields 的承载路径:
+// 已登记模型直接用 Kiro 透出的真实 schema 路径(空串即"该模型不支持,不发"),
+// 未登记才按家族兜底。
+func resolveSchemaPath(kiroID string) string {
+	if meta, ok := lookupModelMeta(kiroID); ok {
+		return meta.effortSchemaPath
+	}
+	return fallbackSchemaPath(strings.ToLower(kiroID))
 }
 
 // buildAdditionalModelRequestFields 严格按模型真实 schema 构建 additionalModelRequestFields,
@@ -969,14 +1074,14 @@ func buildAdditionalModelRequestFields(req *ClaudeRequest, thinking bool) map[st
 	kiroID := MapModel(req.Model)
 	modelLower := strings.ToLower(kiroID)
 
-	switch fallbackSchemaPath(modelLower) {
+	switch resolveSchemaPath(kiroID) {
 	case "reasoning":
 		// GPT reasoning schema 除 effort 外还带 mode(standard/pro)。支持该字段才发 mode。
 		reasoning := map[string]interface{}{}
 		if mode, ok := resolveReasoningMode(req, modelLower); ok {
 			reasoning["mode"] = mode
 		}
-		reasoning["effort"] = resolveReasoningEffort(req)
+		reasoning["effort"] = resolveModelEffort(req, kiroID)
 		return map[string]interface{}{"reasoning": reasoning}
 
 	case "output_config":
@@ -1000,7 +1105,7 @@ func buildAdditionalModelRequestFields(req *ClaudeRequest, thinking bool) map[st
 		// 注入时统一走 resolveReasoningEffort 校验(非法档位回退 high),不再直接透传未校验的 effort。
 		hasExplicitEffort := req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != ""
 		if !disabled && (thinking || hasExplicitEffort) {
-			fields["output_config"] = map[string]interface{}{"effort": resolveReasoningEffort(req)}
+			fields["output_config"] = map[string]interface{}{"effort": resolveModelEffort(req, kiroID)}
 		}
 
 		if req.MaxTokens > 0 {
@@ -2222,10 +2327,407 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
 
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
+	if payloadByteSize(payload) <= maxPayloadBytes {
+		return
+	}
+
+	// Convergence stage 1: reclaim the bytes no text stage can reach — images and
+	// structured tool results.
+	//
+	// This MUST run before the text stages. Both of them derive their budget from
+	// `payloadBudget() - <payload measured with the bodies emptied>`, so megabytes
+	// of attachments push that budget to its floor and collapse every text body to
+	// a placeholder in order to make room for bytes that are about to be discarded
+	// anyway. Observed in production as `currentLen=1` on payloads still measuring
+	// 2.9–6.1 MB after "full convergence": the instruction had been ground down to
+	// a single byte while multi-megabyte images sat untouched.
+	reclaimAttachmentBytes(payload)
+	if payloadByteSize(payload) <= maxPayloadBytes {
+		return
+	}
+
+	// Convergence stage 2: shrink the current message. It is trimmed before the
+	// retained history because it is the one part we can always resize, but it is
+	// never destroyed — see minPreservedCurrentBytes.
+	truncateCurrentMessage(payload)
+	if payloadByteSize(payload) <= maxPayloadBytes {
+		return
+	}
+
+	// Convergence stage 3: the retained turns are themselves too big (the
+	// minRecentHistoryTurns floor kept a multi-megabyte recent turn). Shrink
+	// their bodies rather than shipping an oversized payload upstream, which is
+	// a guaranteed HTTP 400 "Input is too long.".
+	shrinkHistoryEntries(payload)
+
+	if size := payloadByteSize(payload); size > maxPayloadBytes {
+		// Remainder after every lever has been pulled: the per-body floors, the
+		// JSON structure itself, and the tool declarations (never shrunk — a model
+		// that cannot see a tool's schema cannot call it, which breaks the request
+		// more thoroughly than the 400 being avoided). The byte breakdown is logged
+		// so the next occurrence names its own cause instead of surfacing as an
+		// opaque upstream 400.
+		cur := payload.ConversationState.CurrentMessage.UserInputMessage
+		logger.Warnf("[Truncate] payload still oversized after full convergence: size=%d limit=%d history=%d currentLen=%d imageBytes=%d toolResultBytes=%d toolSpecBytes=%d",
+			size, maxPayloadBytes, len(payload.ConversationState.History), len(cur.Content),
+			payloadImageBytes(payload), currentToolResultBytes(payload), currentToolSpecBytes(payload))
+	}
+}
+
+// reclaimAttachmentBytes frees the payload bytes the text convergence stages
+// cannot touch, in increasing order of value:
+//
+//  1. the current message's structured tool results — bulk machine output (file
+//     reads, greps, diffs), the cheapest text in the payload. Each keeps
+//     toolResultMinPreservedBytes so the tool loop stays intelligible, and the
+//     KiroToolResult entries themselves are never removed: their toolUseId has to
+//     keep answering the active assistant turn's toolUses or the upstream rejects
+//     the request for an unanswered tool use. Only the excess over budget is
+//     taken, so this often removes the need to touch attachments at all.
+//  2. images, history oldest first and the current message last — but ONLY while
+//     the text stages provably cannot reach the budget on their own (see
+//     shrinkableFloorSize). Images cannot be shrunk (a truncated base64 blob is a
+//     decode error upstream), so reclaiming one means losing it, and that is not
+//     worth doing to save a few kilobytes that trimming text would have covered.
+//     Measured: dropping unconditionally whenever the payload was oversized hit
+//     roughly 3 requests a minute of live traffic, well beyond the ones that were
+//     actually failing.
+func reclaimAttachmentBytes(payload *KiroPayload) {
+	if freed := shrinkCurrentToolResults(payload); freed > 0 {
+		logger.Warnf("[Truncate] shrank current tool results by %d bytes to fit the input limit", freed)
+	}
+	if payloadByteSize(payload) <= payloadBudget() {
+		return
+	}
+
+	history, current := dropImagesUntilReachable(payload)
+	if history > 0 {
+		logger.Warnf("[Truncate] dropped %d history image(s): text shrinking alone cannot reach the input limit", history)
+	}
+	if current > 0 {
+		logger.Warnf("[Truncate] dropped %d image(s) from the current message: text shrinking alone cannot reach the input limit", current)
+	}
+}
+
+// dropImagesUntilReachable removes images while the text convergence stages cannot
+// reach the budget without them, cheapest first: history oldest to newest, then the
+// current message (what the user just attached, so it goes last). Returns how many
+// were dropped from each side.
+//
+// The loop is driven by the FLOOR, not by the current size: the payload still holds
+// unshrunk text at this point, so stopping when the size fits would discard images
+// to make room for bytes the text stages are about to give back anyway.
+func dropImagesUntilReachable(payload *KiroPayload) (history, current int) {
+	budget := payloadBudget()
+	floor := shrinkableFloorSize(payload)
+	if floor <= budget {
+		return 0, 0 // trimming text is enough; the attachments stay
+	}
+
+	for i := range payload.ConversationState.History {
+		if floor <= budget {
+			break
+		}
+		user := payload.ConversationState.History[i].UserInputMessage
+		if user == nil || len(user.Images) == 0 {
+			continue
+		}
+		dropped := 0
+		for len(user.Images) > 0 && floor > budget {
+			floor -= imageByteSize(user.Images[0])
+			user.Images = user.Images[1:]
+			dropped++
+		}
+		if len(user.Images) == 0 {
+			user.Images = nil // let omitempty drop the key entirely
+		}
+		user.Content = noteDroppedImages(user.Content, dropped)
+		history += dropped
+	}
+
+	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+	for len(cur.Images) > 0 && floor > budget {
+		floor -= imageByteSize(cur.Images[0])
+		cur.Images = cur.Images[1:]
+		current++
+	}
+	if current > 0 {
+		if len(cur.Images) == 0 {
+			cur.Images = nil
+		}
+		cur.Content = noteDroppedImages(cur.Content, current)
+	}
+	return history, current
+}
+
+// shrinkCurrentToolResults shrinks the current message's structured tool result
+// bodies, largest first, freeing just the excess over budget and never taking a
+// body below toolResultMinPreservedBytes. Returns the bytes freed.
+//
+// The budget is expressed as the EXCESS to free rather than as a share of the
+// total, because at this point the conversation text has not been shrunk yet: a
+// share-of-total split would see megabytes of history in the overhead, compute a
+// zero budget, and collapse the tool results completely.
+func shrinkCurrentToolResults(payload *KiroPayload) int {
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) == 0 {
+		return 0
+	}
+	excess := payloadByteSize(payload) - payloadBudget()
+	if excess <= 0 {
+		return 0
+	}
+
+	type bodyRef struct {
+		result  int
+		content int
+		weight  int
+	}
+	refs := make([]bodyRef, 0, len(ctx.ToolResults))
+	for j := range ctx.ToolResults {
+		for k := range ctx.ToolResults[j].Content {
+			refs = append(refs, bodyRef{j, k, jsonEscapedLen(ctx.ToolResults[j].Content[k].Text)})
+		}
+	}
+	// Largest first: taking the excess out of the biggest bodies leaves the short
+	// results — the ones the model usually needs verbatim — untouched.
+	sort.SliceStable(refs, func(a, b int) bool { return refs[a].weight > refs[b].weight })
+
+	freed := 0
+	for _, ref := range refs {
+		if excess <= 0 {
+			break
+		}
+		if ref.weight <= toolResultMinPreservedBytes {
+			continue
+		}
+		take := ref.weight - toolResultMinPreservedBytes
+		if take > excess {
+			take = excess
+		}
+		body := &ctx.ToolResults[ref.result].Content[ref.content]
+		shrunk := shrinkToEscapedBudgetWithMarker(body.Text, ref.weight-take, toolResultTruncationPlaceholder)
+		gain := ref.weight - jsonEscapedLen(shrunk)
+		if gain <= 0 {
+			continue
+		}
+		body.Text = shrunk
+		excess -= gain
+		freed += gain
+	}
+	return freed
+}
+
+// shrinkableFloorSize reports the smallest payload the TEXT convergence stages
+// can possibly reach: the current size minus everything those stages are allowed
+// to give up.
+//
+// Exact and side-effect free: a body contributes precisely its JSON-escaped
+// length to the serialized payload, so the achievable savings are a plain
+// subtraction — no speculative mutate-measure-restore needed.
+//
+// Used to decide whether images have to be dropped at all: if even the floor is
+// over budget, text shrinking cannot save the request and the attachments are the
+// only lever left. If the floor fits, every image stays.
+func shrinkableFloorSize(payload *KiroPayload) int {
+	size := payloadByteSize(payload)
+
+	// shrinkHistoryEntries will not take a retained turn below the placeholder.
+	history := payload.ConversationState.History
+	placeholderWeight := jsonEscapedLen(truncationPlaceholder)
+	for i := range history {
+		size -= reducibleBytes(historyEntryContent(history[i]), placeholderWeight)
+	}
+
+	// truncateCurrentMessage will not take the instruction below its window.
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	size -= reducibleBytes(cur.Content, minPreservedCurrentBytes)
+
+	if ctx := cur.UserInputMessageContext; ctx != nil {
+		for j := range ctx.ToolResults {
+			for k := range ctx.ToolResults[j].Content {
+				size -= reducibleBytes(ctx.ToolResults[j].Content[k].Text, toolResultMinPreservedBytes)
+			}
+		}
+	}
+	return size
+}
+
+// reducibleBytes reports how many serialized bytes a body can give up before it
+// hits the floor its shrink stage refuses to cross.
+func reducibleBytes(s string, floor int) int {
+	weight := jsonEscapedLen(s)
+	if weight <= floor {
+		return 0
+	}
+	return weight - floor
+}
+
+// noteDroppedImages records an image elision in the turn's text, so the model does
+// not answer as though it could still see the attachment.
+func noteDroppedImages(content string, count int) string {
+	if count <= 0 {
+		return content
+	}
+	note := fmt.Sprintf("[%d attached image(s) were removed to fit the model's input limit.]", count)
+	trimmed := strings.TrimSpace(content)
+	// A turn that carried only the image has no text worth keeping; replacing it
+	// outright also keeps it non-empty, which sanitizeKiroHistory requires.
+	if trimmed == "" || trimmed == minimalFallbackUserContent || trimmed == imageOnlyUserContent {
+		return note
+	}
+	return content + "\n\n" + note
+}
+
+// imageByteSize returns the serialized size of one image inside its array,
+// including the separating comma.
+func imageByteSize(img KiroImage) int {
+	raw, err := json.Marshal(img)
+	if err != nil {
+		return 0
+	}
+	return len(raw) + 1
+}
+
+// payloadImageBytes reports the serialized weight of every image still attached,
+// current message and history alike. Diagnostic only.
+func payloadImageBytes(payload *KiroPayload) int {
+	total := 0
+	for _, img := range payload.ConversationState.CurrentMessage.UserInputMessage.Images {
+		total += imageByteSize(img)
+	}
+	for i := range payload.ConversationState.History {
+		if user := payload.ConversationState.History[i].UserInputMessage; user != nil {
+			for _, img := range user.Images {
+				total += imageByteSize(img)
+			}
+		}
+	}
+	return total
+}
+
+// currentToolResultBytes reports the serialized weight of the current message's
+// structured tool results. Diagnostic only.
+func currentToolResultBytes(payload *KiroPayload) int {
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) == 0 {
+		return 0
+	}
+	raw, err := json.Marshal(ctx.ToolResults)
+	if err != nil {
+		return 0
+	}
+	return len(raw)
+}
+
+// currentToolSpecBytes reports the serialized weight of the client's tool
+// declarations. Diagnostic only: these are never shrunk, so a large value here is
+// the one residue the convergence pipeline deliberately refuses to touch.
+func currentToolSpecBytes(payload *KiroPayload) int {
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) == 0 {
+		return 0
+	}
+	raw, err := json.Marshal(ctx.Tools)
+	if err != nil {
+		return 0
+	}
+	return len(raw)
+}
+
+// shrinkHistoryEntries shrinks the bodies of the RETAINED history entries as the
+// final convergence step, handing out whatever budget is left by max-min fair
+// share (see the allocation loop): short turns keep their body untouched and the
+// surplus flows to the oversized ones.
+//
+// Needed because the previous last resort could only shrink the current message
+// and never touched history: when a single retained turn exceeded the limit on
+// its own (the common shape of a compaction request, whose most recent turn
+// holds a large file read / grep / diff narrated into the user turn), the
+// oversized payload went upstream unchanged and came back 400.
+func shrinkHistoryEntries(payload *KiroPayload) {
+	history := payload.ConversationState.History
+	if len(history) == 0 {
+		return
+	}
+
+	// Budget = target − the overhead measured with every history body emptied.
+	// Measuring (rather than arithmetic on raw lengths) is what keeps JSON escape
+	// expansion out of the overhead; see truncateCurrentMessage. The accounting is
+	// exact: an empty body serializes as "" , so restoring a body adds precisely
+	// its escaped length.
+	saved := make([]string, len(history))
+	weights := make([]int, len(history))
+	order := make([]int, 0, len(history))
+	for i := range history {
+		saved[i] = historyEntryContent(history[i])
+		weights[i] = jsonEscapedLen(saved[i])
+		setHistoryEntryContent(history[i], "")
+		if saved[i] != "" {
+			order = append(order, i)
+		}
+	}
+	remaining := payloadBudget() - payloadByteSize(payload)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	// Max-min fair allocation, shortest entry first: each entry may take an equal
+	// split of what is left, cheap turns consume less than their share and hand
+	// the surplus to the big ones. Deducting the ACTUAL cost each round (not the
+	// nominal share) is what keeps the total strictly inside the budget — a purely
+	// proportional split leaked the placeholder substitutions and overshot the
+	// limit by a few hundred bytes.
+	sort.SliceStable(order, func(a, b int) bool { return weights[order[a]] < weights[order[b]] })
+
+	left := len(order)
+	for _, i := range order {
+		share := 0
+		if left > 0 && remaining > 0 {
+			share = remaining / left
+		}
+		content := saved[i]
+		if weights[i] > share {
+			content = shrinkToEscapedBudget(saved[i], share)
+			if strings.TrimSpace(content) == "" {
+				// Never leave a turn empty: sanitizeKiroHistory's second pass drops
+				// hollow turns, which would silently reshape the conversation on the
+				// next round. Collapse to the placeholder instead — but only when it
+				// is actually shorter than what it replaces.
+				if weights[i] > jsonEscapedLen(truncationPlaceholder) {
+					content = truncationPlaceholder
+				} else {
+					content = saved[i]
+				}
+			}
+		}
+		setHistoryEntryContent(history[i], content)
+		remaining -= jsonEscapedLen(content)
+		left--
+	}
+}
+
+// historyEntryContent returns the body of a history entry, whichever side it is.
+func historyEntryContent(entry KiroHistoryMessage) string {
+	if entry.UserInputMessage != nil {
+		return entry.UserInputMessage.Content
+	}
+	if entry.AssistantResponseMessage != nil {
+		return entry.AssistantResponseMessage.Content
+	}
+	return ""
+}
+
+// setHistoryEntryContent writes the body of a history entry. KiroHistoryMessage
+// is a value type holding pointers, so mutating through them is visible to the
+// caller's slice.
+func setHistoryEntryContent(entry KiroHistoryMessage, content string) {
+	if entry.UserInputMessage != nil {
+		entry.UserInputMessage.Content = content
+		return
+	}
+	if entry.AssistantResponseMessage != nil {
+		entry.AssistantResponseMessage.Content = content
 	}
 }
 
@@ -2261,23 +2763,166 @@ func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
 }
 
-// truncateCurrentMessage hard-truncates the current message content as a last
-// resort when even the minimal retained history plus current message exceeds the
-// limit.
+// truncateCurrentMessage shrinks the current message body when even the minimal
+// retained history plus the current message exceeds the limit.
+//
+// The budget MUST be derived from JSON-escaped sizes. The payload's real size is
+// its serialized size, while the raw body length can be half of that (quotes,
+// newlines and tabs — i.e. exactly what a conversation transcript is made of —
+// each double in length, and `<`, `>`, `&` and control characters expand to six
+// bytes). The previous implementation computed the fixed overhead as
+//
+//	overhead := payloadByteSize(payload) - len(cur.Content)
+//
+// where the minuend is an escaped size and the subtrahend a raw one, so the whole
+// escape expansion of the body leaked into "overhead". Measured: 100 KiB of
+// quotes inflated the overhead from its true ~100 bytes to 102,566 — the budget
+// was systematically understated (content over-truncated by hundreds of KiB),
+// and once the expansion alone exceeded maxPayloadBytes the budget collapsed to
+// zero and the entire instruction was replaced by ".".
 func truncateCurrentMessage(payload *KiroPayload) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
-	if budget < 0 {
-		budget = 0
+	if cur.Content == "" {
+		return
 	}
-	if len(cur.Content) > budget {
-		if budget == 0 {
-			cur.Content = minimalFallbackUserContent
-			return
+
+	// Fixed overhead = the payload measured with the body emptied. This excludes
+	// the body's own escape expansion by construction.
+	original := cur.Content
+	cur.Content = ""
+	overhead := payloadByteSize(payload)
+	cur.Content = original
+
+	budget := payloadBudget() - overhead
+	if budget < minPreservedCurrentBytes {
+		// The fixed overhead already ate the whole budget. Still keep a window for
+		// the instruction and let the caller shrink history instead; never destroy
+		// what the client actually asked for.
+		budget = minPreservedCurrentBytes
+	}
+	cur.Content = shrinkToEscapedBudget(original, budget)
+}
+
+// shrinkToEscapedBudget shrinks s so that its JSON-serialized form fits in
+// `budget` bytes, keeping a slice of BOTH ends with the truncation placeholder
+// in between.
+//
+// Head and tail are both preserved because the instruction of a compaction-style
+// request may sit at either end: the client either appends it after the
+// transcript ("...summarize the conversation above") or prepends it. Head-only
+// truncation — the previous behavior — silently discarded a trailing
+// instruction.
+func shrinkToEscapedBudget(s string, budget int) string {
+	return shrinkToEscapedBudgetWithMarker(s, budget, truncationPlaceholder)
+}
+
+// shrinkToEscapedBudgetWithMarker is shrinkToEscapedBudget with a caller-chosen
+// elision note, so a tool result's body is not annotated with a sentence about
+// conversation history.
+func shrinkToEscapedBudgetWithMarker(s string, budget int, placeholder string) string {
+	if budget <= 0 || s == "" {
+		return ""
+	}
+	if jsonEscapedLen(s) <= budget {
+		return s
+	}
+
+	marker := "\n\n" + placeholder + "\n\n"
+	body := budget - jsonEscapedLen(marker)
+	if body <= 0 {
+		// Not even room for the placeholder: degrade to a head-only slice.
+		return clampToEscapedBudget(s, budget, true)
+	}
+	// Tail-biased split: trailing instructions are the more common shape.
+	headBudget := body * 2 / 5
+	head := clampToEscapedBudget(s, headBudget, true)
+	tail := clampToEscapedBudget(s, body-headBudget, false)
+	return head + marker + tail
+}
+
+// clampToEscapedBudget returns the longest prefix (fromHead) or suffix of s whose
+// JSON-escaped length fits in budget, cut only on rune boundaries.
+func clampToEscapedBudget(s string, budget int, fromHead bool) string {
+	if budget <= 0 || s == "" {
+		return ""
+	}
+	if jsonEscapedLen(s) <= budget {
+		return s
+	}
+	// Binary search on the raw byte count. runeAlignedSlice is monotonic in n and
+	// jsonEscapedLen is monotonic in the slice, so the predicate is monotonic.
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if jsonEscapedLen(runeAlignedSlice(s, mid, fromHead)) <= budget {
+			lo = mid
+		} else {
+			hi = mid - 1
 		}
-		cur.Content = cur.Content[:budget]
 	}
+	return runeAlignedSlice(s, lo, fromHead)
+}
+
+// runeAlignedSlice returns at most n bytes from the head or tail of s, never
+// splitting a multi-byte character.
+//
+// A bare s[:n] leaves a partial rune, which encoding/json then emits as the
+// 6-byte escape \ufffd — LONGER than the character it replaced. That is how
+// "truncate to fit" used to end up still over the limit: a CJK body clamped to
+// the budget produced a 921,610-byte payload against a 921,600 limit, with
+// U+FFFD corruption in the text the model reads.
+func runeAlignedSlice(s string, n int, fromHead bool) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	if fromHead {
+		cut := n
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		return s[:cut]
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
+}
+
+// jsonEscapedLen reports how many bytes s occupies inside a JSON string,
+// excluding the surrounding quotes, and allocates nothing.
+//
+// Truncation convergence measures large strings repeatedly, so json.Marshal per
+// probe would mean megabytes of garbage per request. The rules mirror
+// encoding/json's encoder, including its HTML escaping (`<`, `>`, `&` become
+// \u003c / \u003e / \u0026), \u2028 / \u2029 line separators, and \ufffd for
+// invalid UTF-8. jsonEscapedLenMatchesMarshal in translator_test.go pins this
+// against the real encoder.
+func jsonEscapedLen(s string) int {
+	n := 0
+	for _, r := range s {
+		switch {
+		case r == '"' || r == '\\' || r == '\n' || r == '\r' || r == '\t':
+			n += 2
+		case r < 0x20:
+			n += 6 // \u00XX
+		case r == '<' || r == '>' || r == '&':
+			n += 6 // encoding/json HTML-escapes these by default
+		case r == '\u2028' || r == '\u2029':
+			n += 6
+		case r == utf8.RuneError:
+			// Either invalid bytes (encoder emits \ufffd) or a literal U+FFFD.
+			// Charging 6 for both is a deliberate over-estimate: it can only make
+			// the result smaller than the budget, never larger.
+			n += 6
+		default:
+			n += utf8.RuneLen(r)
+		}
+	}
+	return n
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {
@@ -2627,7 +3272,7 @@ func sanitizeImagePlaceholders(text string) string {
 func normalizeUserContent(text string, hasImages bool) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" && hasImages {
-		return "Please analyze the attached image."
+		return imageOnlyUserContent
 	}
 	return trimmed
 }
@@ -2673,6 +3318,13 @@ func parseBase64Image(data, format string) *KiroImage {
 	if format == "" {
 		format = "png"
 	}
+
+	// 上游对**像素尺寸**另有硬限制(任一边 > 8000 → 400 IMAGE_DIMENSION_EXCEEDED),
+	// 与字节体积无关:一张 12000x900 的长截图只有几百 KB 也会被整个拒掉。超限时在
+	// 本地等比缩到限内再发,顺带也减小 payload。未超限则原样返回、字节完全不变。
+	// 必须同时接收返回的 format —— 缩放可能改变容器(gif → png),声明与字节不一致会
+	// 触发 IMAGE_MIME_MISMATCH。见 image_resize.go。
+	data, format = shrinkOversizedImage(data, format)
 
 	return &KiroImage{
 		Format: format,

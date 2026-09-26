@@ -213,14 +213,18 @@ func (h *Handler) handleResponsesNonStream(
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
 				releaseSlot()
+				// 非流式:尚未向客户端写任何字节,ctx 取消只能来自客户端读端断开。
 				h.noteClientDisconnect("responses", model, apiKeyID,
-					estimateApproxTokens(content)+estimateApproxTokens(reasoningContent))
+					estimateApproxTokens(content)+estimateApproxTokens(reasoningContent), err, false)
 				return
 			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(&account, err)
+			if isRequestShapeErrorMessage(err.Error()) {
+				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
+			}
 			continue
 		}
 
@@ -597,7 +601,8 @@ func (h *Handler) handleResponsesStream(
 			if clientGone(ctx) {
 				releaseSlot()
 				h.noteClientDisconnect("responses", model, apiKeyID,
-					estimateApproxTokens(fullText.String())+estimateApproxTokens(reasoningText.String()))
+					estimateApproxTokens(fullText.String())+estimateApproxTokens(reasoningText.String()),
+					err, kw.WriteFailed())
 				return
 			}
 			// responses 流在进入本循环前就已发 response.created(提交 200 头)。
@@ -713,6 +718,10 @@ func (h *Handler) handleResponsesStream(
 		})
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		// 上游正常收尾但写出已失败过 → 客户端只收到截断的流(见 noteStreamWriteFailure)。
+		if kw.WriteFailed() {
+			h.noteStreamWriteFailure("responses", model, apiKeyID)
+		}
 		return
 	}
 

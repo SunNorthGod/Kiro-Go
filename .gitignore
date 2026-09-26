@@ -22,3 +22,6 @@ Thumbs.db
 # Local backups / scratch
 backup*/
 PR-*.md
+
+# Build output (cross-compiled binaries land here)
+/dist/

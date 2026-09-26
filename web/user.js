@@ -237,6 +237,22 @@
     if (Math.abs(n) >= 1 && Math.floor(n) === n) return Number(n).toLocaleString('en-US');
     return Number(n).toLocaleString('en-US', { maximumFractionDigits: 1 });
   }
+  // Credits for a SINGLE request are routinely below 0.05 — a 6.8K-token opus-5
+  // call costs about 0.028 — and formatNumber's one-decimal cap rendered those as
+  // "0", so a customer reading their own statement saw a page of apparently free
+  // requests. Scale precision to magnitude and never round a real charge down to
+  // zero. Aggregates (balance / granted) deliberately keep formatNumber: they are
+  // large, whole-ish top-up figures where extra decimals only add noise.
+  function formatCredits(v) {
+    const n = Number(v);
+    if (!isFinite(n) || n === 0) return '0';
+    const abs = Math.abs(n);
+    if (abs >= 100) return n.toFixed(1);
+    if (abs >= 1) return n.toFixed(2);
+    if (abs >= 0.01) return n.toFixed(3);
+    if (abs >= 0.0001) return n.toFixed(4);
+    return n.toExponential(1); // vanishingly small, but never rendered as zero
+  }
   function formatCompact(n) {
     n = Number(n) || 0;
     if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
@@ -499,7 +515,8 @@
     const g = grantedOf();
     $('upStatBalance').textContent = g > 0 ? formatNumber(balanceOf()) : INFINITY;
     $('upStatGranted').textContent = g > 0 ? formatNumber(g) : t('user.overview.unlimited');
-    $('upStatUsed').textContent = formatNumber(usedOf());
+    // "Used" starts out as a fraction on a fresh card, where formatNumber shows 0.
+    $('upStatUsed').textContent = formatCredits(usedOf());
     $('upStatTokens').textContent = formatCompact(tokensOf());
     $('upStatRequests').textContent = formatNumber(requestsOf());
   }
@@ -590,7 +607,7 @@
       '<p class="card-subtitle">' + escapeHtml(t('user.overview.summaryHint')) + '</p>' +
       '<div class="ng-grid ng-grid-4 up-usage-metrics">' +
       summaryItem(t('user.overview.balance'), g > 0 ? formatNumber(balanceOf()) : INFINITY, 'balance') +
-      summaryItem(t('user.overview.used'), formatNumber(usedOf()), 'used') +
+      summaryItem(t('user.overview.used'), formatCredits(usedOf()), 'used') +
       summaryItem(t('user.overview.tokens'), formatNumber(tokensOf()), '') +
       summaryItem(t('user.overview.requests'), formatNumber(requestsOf()), '') +
       cacheHitItem() +
@@ -605,7 +622,7 @@
       byModel.forEach(m => {
         usageCard += '<tr>' +
           '<td class="font-mono">' + escapeHtml(m.model || '-') + '</td>' +
-          '<td class="ta-right">' + escapeHtml(formatNumber(m.credits || 0)) + '</td>' +
+          '<td class="ta-right">' + escapeHtml(formatCredits(m.credits)) + '</td>' +
           '<td class="ta-right">' + escapeHtml(formatNumber(m.requests || 0)) + '</td>' +
           '</tr>';
       });
@@ -671,7 +688,7 @@
         '<td class="ta-right">' + escapeHtml(formatNumber(r.inputTokens || 0)) + '</td>' +
         '<td class="ta-right">' + escapeHtml(formatNumber(r.cacheReadInputTokens || 0)) + '</td>' +
         '<td class="ta-right">' + escapeHtml(formatNumber(r.outputTokens || 0)) + '</td>' +
-        '<td class="ta-right">' + escapeHtml(formatNumber(r.credits || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatCredits(r.credits)) + '</td>' +
         '</tr>';
     });
     html += '</tbody></table>' + pagerHtml('records', recordsPage, total);

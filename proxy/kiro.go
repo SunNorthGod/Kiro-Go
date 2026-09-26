@@ -87,6 +87,21 @@ var streamIdleTimeout = func() time.Duration {
 	return 120 * time.Second
 }()
 
+// How hard to retry when every endpoint reports an upstream capacity problem
+// (HTTP 500 MODEL_TEMPORARILY_UNAVAILABLE / "please try again"). Kept small on
+// purpose: the point is to ride out a brief model hiccup, not to hide a sustained
+// outage from the client. Two retries means at most three endpoint cycles, and the
+// backoff is linear (1.2 s, then 2.4 s), so the worst case adds ~3.6 s before the
+// client is told. Waiting also respects the request context, so a client that has
+// already disconnected releases its account slot immediately.
+//
+// Override is deliberately not exposed as an env var: unlike the resize budget
+// these numbers are a property of the upstream's behaviour, not of the host.
+const (
+	upstreamOverloadRetries = 2
+	upstreamOverloadBackoff = 1200 * time.Millisecond
+)
+
 func init() {
 	InitKiroHttpClient("")
 }
@@ -354,11 +369,11 @@ type KiroStreamCallback struct {
 	// pre-first-token silent window (CF 524). May fire again on a later
 	// account/self-heal retry, so it must be idempotent. Synchronous, on the
 	// handler goroutine.
-	OnStreamStart  func()
-	OnText         func(text string, isThinking bool)
-	OnToolUse      func(toolUse KiroToolUse)
-	OnComplete     func(inputTokens, outputTokens int)
-	OnError        func(err error)
+	OnStreamStart func()
+	OnText        func(text string, isThinking bool)
+	OnToolUse     func(toolUse KiroToolUse)
+	OnComplete    func(inputTokens, outputTokens int)
+	OnError       func(err error)
 	// OnException fires on a mid-stream `exception` frame that is NOT a hard
 	// failure — specifically the model hitting its output-token cap
 	// (ContentLengthExceededException). The content streamed so far is valid but
@@ -491,92 +506,129 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 		endpoints = getSortedEndpoints(config.GetPreferredEndpoint())
 	}
 
+	// Retry the WHOLE endpoint cycle — not the next endpoint — when the upstream
+	// reports a capacity problem. The three endpoints are separate API surfaces in
+	// front of the same model backend, so rotating between them inside a few
+	// milliseconds cannot help: production showed all three answering HTTP 500
+	// MODEL_TEMPORARILY_UNAVAILABLE for the same request, after which the client
+	// got "empty upstream response" (286 times in 24 h) even though the upstream
+	// had asked it to try again. Waiting a moment and re-running the cycle is what
+	// it asks for. Bounded, because an overload that outlives a few seconds should
+	// surface to the client rather than be hidden behind unbounded retries.
 	var lastErr error
-	for _, ep := range endpoints {
-		// Update the origin field for the selected endpoint.
-		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+	for cycle := 0; ; cycle++ {
+		lastErr = nil
+		for _, ep := range endpoints {
+			// Update the origin field for the selected endpoint.
+			payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
-		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
-		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
-		reqBody, mErr := json.Marshal(payload)
-		if mErr != nil {
-			lastErr = mErr
-			continue
-		}
-		if debugPayload {
-			logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
-		}
-
-		// Per-endpoint attempt in a closure so the derived cancel is always
-		// released (defer), whether we fail fast or stream to completion.
-		terminal, err := func() (terminal bool, err error) {
-			reqCtx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
-			if err != nil {
-				return false, err
+			// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
+			epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+			reqBody, mErr := json.Marshal(payload)
+			if mErr != nil {
+				lastErr = mErr
+				continue
+			}
+			if debugPayload {
+				logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
 			}
 
-			host := ""
-			if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
-				host = parsedURL.Host
-			}
-			headerValues := buildStreamingHeaderValues(account, host)
+			// Per-endpoint attempt in a closure so the derived cancel is always
+			// released (defer), whether we fail fast or stream to completion.
+			terminal, err := func() (terminal bool, err error) {
+				reqCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
 
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "*/*")
-			if ep.AmzTarget != "" {
-				req.Header.Set("X-Amz-Target", ep.AmzTarget)
-			}
-			applyKiroBaseHeaders(req, account, headerValues)
-			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-			req.Header.Set("x-amzn-codewhisperer-optout", "true")
-			req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-			req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-			if err != nil {
-				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-				return false, err
-			}
-
-			if resp.StatusCode == 429 {
-				resp.Body.Close()
-				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-				return false, fmt.Errorf("quota exhausted on %s", ep.Name)
-			}
-
-			if resp.StatusCode != 200 {
-				errBody, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				e := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-				// Authentication and payment errors are not retried across endpoints.
-				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
-					return true, e
+				req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
+				if err != nil {
+					return false, err
 				}
-				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
-				return false, e
+
+				host := ""
+				if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
+					host = parsedURL.Host
+				}
+				headerValues := buildStreamingHeaderValues(account, host)
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Accept", "*/*")
+				if ep.AmzTarget != "" {
+					req.Header.Set("X-Amz-Target", ep.AmzTarget)
+				}
+				applyKiroBaseHeaders(req, account, headerValues)
+				req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+				req.Header.Set("x-amzn-codewhisperer-optout", "true")
+				req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+				req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+				resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+				if err != nil {
+					logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+					return false, err
+				}
+
+				if resp.StatusCode == 429 {
+					resp.Body.Close()
+					logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+					return false, fmt.Errorf("quota exhausted on %s", ep.Name)
+				}
+
+				if resp.StatusCode != 200 {
+					errBody, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					e := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+					// Authentication and payment errors are not retried across endpoints.
+					if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+						return true, e
+					}
+					// Neither are rejections of the payload itself: every endpoint will
+					// reject the same bytes, so falling back only burns round-trips before
+					// the caller's self-heal / error path can even run. Logged with the
+					// serialized request size, which is the one number needed to tell an
+					// oversized-input 400 apart from a malformed-payload 400.
+					if isRequestShapeErrorMessage(e.Error()) {
+						logger.Warnf("[KiroAPI] Endpoint %s rejected the request itself (no endpoint fallback): reqBytes=%d history=%d model=%s err=%v",
+							ep.Name, len(reqBody), len(payload.ConversationState.History),
+							payload.ConversationState.CurrentMessage.UserInputMessage.ModelID, e)
+						return true, e
+					}
+					logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
+					return false, e
+				}
+
+				// The upstream stream is established: let the handler flush its
+				// response headers / start its keepalive before the first content
+				// event arrives.
+				if callback != nil && callback.OnStreamStart != nil {
+					callback.OnStreamStart()
+				}
+
+				// Success: stream with a per-read idle deadline. On idle, cancel
+				// aborts the upstream request so the blocked Read returns an error.
+				body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, cancel)
+				defer body.Close()
+				return true, parseEventStream(reqCtx, body, callback)
+			}()
+
+			if terminal {
+				return err
 			}
-
-			// The upstream stream is established: let the handler flush its
-			// response headers / start its keepalive before the first content
-			// event arrives.
-			if callback != nil && callback.OnStreamStart != nil {
-				callback.OnStreamStart()
-			}
-
-			// Success: stream with a per-read idle deadline. On idle, cancel
-			// aborts the upstream request so the blocked Read returns an error.
-			body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, cancel)
-			defer body.Close()
-			return true, parseEventStream(reqCtx, body, callback)
-		}()
-
-		if terminal {
-			return err
+			lastErr = err
 		}
-		lastErr = err
+
+		if lastErr == nil || cycle >= upstreamOverloadRetries || !isUpstreamOverloadErrorMessage(lastErr.Error()) {
+			break
+		}
+		wait := upstreamOverloadBackoff * time.Duration(cycle+1)
+		logger.Warnf("[KiroAPI] all endpoints reported upstream capacity trouble; retrying the cycle in %s (attempt %d/%d): %v",
+			wait, cycle+2, upstreamOverloadRetries+1, lastErr)
+		// Honour cancellation while waiting: a client that has already gone away must
+		// not hold an account slot for another second and a half.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
 	}
 
 	if lastErr != nil {
@@ -861,41 +913,66 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 
 // getContextWindowSize returns the context window size (in tokens) for a model.
 //
-// Per Kiro's ListAvailableModels, the 1M-token context window applies to
-// Claude 4.6 and newer (sonnet-4.6, opus-4.6, opus-4.7, opus-4.8, and future
-// 4.x releases), while 4.5 and earlier (opus-4.5, sonnet-4.5, sonnet-4,
-// haiku-4.5) use a 200K window. This value is used to convert the upstream
-// contextUsagePercentage into an absolute input-token count that clients rely
-// on to decide when to compact; an undersized window under-reports tokens and
-// prevents clients from compacting in time.
+// 取值优先级:
+//  1. Kiro ListAvailableModels 透出的 tokenLimits.maxInputTokens(权威值,新模型
+//     上线即生效,见 model_registry.go)。
+//  2. 按模型名的版本号推断(冷启动 / 回源失败时兜底)。
+//
+// This value is used to convert the upstream contextUsagePercentage into an
+// absolute input-token count that clients rely on to decide when to compact; an
+// undersized window under-reports tokens and prevents clients from compacting
+// in time.
 func getContextWindowSize(model string) int {
+	if meta, ok := lookupModelMeta(model); ok && meta.maxInputTokens > 0 {
+		return meta.maxInputTokens
+	}
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}
 	return 200_000
 }
 
-// largeContextMinor matches "claude-<family>-<major>.<minor>" (dot or dash form)
-// and is used to classify 1M-window models by version.
-var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\d+)[.-](\d+)`)
+// claudeVersionExtractor matches "claude-<family>-<major>[.<minor>]" (dot or dash
+// form) and is used to classify models by version.
+//
+// minor 是**可选**的:Claude 5 代起模型名不再带小版本号(claude-opus-5 /
+// claude-sonnet-5),写死两段数字会让它们整个匹配不上而误判成小窗口模型。
+// minor 限 1~2 位并加 \b 边界,避免把日期快照(claude-sonnet-4-20250514)误当小版本。
+var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d{1,2}))?\b`)
 
-func isLargeContextModel(model string) bool {
-	m := strings.ToLower(model)
-	if match := claudeVersionExtractor.FindStringSubmatch(m); match != nil {
-		major, errMaj := strconv.Atoi(match[1])
-		minor, errMin := strconv.Atoi(match[2])
-		if errMaj == nil && errMin == nil {
-			// 1M window for Claude >= 4.6 (4.6, 4.7, 4.8, ...) and any major >= 5.
-			if major > 4 {
-				return true
-			}
-			if major == 4 && minor >= 6 {
-				return true
-			}
-			return false
+// parseClaudeVersion 从模型名(客户端别名 / kiro_id / 带 -thinking 后缀均可)里解析
+// Claude 版本号。无小版本号时 minor 返回 0(如 claude-opus-5 → 5, 0)。
+func parseClaudeVersion(model string) (major int, minor int, ok bool) {
+	match := claudeVersionExtractor.FindStringSubmatch(strings.ToLower(model))
+	if match == nil {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	if match[2] != "" {
+		if minor, err = strconv.Atoi(match[2]); err != nil {
+			return 0, 0, false
 		}
 	}
+	return major, minor, true
+}
+
+// isLargeContextModel 判断模型是否为 1M 上下文窗口。
+//
+// 对齐 Kiro ListAvailableModels:Claude 4.6 及更新(sonnet-4.6、opus-4.6/4.7/4.8)
+// 以及 5 代及以后(claude-opus-5、claude-sonnet-5 等,无小版本号)为 1M;
+// 4.5 及更早(opus-4.5、sonnet-4.5、sonnet-4、haiku-4.5)为 200K。
+func isLargeContextModel(model string) bool {
+	if major, minor, ok := parseClaudeVersion(model); ok {
+		if major > 4 {
+			return true
+		}
+		return major == 4 && minor >= 6
+	}
 	// Fallback substring checks for non-standard identifiers.
+	m := strings.ToLower(model)
 	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
 		if strings.Contains(m, tag) {
 			return true

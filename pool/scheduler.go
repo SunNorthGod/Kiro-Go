@@ -2,7 +2,9 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"sync"
 	"time"
 )
@@ -69,6 +71,27 @@ type snapAcct struct {
 	priority int
 }
 
+// snapshotStats counts, per filter, why accounts were left out of an eligibility
+// snapshot. It exists so an empty snapshot can explain itself.
+//
+// Before this, Acquire returned ErrNoAccount — which the handlers turn into HTTP
+// 503 "No available accounts" — without logging anything at all. Diagnosing a
+// production burst of 503s therefore meant inferring the cause from the outside:
+// the responses came back in 0.00s, no app log line accompanied them, no
+// request_logs row is written (a row needs an account_id, and none was chosen),
+// and every account showed error_count 0. Six filters can empty the set and they
+// have completely different fixes, so the symptom was unattributable. Now it
+// names itself.
+type snapshotStats struct {
+	pooled     int // accounts in the pool (after dedupe)
+	notBound   int // excluded by the key's bound_account_ids
+	retried    int // already tried and failed during this request's failover
+	noModel    int // does not serve the requested model
+	cooling    int // inside an error/rate-limit cooldown
+	nearExpiry int // inside the token refresh skew window
+	quota      int // over usage quota / overage-blocked
+}
+
 // eligibleSnapshot returns value copies of every currently-eligible account for
 // the given model (deduped by ID), captured under mu.RLock. Returning copies —
 // never &p.accounts[i] — is what fixes the data race where the request path read
@@ -77,7 +100,10 @@ type snapAcct struct {
 // boundAccountIDs, when non-empty, restricts selection to the intersection with
 // the pool (a key bound to specific accounts may only use those); empty means any
 // account is allowed.
-func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, boundAccountIDs []string) []snapAcct {
+//
+// The second return value reports why each excluded account was excluded; it is
+// only consumed when the snapshot comes back empty.
+func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, boundAccountIDs []string) ([]snapAcct, snapshotStats) {
 	var boundSet map[string]bool
 	if len(boundAccountIDs) > 0 {
 		boundSet = make(map[string]bool, len(boundAccountIDs))
@@ -93,6 +119,7 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, b
 	now := time.Now()
 	seen := make(map[string]bool, len(p.accounts))
 	out := make([]snapAcct, 0, len(p.accounts))
+	var stats snapshotStats
 
 	for i := range p.accounts {
 		a := p.accounts[i]
@@ -100,27 +127,111 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, b
 			continue
 		}
 		seen[a.ID] = true
+		stats.pooled++
 		if boundSet != nil && !boundSet[a.ID] {
+			stats.notBound++
 			continue
 		}
 		if excluded != nil && excluded[a.ID] {
+			stats.retried++
 			continue
 		}
 		if model != "" && !p.accountHasModel(a.ID, model) {
+			stats.noModel++
 			continue
 		}
 		if cd, ok := p.cooldowns[a.ID]; ok && now.Before(cd) {
+			stats.cooling++
 			continue
 		}
 		if a.ExpiresAt > 0 && now.Unix() > a.ExpiresAt-tokenRefreshSkewSeconds {
+			stats.nearExpiry++
 			continue
 		}
 		if isQuotaBlocked(a, allowOverUsage) {
+			stats.quota++
 			continue
 		}
 		out = append(out, snapAcct{acct: a, priority: a.Weight})
 	}
-	return out
+	return out, stats
+}
+
+// noAccountLogState rate-limits the empty-snapshot explanation. A burst of 503s can
+// be dozens per second (56 in one minute was measured), and one line each would
+// bury the very information it is meant to surface — so identical bursts collapse
+// into one line carrying the suppressed count.
+var noAccountLogState struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+const noAccountLogInterval = 2 * time.Second
+
+// modelRelaxLogState rate-limits the model-filter fallback notice, which fires once
+// per request for a model nobody advertises — potentially every request from one
+// misconfigured client.
+var modelRelaxLogState struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+// logModelFilterRelaxed records that routing ignored the per-account model list
+// because honouring it would have produced a 503. Worth a WARN, not silence: it
+// means either a client is asking for something that does not exist, or the model
+// cache is missing a model the upstream really serves. Both need a human eventually.
+func (p *AccountPool) logModelFilterRelaxed(model string, stats snapshotStats) {
+	modelRelaxLogState.mu.Lock()
+	if !modelRelaxLogState.last.IsZero() && time.Since(modelRelaxLogState.last) < noAccountLogInterval {
+		modelRelaxLogState.suppressed++
+		modelRelaxLogState.mu.Unlock()
+		return
+	}
+	suppressed := modelRelaxLogState.suppressed
+	modelRelaxLogState.suppressed = 0
+	modelRelaxLogState.last = time.Now()
+	modelRelaxLogState.mu.Unlock()
+
+	extra := ""
+	if suppressed > 0 {
+		extra = fmt.Sprintf(" (+%d more suppressed in the last %s)", suppressed, noAccountLogInterval)
+	}
+	logger.Warnf("[Pool] model %q is advertised by none of %d accounts; routing anyway and "+
+		"letting the upstream decide (would otherwise have been HTTP 503)%s",
+		model, stats.noModel, extra)
+}
+
+// logNoAccount explains an empty eligibility snapshot. Called only on the
+// ErrNoAccount path, so it costs nothing on a healthy request.
+func (p *AccountPool) logNoAccount(model string, stats snapshotStats, boundAccountIDs []string) {
+	noAccountLogState.mu.Lock()
+	since := time.Since(noAccountLogState.last)
+	if since < noAccountLogInterval && !noAccountLogState.last.IsZero() {
+		noAccountLogState.suppressed++
+		noAccountLogState.mu.Unlock()
+		return
+	}
+	suppressed := noAccountLogState.suppressed
+	noAccountLogState.suppressed = 0
+	noAccountLogState.last = time.Now()
+	noAccountLogState.mu.Unlock()
+
+	extra := ""
+	if suppressed > 0 {
+		extra = fmt.Sprintf(" (+%d more suppressed in the last %s)", suppressed, noAccountLogInterval)
+	}
+	bound := "any"
+	if len(boundAccountIDs) > 0 {
+		bound = fmt.Sprintf("%d bound", len(boundAccountIDs))
+	}
+	// Reported even when a count is zero: which filters did NOT fire is as
+	// diagnostic as which did.
+	logger.Warnf("[Pool] no eligible account -> HTTP 503: model=%q key=%s pooled=%d "+
+		"notBound=%d alreadyTried=%d noModel=%d cooling=%d nearTokenExpiry=%d quotaBlocked=%d%s",
+		model, bound, stats.pooled, stats.notBound, stats.retried, stats.noModel,
+		stats.cooling, stats.nearExpiry, stats.quota, extra)
 }
 
 // Acquire admits the request (per-key fairness), selects an account
@@ -138,8 +249,32 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, b
 // The concurrency gate and the RPM gate are INDEPENDENT: a key that is unlimited
 // on concurrency is still RPM-gated (and vice-versa). Only isAdmin bypasses both.
 func (p *AccountPool) Acquire(keyID string, keyConcurrency *int, isAdmin bool, conversationID, model string, excluded map[string]bool, boundAccountIDs []string) (config.Account, func(), error) {
-	snap := p.eligibleSnapshot(model, excluded, boundAccountIDs)
+	snap, stats := p.eligibleSnapshot(model, excluded, boundAccountIDs)
+	if len(snap) == 0 && model != "" && stats.noModel > 0 {
+		// The model filter ALONE emptied the pool, so the request is about to be told
+		// "No available accounts" when the truth is "nobody advertises this model".
+		//
+		// ListAvailableModels is an advertisement, not an authority. Measured: every
+		// one of the 12 requests for model "simple-task" that reached the upstream
+		// (during the window after a restart when the model cache is still cold and
+		// accountHasModel passes optimistically) SUCCEEDED. So the backend serves it
+		// and the filter is wrong — yet once the cache warmed, the same request became
+		// an instant 503. Every 503 observed on this build had exactly this shape:
+		// noModel=10, with cooling, nearTokenExpiry, quotaBlocked and the bindings all
+		// zero.
+		//
+		// So fall back to routing without the model filter and let the upstream decide.
+		// This is the same optimism accountHasModel already applies to a cold cache,
+		// extended to a warm-but-incomplete one. A model the upstream genuinely does
+		// not have now comes back as its own 400 with the upstream's message, which
+		// tells the client something true, instead of a 503 blaming our capacity.
+		if relaxed, _ := p.eligibleSnapshot("", excluded, boundAccountIDs); len(relaxed) > 0 {
+			p.logModelFilterRelaxed(model, stats)
+			snap = relaxed
+		}
+	}
 	if len(snap) == 0 {
+		p.logNoAccount(model, stats, boundAccountIDs)
 		return config.Account{}, nil, ErrNoAccount
 	}
 	distinct := len(snap)

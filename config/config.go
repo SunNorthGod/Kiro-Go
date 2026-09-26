@@ -288,8 +288,11 @@ type AccountInfo struct {
 	TrialExpiresAt    int64
 }
 
-// Version current version
-const Version = "1.1.14"
+// Version current version. MUST stay in sync with version.json at the repo root:
+// this constant is what /admin/api/version and /health report, while version.json
+// is what the admin panel compares against for the update banner. A mismatch made
+// the panel report an update that was already installed.
+const Version = "1.1.19"
 
 var (
 	cfg     *Config
@@ -1058,10 +1061,19 @@ type ThinkingConfig struct {
 	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
 }
 
-// GetThinkingConfig 获取 thinking 配置
+// GetThinkingConfig 获取 thinking 配置。
+// 与本包其余 getter 一致:配置尚未加载(cfg == nil)时返回全默认值而不是 panic。
 func GetThinkingConfig() ThinkingConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+
+	if cfg == nil {
+		return ThinkingConfig{
+			Suffix:       "-thinking",
+			OpenAIFormat: "reasoning_content",
+			ClaudeFormat: "thinking",
+		}
+	}
 
 	suffix := cfg.ThinkingSuffix
 	if suffix == "" {

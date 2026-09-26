@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -730,8 +731,16 @@ func enrichModelInfo(info map[string]interface{}, m *ModelInfo, includeEffort bo
 	}
 }
 
+// fallbackAnthropicModels 是 ListAvailableModels 回源失败时的兜底目录,
+// 按 Kiro 官方模型选择器的新旧顺序排列(2026-07:opus-5 / sonnet-5 / opus-4.8 为最新)。
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
+	models := []map[string]interface{}{
+		buildModelInfo("claude-opus-5", "anthropic", true),
+		buildModelInfo("claude-opus-5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-sonnet-5", "anthropic", true),
+		buildModelInfo("claude-sonnet-5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.8", "anthropic", true),
+		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.6", "anthropic", true),
@@ -747,6 +756,19 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 		buildModelInfo("claude-opus-4.5", "anthropic", true),
 		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
 	}
+	// 兜底目录也带上窗口 / 输出上限(按版本号推断):否则客户端拿不到 context_window,
+	// 只能假定 200K,1M 模型的上下文条与压缩时机都会偏。
+	for _, info := range models {
+		id, _ := info["id"].(string)
+		if id == "" {
+			continue
+		}
+		window := getContextWindowSize(id)
+		info["context_window"] = window
+		info["max_input_tokens"] = window
+		info["max_output_tokens"] = modelMaxOutputTokens(id)
+	}
+	return models
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -828,6 +850,9 @@ func (h *Handler) refreshModelsCache() {
 		h.cachedModels = aggregated
 		h.modelsCacheTime = time.Now().Unix()
 		h.modelsCacheMu.Unlock()
+		// 登记权威 token 上限 + effort schema,供上下文窗口 / max_tokens 上限 /
+		// additionalModelRequestFields 三处取用(见 model_registry.go)。
+		registerModelMeta(aggregated)
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
 	}
 }
@@ -853,6 +878,7 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
 	h.modelsCacheTime = time.Now().Unix()
 	h.modelsCacheMu.Unlock()
+	registerModelMeta(models)
 
 	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
 	// Auto-enable the upstream Overages switch for freshly added, capable accounts.
@@ -1188,18 +1214,21 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			} else {
 				sig = generateFakeSignature()
 			}
-			// 按 40 字节切块发送 signature_delta(对齐 Anthropic 分块惯例)
-			for i := 0; i < len(sig); i += 40 {
-				end := i + 40
-				if end > len(sig) {
-					end = len(sig)
-				}
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": thinkingIdx,
-					"delta": map[string]string{"type": "signature_delta", "signature": sig[i:end]},
-				})
-			}
+			// 签名必须**一次性**整串下发,绝不分块。Anthropic 的 signature_delta 是
+			// **赋值**语义,与 text_delta / thinking_delta / input_json_delta 的追加语义
+			// 相反(官方 SDK accumulate: `signature: event.delta.signature`,而
+			// thinking 是 `snapshotContent.thinking + event.delta.thinking`)。
+			// 此前按 40 字节切块发出 N 个事件,客户端只会保留**最后一片**(≤40 字节),
+			// 后果有二:
+			//   1) wrapProvenanceSignature 的前缀在头部,必然被丢掉 → 下一轮
+			//      classifyHistorySignature 判为 foreign → applyThinkingProvenance
+			//      一律剥离 → 整套签名 provenance 与 interleaved thinking 在流式路径上空转。
+			//   2) generateFakeSignature 刻意凑的 ≥100 字符长度保证被破坏。
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": thinkingIdx,
+				"delta": map[string]string{"type": "signature_delta", "signature": sig},
+			})
 		}
 
 		closeActiveBlock := func() {
@@ -1223,18 +1252,28 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				return
 			}
 			ensureMessageStart()
+			// 先关旧块(thinking 块在这里吐出它自己的 signature_delta),再开新块。
 			closeActiveBlock()
 
 			idx := nextContentIndex
 			nextContentIndex++
 
 			if blockType == "thinking" {
+				// 签名是**每块**一份,不是每次响应一份。一次响应里 reasoning→text→reasoning
+				// 交错时会开出第二个 thinking 块;此前 signatureSent 是整个 attempt 级的一次性
+				// 开关,第二块永远拿不到 signature_delta(客户端回传时会被判无效签名)。
+				// 在开新 thinking 块时重置,让每块各自承载上游为它下发的签名。
+				signatureSent = false
+				nativeSignature = ""
 				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
-						"type":     "thinking",
-						"thinking": "",
+						"type": "thinking",
+						// thinking + signature 都按官方 wire format 给出空初值:严格客户端
+						// (如 Python SDK 的 ThinkingBlock)把 signature 当必填字段。
+						"thinking":  "",
+						"signature": "",
 					},
 				})
 			} else {
@@ -1538,7 +1577,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			if clientGone(ctx) {
 				releaseSlot()
 				h.noteClientDisconnect("claude", model, apiKeyID,
-					estimateApproxTokens(rawContentBuilder.String())+estimateApproxTokens(rawThinkingBuilder.String()))
+					estimateApproxTokens(rawContentBuilder.String())+estimateApproxTokens(rawThinkingBuilder.String()),
+					err, kw.WriteFailed())
 				return
 			}
 			releaseSlot()
@@ -1551,6 +1591,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			// 提交的流里 → 客户端看到"两份(不同账号)回答"。commit 之后一律发 SSE error
 			// 收尾,只有 commit 之前(真正未提交)才允许静默换号重试。
 			if !streamCommitted {
+				if isRequestShapeErrorMessage(err.Error()) {
+					break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
+				}
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
@@ -1628,6 +1671,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
+		// 上游正常收尾,但期间向客户端的写出已经失败过 → 客户端拿到的是被截断的流,
+		// 而这里刚刚照常记了成功并计费。记录下来(见 noteStreamWriteFailure)。
+		if kw.WriteFailed() {
+			h.noteStreamWriteFailure("claude", model, apiKeyID)
+		}
 		return
 	}
 
@@ -1794,10 +1842,59 @@ func clientGone(ctx context.Context) bool {
 // (whether to bill on disconnect is a product decision). apiKeyID is the
 // internal card id (a UUID, not the secret key value); it is shortened for the
 // log. approxOutputTokens is a best-effort estimate of what had already streamed.
-func (h *Handler) noteClientDisconnect(endpoint, model, apiKeyID string, approxOutputTokens int) {
+//
+// upstreamErr and writeFailed exist because this is the ONE branch in every
+// streaming handler that returns without emitting an SSE error event or a
+// message_stop — from the client's point of view the stream simply stops. It used
+// to log neither the upstream error nor the reason, which made "silent stream cut"
+// reports impossible to diagnose: the single piece of evidence that would explain
+// the cut was discarded right here.
+//
+// The two causes must be told apart because net/http cancels the request context
+// on ANY failed write to the connection (checkConnErrorWriter, net/http/server.go),
+// so ctx.Err() != nil covers both:
+//   - writeFailed: OUR write to the client failed — the peer or an intermediate
+//     hop (CDN / reverse proxy) dropped the response mid-stream.
+//   - otherwise: the background read detected the peer closing the connection,
+//     i.e. a genuine client-side disconnect or abort.
+func (h *Handler) noteClientDisconnect(endpoint, model, apiKeyID string, approxOutputTokens int, upstreamErr error, writeFailed bool) {
 	n := atomic.AddInt64(&h.clientDisconnects, 1)
-	logger.Warnf("[Billing] client disconnect before metering; request not billed: endpoint=%s model=%s apiKey=%s approxOutputTokens=%d totalClientDisconnects=%d",
-		endpoint, model, shortID(apiKeyID), approxOutputTokens, n)
+	cause := "peer closed connection (read side)"
+	if writeFailed {
+		cause = "write to client failed (peer or middlebox dropped the stream)"
+	}
+	logger.Warnf("[Stream] interrupted before metering; not billed, no error sent to client: endpoint=%s model=%s apiKey=%s approxOutputTokens=%d cause=%q ctxErr=%v upstreamErr=%v totalInterrupted=%d",
+		endpoint, model, shortID(apiKeyID), approxOutputTokens, cause, contextErrString(upstreamErr), upstreamErr, n)
+}
+
+// contextErrString renders the interruption reason compactly for the log line.
+func contextErrString(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.Canceled):
+		return "context canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline exceeded"
+	default:
+		return "other"
+	}
+}
+
+// noteStreamWriteFailure records the OTHER silent path: the upstream stream
+// finished cleanly (err == nil) but writes to the client had already been
+// failing, so the handler walks its success path — emitting message_delta /
+// message_stop into a dead connection, recording success and BILLING the request
+// — while the client only ever saw a truncated stream. Nothing used to observe
+// this at all: sseKeepaliveWriter latched writeFailed and no one read it.
+//
+// Billing is intentionally left unchanged here (same policy decision as
+// noteClientDisconnect); this makes the case visible so it can be quantified
+// before changing behavior.
+func (h *Handler) noteStreamWriteFailure(endpoint, model, apiKeyID string) {
+	n := atomic.AddInt64(&h.clientDisconnects, 1)
+	logger.Warnf("[Stream] upstream completed but writes to the client had failed; client received a truncated stream (still billed): endpoint=%s model=%s apiKey=%s totalInterrupted=%d",
+		endpoint, model, shortID(apiKeyID), n)
 }
 
 // shortID returns a log-friendly prefix of an internal id (UUID). Not a secret,
@@ -1998,14 +2095,18 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
 				releaseSlot()
+				// 非流式:尚未向客户端写任何字节,ctx 取消只能来自客户端读端断开。
 				h.noteClientDisconnect("claude", model, apiKeyID,
-					estimateApproxTokens(content)+estimateApproxTokens(thinkingContent))
+					estimateApproxTokens(content)+estimateApproxTokens(thinkingContent), err, false)
 				return
 			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(&account, err)
+			if isRequestShapeErrorMessage(err.Error()) {
+				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
+			}
 			continue
 		}
 
@@ -2578,7 +2679,8 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			if clientGone(ctx) {
 				releaseSlot()
 				h.noteClientDisconnect("openai", model, apiKeyID,
-					estimateApproxTokens(rawContentBuilder.String())+estimateApproxTokens(rawReasoningBuilder.String()))
+					estimateApproxTokens(rawContentBuilder.String())+estimateApproxTokens(rawReasoningBuilder.String()),
+					err, kw.WriteFailed())
 				return
 			}
 			releaseSlot()
@@ -2589,6 +2691,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			// 二者间存在窗口,commit 后换号重跑会让第二轮内容续在同一个流里 →"答两遍"。
 			// commit 之后一律收尾,只有 commit 之前才允许静默换号重试。
 			if !streamCommitted {
+				if isRequestShapeErrorMessage(err.Error()) {
+					break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
+				}
 				continue
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
@@ -2661,6 +2766,10 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		// 上游正常收尾但写出已失败过 → 客户端只收到截断的流(见 noteStreamWriteFailure)。
+		if kw.WriteFailed() {
+			h.noteStreamWriteFailure("openai", model, apiKeyID)
+		}
 		return
 	}
 
@@ -2765,14 +2874,18 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
 				releaseSlot()
+				// 非流式:尚未向客户端写任何字节,ctx 取消只能来自客户端读端断开。
 				h.noteClientDisconnect("openai", model, apiKeyID,
-					estimateApproxTokens(content)+estimateApproxTokens(reasoningContent))
+					estimateApproxTokens(content)+estimateApproxTokens(reasoningContent), err, false)
 				return
 			}
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(&account, err)
+			if isRequestShapeErrorMessage(err.Error()) {
+				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
+			}
 			continue
 		}
 

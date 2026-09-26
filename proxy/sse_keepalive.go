@@ -114,6 +114,23 @@ func (k *sseKeepaliveWriter) Flush() {
 	k.flusher.Flush()
 }
 
+// WriteFailed reports whether ANY write to the client has failed (a real event or
+// a heartbeat). Without it the flag was latched but never read, so a stream that
+// died mid-flight looked identical to a healthy one: the event pump kept writing
+// into a broken connection, every write silently failed, and the handler still
+// took its success path — recording success and billing the request while the
+// client only ever received a truncated stream.
+//
+// It also disambiguates the request context being cancelled. net/http cancels the
+// request context on ANY failed write to the connection (checkConnErrorWriter in
+// net/http/server.go), so "ctx.Err() != nil" alone cannot tell a real client
+// disconnect apart from our own write failure. WriteFailed() separates the two.
+func (k *sseKeepaliveWriter) WriteFailed() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.writeFailed
+}
+
 // Start launches the heartbeat goroutine. Idempotent; no-op when the keepalive
 // is disabled (interval <= 0) or already stopped. See the type comment for the
 // "headers must already be flushed" precondition.

@@ -1054,7 +1054,7 @@
       html += '<tr>' +
         '<td class="ov-daily-date">' + escapeHtml(r.date || '-') + '</td>' +
         '<td class="ta-right">' + escapeHtml(formatNumber(r.requests || 0)) + '</td>' +
-        '<td class="ta-right">' + escapeHtml(Number(r.credits || 0).toFixed(1)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatCredits(r.credits)) + '</td>' +
         '<td class="ta-right">' + escapeHtml(formatNumber(r.tokens || 0)) + '</td>' +
         '</tr>';
     });
@@ -1278,7 +1278,9 @@
           escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
           '<span class="log-msg">' + escapeHtml(l.error) + '</span>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(1) + ' cr') : '-') + '</span>';
+        // Zero stays a dash (nothing was charged); anything charged shows a real
+        // figure rather than being rounded to "0.0". See formatCredits.
+        detailCell = '<span class="text-muted">' + (l.credits ? (escapeHtml(formatCredits(l.credits)) + ' cr') : '-') + '</span>';
       }
       const endpoint = l.endpoint || '-';
       const model = l.model || '-';
@@ -1460,6 +1462,23 @@
     if (abs >= 1e3) return (n / 1e3).toFixed(abs >= 1e4 ? 0 : 1) + 'K';
     if (Math.floor(n) === n) return n.toString();
     return n.toFixed(1);
+  }
+  // Credits for a SINGLE request are routinely below 0.05 — a 6.8K-token opus-5
+  // call costs about 0.028. Printing those with one decimal produced "0.0", which
+  // reads as "this was free" and caused real support questions; over one 7-day
+  // window 3,129 requests worth 94.5 credits displayed that way. A genuinely
+  // uncharged request is a different thing and must stay distinguishable, so:
+  // scale precision to magnitude, never round a non-zero charge down to zero, and
+  // leave exact 0 as a plain "0" (callers that want a dash keep their own check).
+  function formatCredits(v) {
+    const n = Number(v);
+    if (!isFinite(n) || n === 0) return '0';
+    const abs = Math.abs(n);
+    if (abs >= 100) return n.toFixed(1);
+    if (abs >= 1) return n.toFixed(2);
+    if (abs >= 0.01) return n.toFixed(3);
+    if (abs >= 0.0001) return n.toFixed(4);
+    return n.toExponential(1); // vanishingly small, but never rendered as zero
   }
   // Relative "time ago" for a Unix-seconds timestamp (used by account added-at / logs / records).
   function formatRelTime(ts) {
@@ -2879,7 +2898,10 @@
     let html = '<div class="key-summary-grid">';
     html += keySummaryCard(t('keyDetail.summaryBalance'), granted > 0 ? formatNumber(balance) : '\u221e', 'balance');
     html += keySummaryCard(t('keyDetail.summaryGranted'), granted > 0 ? formatNumber(granted) : t('keys.unlimited'), '');
-    html += keySummaryCard(t('keyDetail.summaryUsed'), formatNumber(used), 'used');
+    // Used credits can legitimately be a fraction on a barely-used card, so it
+    // needs the same treatment as the per-request figures (formatNumber would
+    // show a 0.03-credit card as "0").
+    html += keySummaryCard(t('keyDetail.summaryUsed'), formatCredits(used), 'used');
     html += keySummaryCard(t('keyDetail.summaryTokens'), formatNumber(tokensUsed), '');
     html += keySummaryCard(t('keyDetail.summaryRequests'), formatNumber(requestsCount), '');
     html += '<div class="key-summary-item"><div class="key-summary-value"' + (chrColor ? ' style="color:' + chrColor + '"' : '') + '>' + escapeHtml(chrTxt) + '</div>' +
@@ -2895,7 +2917,7 @@
       byModel.forEach(m => {
         html += '<tr>' +
           '<td class="font-mono">' + escapeHtml(m.model || '-') + '</td>' +
-          '<td class="ta-right">' + escapeHtml(formatNumber(m.credits || 0)) + '</td>' +
+          '<td class="ta-right">' + escapeHtml(formatCredits(m.credits)) + '</td>' +
           '<td class="ta-right">' + escapeHtml(formatNumber(m.requests || 0)) + '</td>' +
           '</tr>';
       });
@@ -2971,7 +2993,7 @@
         '<td class="ta-right">' + escapeHtml(formatNumber(r.inputTokens || 0)) + '</td>' +
         '<td class="ta-right">' + escapeHtml(formatNumber(r.outputTokens || 0)) + '</td>' +
         '<td class="ta-right">' + escapeHtml(formatNumber(r.cacheReadInputTokens || 0)) + '</td>' +
-        '<td class="ta-right">' + escapeHtml(formatNumber(r.credits || 0)) + '</td>' +
+        '<td class="ta-right">' + escapeHtml(formatCredits(r.credits)) + '</td>' +
         '</tr>';
     });
     html += '</tbody></table>' + pagerHtml('usage', keyUsagePage, total);
