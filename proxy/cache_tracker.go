@@ -654,21 +654,14 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
-func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool, credits float64) map[string]interface{} {
+func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
 		"output_tokens": outputTokens,
 	}
-	// credits(#6): upstream Kiro meteringEvent truth for this turn (JSON number /
-	// float64), surfaced at the top level of the Anthropic usage object as
-	// "credits". Present (and > 0) only when the upstream reported credit
-	// consumption; omitted when 0 (message_start, or a turn the upstream did not
-	// meter). Never locally estimated — always passed through from OnCredits so
-	// the value is metering truth. The downstream Kiro IDE plugin reads this field
-	// to display per-turn credits.
-	if credits > 0 {
-		result["credits"] = credits
-	}
+	// credits 刻意不出现在客户端 usage 里(2026-09-27 主人拍板:协议零自定义字段)。
+	// 上游 meteringEvent 真值仍经 OnCredits 进入内部账本(usage_counters/usage_records/
+	// 账号余额),只是不再透传——下游计费走标准 tokens 字段。
 	if !includeCache {
 		return result
 	}

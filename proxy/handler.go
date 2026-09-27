@@ -1233,7 +1233,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				// credits=0 at message_start: the upstream meteringEvent has not
 				// arrived yet, so no per-turn credits are known. The final
 				// message_delta carries the real credits (see below).
-				"usage": buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil, 0),
+				"usage": buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
 			},
 		})
 		messageStarted = true
@@ -1822,7 +1822,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			},
 			// credits(#6): upstream meteringEvent truth for this turn (0 when the
 			// upstream did not meter → omitted by buildClaudeUsageMap).
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil || hasCacheMetering, credits),
+			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil || hasCacheMetering),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -2366,10 +2366,6 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-		// credits(#6): upstream meteringEvent truth for this turn; float64,
-		// omitempty → omitted when 0 (no upstream metering). Same "credits" field
-		// name/semantics as the streaming path's usage map.
-		resp.Usage.Credits = credits
 		if cacheProfile != nil || hasCacheMetering {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,

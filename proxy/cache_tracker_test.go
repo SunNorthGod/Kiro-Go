@@ -54,7 +54,7 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 		CacheCreation1hInputTokens: 20,
 	}
 
-	m := buildClaudeUsageMap(100, 50, usage, true, 0)
+	m := buildClaudeUsageMap(100, 50, usage, true)
 
 	if got := m["input_tokens"]; got != 50 {
 		t.Fatalf("expected billed input tokens 50, got %#v", got)
@@ -72,30 +72,21 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 	if creation["ephemeral_5m_input_tokens"] != 10 || creation["ephemeral_1h_input_tokens"] != 20 {
 		t.Fatalf("unexpected ttl breakdown: %#v", creation)
 	}
-	// credits(#6): omitted entirely when 0 (no upstream metering this turn).
+	// credits 不再透传(协议零自定义字段):任何情况下都不出现。
 	if _, ok := m["credits"]; ok {
-		t.Fatalf("expected credits to be omitted when zero, got %#v", m["credits"])
+		t.Fatalf("expected no credits field at all, got %#v", m["credits"])
 	}
 }
 
-// TestBuildClaudeUsageMapIncludesCredits verifies the #6 contract: the upstream
-// meteringEvent credits are surfaced as a top-level float64 "credits" field in
-// the Anthropic usage object when > 0.
-func TestBuildClaudeUsageMapIncludesCredits(t *testing.T) {
-	m := buildClaudeUsageMap(100, 50, promptCacheUsage{}, false, 12.5)
+// TestBuildClaudeUsageMapExcludesCredits pins the zero-custom-fields contract:
+// the client-facing usage map carries standard Anthropic keys only. Upstream
+// metering credits stay internal (ledgers/balance) and are never emitted.
+func TestBuildClaudeUsageMapExcludesCredits(t *testing.T) {
+	m := buildClaudeUsageMap(100, 50, promptCacheUsage{}, false)
 
-	got, ok := m["credits"]
-	if !ok {
-		t.Fatalf("expected credits field present when > 0, got %#v", m)
+	if _, ok := m["credits"]; ok {
+		t.Fatalf("credits must never appear in client-facing usage, got %#v", m)
 	}
-	c, isFloat := got.(float64)
-	if !isFloat {
-		t.Fatalf("expected credits to be float64, got %T (%#v)", got, got)
-	}
-	if c != 12.5 {
-		t.Fatalf("expected credits 12.5, got %v", c)
-	}
-	// Token fields still present; cache fields omitted when includeCache=false.
 	if m["input_tokens"] != 100 || m["output_tokens"] != 50 {
 		t.Fatalf("unexpected token fields: %#v", m)
 	}

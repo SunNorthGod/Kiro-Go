@@ -296,10 +296,6 @@ type ClaudeUsage struct {
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
-	// Credits(#6): 本轮上游 meteringEvent 累计的 credits(float64,omitempty → 0 时省略)。
-	// 非流式路径在此透传;流式路径经 buildClaudeUsageMap 以同名 "credits" 字段输出。
-	// 恒为上游真值,不本地估算(无 metering 时 OnCredits 不触发,credits=0 → 省略)。
-	Credits float64 `json:"credits,omitempty"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
