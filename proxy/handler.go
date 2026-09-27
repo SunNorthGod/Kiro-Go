@@ -2472,6 +2472,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	// OpenAI 协议没有思考开关字段:一律按显式思考处理,与 Claude 路径的裸名语义
+	// (resolveEffectiveThinking)及原生 Kiro(协议内部思考)对齐。
+	thinking = true
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 	cacheProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens)

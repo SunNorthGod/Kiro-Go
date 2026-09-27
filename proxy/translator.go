@@ -2074,6 +2074,16 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	// effort 档位注入(对齐 Claude 路径与原生 Kiro):原生 IDE 每请求都带
+	// additionalModelRequestFields(xft/bWo:{output_config:{effort}} 或
+	// {reasoning:{effort}}),OpenAI 路径此前整个缺失,同模型两协议上游请求体不一致。
+	// 用合成 ClaudeRequest 复用同一构建器(模型归一/schema 路径/档位收敛共享);
+	// 空 schema 模型返回 nil 不发,避免上游 400。
+	payload.AdditionalModelRequestFields = buildAdditionalModelRequestFields(&ClaudeRequest{
+		Model:     req.Model,
+		MaxTokens: req.MaxTokens,
+	}, thinking)
+
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
