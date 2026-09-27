@@ -691,11 +691,11 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		h.modelsCacheMu.RUnlock()
 	}
 
-	thinkingSuffix := config.GetThinkingConfig().Suffix
 
-	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+
+	models := buildAnthropicModelsResponse(cached)
 	if len(models) == 0 {
-		models = fallbackAnthropicModels(thinkingSuffix)
+		models = fallbackAnthropicModels()
 	}
 
 	// 添加别名模型（仅当官方模型列表里没有同名 id 时才补，避免与 Kiro
@@ -730,12 +730,15 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
+func buildAnthropicModelsResponse(cached []ModelInfo) []map[string]interface{} {
 	if len(cached) == 0 {
 		return nil
 	}
 
-	models := make([]map[string]interface{}, 0, len(cached)*2)
+	// 纯透传(2026-09-27 主人拍板):只列 AWS ListAvailableModels 返回的基础模型,
+	// 不再自动生成 -thinking 变体。思考由协议字段承载(output_config/reasoning,
+	// 与原生 Kiro 同构);模型名 -thinking 后缀的请求路径仍兼容(ParseModelAndThinking)。
+	models := make([]map[string]interface{}, 0, len(cached))
 	for i := range cached {
 		m := cached[i]
 		supportsImage := modelSupportsImage(m.InputTypes)
@@ -744,11 +747,6 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		base := buildModelInfo(m.ModelId, "anthropic", supportsImage)
 		enrichModelInfo(base, &m, true)
 		models = append(models, base)
-		// Auto-generated thinking variant: same token limits/description, but no
-		// effort schema (thinking is budget-driven for the variant).
-		variant := buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage)
-		enrichModelInfo(variant, &m, false)
-		models = append(models, variant)
 	}
 	return models
 }
@@ -806,28 +804,18 @@ func enrichModelInfo(info map[string]interface{}, m *ModelInfo, includeEffort bo
 
 // fallbackAnthropicModels 是 ListAvailableModels 回源失败时的兜底目录,
 // 按 Kiro 官方模型选择器的新旧顺序排列(2026-07:opus-5 / sonnet-5 / opus-4.8 为最新)。
-func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
+func fallbackAnthropicModels() []map[string]interface{} {
 	models := []map[string]interface{}{
 		buildModelInfo("claude-opus-5", "anthropic", true),
-		buildModelInfo("claude-opus-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-5", "anthropic", true),
-		buildModelInfo("claude-sonnet-5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.8", "anthropic", true),
-		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
 	}
 	// 兜底目录也带上窗口 / 输出上限(按版本号推断):否则客户端拿不到 context_window,
 	// 只能假定 200K,1M 模型的上下文条与压缩时机都会偏。
@@ -1052,8 +1040,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking)
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
@@ -1106,7 +1093,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking)
 	// 裸名请求写死视同显式思考(默认思考档 high,2026-09-27 主人拍板)。
 	thinking = resolveEffectiveThinking(thinking, &req)
 	req.Model = actualModel
@@ -2470,8 +2457,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking := ParseModelAndThinking(req.Model), true
 	// OpenAI 协议没有思考开关字段:一律按显式思考处理,与 Claude 路径的裸名语义
 	// (resolveEffectiveThinking)及原生 Kiro(协议内部思考)对齐。
 	thinking = true
@@ -5395,8 +5381,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	// Build a minimal chat payload
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking := ParseModelAndThinking(req.Model), true
 
 	openaiReq := &OpenAIRequest{
 		Model:     actualModel,
@@ -5563,7 +5548,6 @@ func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.GetThinkingConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"suffix":       cfg.Suffix,
 		"openaiFormat": cfg.OpenAIFormat,
 		"claudeFormat": cfg.ClaudeFormat,
 	})
@@ -5572,7 +5556,6 @@ func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 // apiUpdateThinkingConfig 更新 thinking 配置
 func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Suffix       string `json:"suffix"`
 		OpenAIFormat string `json:"openaiFormat"`
 		ClaudeFormat string `json:"claudeFormat"`
 	}
@@ -5595,7 +5578,7 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat); err != nil {
+	if err := config.UpdateThinkingConfig(req.OpenAIFormat, req.ClaudeFormat); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

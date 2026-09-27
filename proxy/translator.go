@@ -132,19 +132,9 @@ const toolResultTruncationPlaceholder = "[Tool output was truncated to fit the m
 // text" and replace it outright when the image it refers to is dropped.
 const imageOnlyUserContent = "Please analyze the attached image."
 
-// ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
-// and reports whether thinking mode was requested via the configured suffix.
-func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
+// ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID.
+func ParseModelAndThinking(model string) string {
 	lower := strings.ToLower(model)
-	thinking := false
-
-	// Strip the configured thinking suffix (e.g. "-thinking") if present.
-	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
-		thinking = true
-		model = model[:len(model)-len(thinkingSuffix)]
-		lower = strings.ToLower(model)
-	}
 
 	// Strip a trailing dated snapshot suffix (e.g. "-20250929") that Anthropic
 	// SDKs / Claude Code append (claude-sonnet-4-5-20250929, claude-opus-4-1-20250805).
@@ -159,27 +149,26 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
 	for _, m := range modelAliases {
 		if strings.Contains(lower, m.key) {
-			return m.value, thinking
+			return m.value
 		}
 	}
 
 	// 2) Format normalization: claude-{family}-N-M → claude-{family}-N.M.
 	//    New versions (claude-opus-4-8, etc.) flow through here without code changes.
 	if claudeVersionPattern.MatchString(lower) {
-		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3"), thinking
+		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3")
 	}
 
 	// 3) Already a valid Kiro model (dot form or bare family like claude-sonnet-4): pass through.
 	if strings.HasPrefix(lower, "claude-") {
-		return model, thinking
+		return model
 	}
 
-	return model, thinking
+	return model
 }
 
-func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {
-	actualModel, suffixThinking := ParseModelAndThinking(model, thinkingSuffix)
-	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig) (string, bool) {
+	return ParseModelAndThinking(model), isClaudeThinkingRequested(thinkingCfg)
 }
 
 func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
@@ -213,8 +202,7 @@ func claudeEffortRequested(req *ClaudeRequest) bool {
 }
 
 func MapModel(model string) string {
-	mapped, _ := ParseModelAndThinking(model, "-thinking")
-	return mapped
+	return ParseModelAndThinking(model)
 }
 
 // ==================== Claude API 类型 ====================

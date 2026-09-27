@@ -286,17 +286,17 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 			wantThinking: false,
 		},
 		{
-			name:         "suffix remains supported when thinking is disabled",
+			name:         "suffix names are no longer special; disabled still wins",
 			model:        "claude-sonnet-4.5-thinking",
 			thinking:     &ClaudeThinkingConfig{Type: "disabled"},
-			wantModel:    "claude-sonnet-4.5",
-			wantThinking: true,
+			wantModel:    "claude-sonnet-4.5-thinking",
+			wantThinking: false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotModel, gotThinking := resolveClaudeThinkingMode(tc.model, tc.thinking, "-thinking")
+			gotModel, gotThinking := resolveClaudeThinkingMode(tc.model, tc.thinking)
 			if gotModel != tc.wantModel {
 				t.Fatalf("expected model %q, got %q", tc.wantModel, gotModel)
 			}
@@ -511,20 +511,17 @@ func TestMergeUniqueModelsPreservesUnionAcrossAccounts(t *testing.T) {
 	}
 }
 
-func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
+func TestBuildAnthropicModelsResponsePurePassthrough(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
 		InputTypes: []string{"text", "image"},
-	}}, "-thinking")
+	}})
 
-	if len(models) != 2 {
-		t.Fatalf("expected base model and thinking variant, got %d", len(models))
+	if len(models) != 1 {
+		t.Fatalf("expected pure passthrough (no thinking variants), got %d entries", len(models))
 	}
 	if models[0]["id"] != "claude-sonnet-4.5" {
 		t.Fatalf("unexpected base model id: %#v", models[0]["id"])
-	}
-	if models[1]["id"] != "claude-sonnet-4.5-thinking" {
-		t.Fatalf("unexpected thinking model id: %#v", models[1]["id"])
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])

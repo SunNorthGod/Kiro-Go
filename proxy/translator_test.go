@@ -484,58 +484,52 @@ func schemaContainsKey(value interface{}, key string) bool {
 
 func TestParseModelAndThinking(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		wantModel    string
-		wantThinking bool
+		name      string
+		input     string
+		wantModel string
 	}{
 		// Format normalization: dash → dot for new versions without code changes.
-		{"new opus dash form", "claude-opus-4-8", "claude-opus-4.8", false},
-		{"new opus dot form", "claude-opus-4.8", "claude-opus-4.8", false},
-		{"existing opus dash form", "claude-opus-4-7", "claude-opus-4.7", false},
-		{"existing opus dot form", "claude-opus-4.7", "claude-opus-4.7", false},
-		{"sonnet dash form", "claude-sonnet-4-6", "claude-sonnet-4.6", false},
-		{"sonnet dot form", "claude-sonnet-4.6", "claude-sonnet-4.6", false},
-		{"haiku dash form", "claude-haiku-4-5", "claude-haiku-4.5", false},
-		{"haiku dot form", "claude-haiku-4.5", "claude-haiku-4.5", false},
-		{"future major bump", "claude-sonnet-5-0", "claude-sonnet-5.0", false},
+		{"new opus dash form", "claude-opus-4-8", "claude-opus-4.8"},
+		{"new opus dot form", "claude-opus-4.8", "claude-opus-4.8"},
+		{"existing opus dash form", "claude-opus-4-7", "claude-opus-4.7"},
+		{"existing opus dot form", "claude-opus-4.7", "claude-opus-4.7"},
+		{"sonnet dash form", "claude-sonnet-4-6", "claude-sonnet-4.6"},
+		{"sonnet dot form", "claude-sonnet-4.6", "claude-sonnet-4.6"},
+		{"haiku dash form", "claude-haiku-4-5", "claude-haiku-4.5"},
+		{"haiku dot form", "claude-haiku-4.5", "claude-haiku-4.5"},
+		{"future major bump", "claude-sonnet-5-0", "claude-sonnet-5.0"},
 
 		// Bare family name passes through (no minor to normalize).
-		{"bare sonnet 4", "claude-sonnet-4", "claude-sonnet-4", false},
+		{"bare sonnet 4", "claude-sonnet-4", "claude-sonnet-4"},
 
 		// Dated snapshot must hit the alias before the regex rewrites it.
-		{"dated sonnet snapshot", "claude-sonnet-4-20250514", "claude-sonnet-4", false},
+		{"dated sonnet snapshot", "claude-sonnet-4-20250514", "claude-sonnet-4"},
 
 		// Cross-family legacy IDs.
-		{"claude 3.5 sonnet", "claude-3-5-sonnet", "claude-sonnet-4.5", false},
-		{"claude 3 opus", "claude-3-opus", "claude-sonnet-4.5", false},
-		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-4", false},
-		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5", false},
+		{"claude 3.5 sonnet", "claude-3-5-sonnet", "claude-sonnet-4.5"},
+		{"claude 3 opus", "claude-3-opus", "claude-sonnet-4.5"},
+		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-4"},
+		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5"},
 
 		// Non-Anthropic fallbacks.
-		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
-		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
-		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
-		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5", false},
+		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5"},
+		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5"},
+		{"gpt-4", "gpt-4", "claude-sonnet-4.5"},
+		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5"},
 
-		// Thinking suffix is stripped before mapping.
-		{"thinking suffix on dash form", "claude-opus-4-8-thinking", "claude-opus-4.8", true},
-		{"thinking suffix on dot form", "claude-sonnet-4.5-thinking", "claude-sonnet-4.5", true},
-		{"thinking suffix on legacy alias", "claude-3-5-sonnet-thinking", "claude-sonnet-4.5", true},
+		// Thinking suffix is no longer special: the name passes through untouched.
+		{"thinking suffix passes through", "claude-opus-4.8-thinking", "claude-opus-4.8-thinking"},
 
 		// Unknown models pass through unchanged.
-		{"unknown model", "some-other-model", "some-other-model", false},
-		{"misspelled claude family", "claude-opux-4-8", "claude-opux-4-8", false},
+		{"unknown model", "some-other-model", "some-other-model"},
+		{"misspelled claude family", "claude-opux-4-8", "claude-opux-4-8"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotModel, gotThinking := ParseModelAndThinking(tc.input, "-thinking")
+			gotModel := ParseModelAndThinking(tc.input)
 			if gotModel != tc.wantModel {
 				t.Errorf("model: got %q, want %q", gotModel, tc.wantModel)
-			}
-			if gotThinking != tc.wantThinking {
-				t.Errorf("thinking: got %v, want %v", gotThinking, tc.wantThinking)
 			}
 		})
 	}
@@ -545,7 +539,7 @@ func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	// Guards the \b boundary in claudeVersionPattern: without it, the regex would
 	// rewrite "claude-sonnet-4-20250514" to "claude-sonnet-4.20250514" before the
 	// alias table could redirect it.
-	got, _ := ParseModelAndThinking("claude-sonnet-4-20250514", "-thinking")
+	got := ParseModelAndThinking("claude-sonnet-4-20250514")
 	if got != "claude-sonnet-4" {
 		t.Fatalf("dated snapshot must alias to claude-sonnet-4, got %q", got)
 	}

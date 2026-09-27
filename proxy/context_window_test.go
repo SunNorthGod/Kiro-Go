@@ -65,8 +65,8 @@ func TestGetContextWindowSizePrefersRegistry(t *testing.T) {
 	if got := getContextWindowSize("claude-haiku-4.5"); got != 400_000 {
 		t.Errorf("registry window should override heuristic, got %d, want 400000", got)
 	}
-	// 连字符别名与 thinking 后缀都要命中同一条登记。
-	if got := getContextWindowSize("claude-haiku-4-5-thinking"); got != 400_000 {
-		t.Errorf("dashed alias + thinking suffix window = %d, want 400000", got)
+	// 连字符别名要与点分登记命中同一条(思考后缀机制已移除,名字不再特殊)。
+	if got := getContextWindowSize("claude-haiku-4-5"); got != 400_000 {
+		t.Errorf("dashed alias window = %d, want 400000", got)
 	}
 }

@@ -3,8 +3,6 @@ package proxy
 import (
 	"strings"
 	"sync"
-
-	"kiro-go/config"
 )
 
 // ==================== 动态模型元数据注册表 ====================
@@ -76,9 +74,6 @@ func lookupModelMeta(model string) (modelMeta, bool) {
 	key := strings.ToLower(strings.TrimSpace(model))
 	if key == "" {
 		return modelMeta{}, false
-	}
-	if suffix := strings.ToLower(config.GetThinkingConfig().Suffix); suffix != "" {
-		key = strings.TrimSuffix(key, suffix)
 	}
 
 	modelMetaMu.RLock()

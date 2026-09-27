@@ -233,7 +233,6 @@ type Config struct {
 	DefaultMaxRPM         *int `json:"defaultMaxRPM,omitempty"`
 
 	// Thinking mode configuration for extended reasoning output
-	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
@@ -1353,7 +1352,6 @@ func GetPromptFilterRules() []PromptFilterRule {
 // ThinkingConfig holds settings for AI thinking/reasoning mode.
 // When enabled, models output their reasoning process alongside the response.
 type ThinkingConfig struct {
-	Suffix       string `json:"suffix"`       // Model name suffix that triggers thinking mode
 	OpenAIFormat string `json:"openaiFormat"` // Output format for OpenAI-compatible responses
 	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
 }
@@ -1366,16 +1364,11 @@ func GetThinkingConfig() ThinkingConfig {
 
 	if cfg == nil {
 		return ThinkingConfig{
-			Suffix:       "-thinking",
 			OpenAIFormat: "reasoning_content",
 			ClaudeFormat: "thinking",
 		}
 	}
 
-	suffix := cfg.ThinkingSuffix
-	if suffix == "" {
-		suffix = "-thinking"
-	}
 	openaiFormat := cfg.OpenAIThinkingFormat
 	if openaiFormat == "" {
 		openaiFormat = "reasoning_content"
@@ -1386,17 +1379,15 @@ func GetThinkingConfig() ThinkingConfig {
 	}
 
 	return ThinkingConfig{
-		Suffix:       suffix,
 		OpenAIFormat: openaiFormat,
 		ClaudeFormat: claudeFormat,
 	}
 }
 
 // UpdateThinkingConfig 更新 thinking 配置
-func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
+func UpdateThinkingConfig(openaiFormat, claudeFormat string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
 	return Save()
