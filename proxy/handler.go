@@ -698,29 +698,8 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = fallbackAnthropicModels()
 	}
 
-	// 添加别名模型（仅当官方模型列表里没有同名 id 时才补，避免与 Kiro
-	// ListAvailableModels 已返回的模型重复。auto 官方已提供，通常不会再追加）。
-	existingIDs := make(map[string]bool, len(models))
-	for _, m := range models {
-		if id, ok := m["id"].(string); ok {
-			existingIDs[id] = true
-		}
-	}
-	autoModel := buildModelInfo("auto", "kiro-proxy", true)
-	autoModel["display_name"] = "Auto"
-	autoModel["description"] = "Automatically selects the best available model."
-	for _, alias := range []map[string]interface{}{
-		autoModel,
-		buildModelInfo("gpt-4o", "kiro-proxy", true),
-		buildModelInfo("gpt-4", "kiro-proxy", true),
-	} {
-		id, _ := alias["id"].(string)
-		if id == "" || existingIDs[id] {
-			continue
-		}
-		existingIDs[id] = true
-		models = append(models, alias)
-	}
+	// 纯透传,零编造(2026-09-27 主人拍板):不追加 auto/gpt-* 等上游不存在的
+	// 别名,列表即 AWS ListAvailableModels 的原样镜像(缓存冷时为已知 AWS 目录)。
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{

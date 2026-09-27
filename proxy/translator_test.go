@@ -511,11 +511,8 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-4"},
 		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5"},
 
-		// Non-Anthropic fallbacks.
-		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5"},
-		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5"},
-		{"gpt-4", "gpt-4", "claude-sonnet-4.5"},
-		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5"},
+		// Non-Anthropic names pass through untouched (no fabrication).
+		{"gpt-4o passes through", "gpt-4o", "gpt-4o"},
 
 		// Thinking suffix is no longer special: the name passes through untouched.
 		{"thinking suffix passes through", "claude-opus-4.8-thinking", "claude-opus-4.8-thinking"},
