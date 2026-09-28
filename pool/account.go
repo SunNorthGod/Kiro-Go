@@ -20,6 +20,8 @@ type AccountPool struct {
 	currentIndex  uint64
 	cooldowns     map[string]time.Time       // 账号冷却时间(含 429 短退避)
 	errorCounts   map[string]int             // 连续错误计数
+	modelCooldowns   map[string]time.Time    // modelScopeKey(accountID, model) → 模型级冷却(opus-5.5 风控这类模型级故障不冻账号本体)
+	modelErrorCounts map[string]int          // modelScopeKey(accountID, model) → 连续模型级错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
 
 	// ---- 调度层:软并发公平 + 会话粘性(见 scheduler.go)----
@@ -57,9 +59,11 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:    make(map[string]time.Time),
-			errorCounts:  make(map[string]int),
-			modelLists:   make(map[string]map[string]bool),
+			cooldowns:        make(map[string]time.Time),
+			errorCounts:      make(map[string]int),
+			modelCooldowns:   make(map[string]time.Time),
+			modelErrorCounts: make(map[string]int),
+			modelLists:       make(map[string]map[string]bool),
 			inflightAcct: make(map[string]int),
 			inflightKey:  make(map[string]int),
 			sticky:       make(map[string]stickyRef),
@@ -312,6 +316,13 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 		}
 	}
 	return nil
+}
+
+// modelScopeKey 是模型级冷却/错误计数表的键。故障域是「这个号上的这个模型」,
+// 不是号本体——2026-09-27/28 生产实测:opus-5.5 被上游按模型风控(空流)时,
+// 同一账号的 opus-4.8/sonnet 全部正常,按号冻结只会把健康号陪绑进冷却。
+func modelScopeKey(accountID, model string) string {
+	return accountID + "\x00" + model
 }
 
 // RecordSuccess 记录请求成功，清除冷却

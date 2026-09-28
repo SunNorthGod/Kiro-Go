@@ -14,9 +14,11 @@ import (
 // lighter newTestPool omits the scheduler fields).
 func newSchedTestPool(accounts ...config.Account) *AccountPool {
 	p := &AccountPool{
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
+		cooldowns:        make(map[string]time.Time),
+		errorCounts:      make(map[string]int),
+		modelCooldowns:   make(map[string]time.Time),
+		modelErrorCounts: make(map[string]int),
+		modelLists:       make(map[string]map[string]bool),
 		inflightAcct: make(map[string]int),
 		inflightKey:  make(map[string]int),
 		sticky:       make(map[string]stickyRef),

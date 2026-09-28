@@ -372,7 +372,7 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(account, err, model)
 			continue
 		}
 
@@ -382,7 +382,7 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 			logger.Warnf("[WebSearch] MCP call failed on account %s: %v", account.Email, err)
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(account, err, model)
 			continue
 		}
 		results := parseSearchResults(mcpResp)
@@ -392,7 +392,7 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 			lastErr = fmt.Errorf("MCP web_search returned unparseable or error search payload")
 			logger.Warnf("[WebSearch] %v on account %s", lastErr, account.Email)
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, lastErr)
+			h.handleAccountFailure(account, lastErr, "")
 			continue
 		}
 		h.pool.RecordSuccess(account.ID)

@@ -406,7 +406,7 @@ func (h *Handler) refreshAllAccounts() {
 			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
 				if _, err := h.refreshAccountToken(account, false); err != nil {
 					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-					h.handleAccountFailure(account, err)
+					h.handleAccountFailure(account, err, "")
 					continue
 				}
 			}
@@ -866,14 +866,14 @@ func (h *Handler) refreshModelsCache() {
 		account := &accounts[i]
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(account, err, "")
 			continue
 		}
 
 		models, err := ListAvailableModels(account)
 		if err != nil {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(account, err, "")
 			continue
 		}
 		// 缓存每账号可用模型，用于路由时过滤
@@ -1284,7 +1284,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			h.handleAccountFailure(&account, err, model)
 			continue
 		}
 		// 选号已定:发上游前裁决历史思考签名——同账号保留、跨账号/来源未知剥离
@@ -1728,7 +1728,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			excluded[account.ID] = true
 			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(&account, err)
+				h.handleAccountFailure(&account, err, model)
 			}
 			// 换号重跑的护栏必须用 streamCommitted(200 头已 flush)而非 messageStarted
 			// (首个内容事件)。二者之间存在窗口:上游已返回 2xx、commitStream 已提交 200
@@ -2197,7 +2197,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			h.handleAccountFailure(&account, err, model)
 			continue
 		}
 		// 选号已定:发上游前裁决历史思考签名(换号剥 thinking,见 stream 路径同注释)。
@@ -2284,7 +2284,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			excluded[account.ID] = true
 			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(&account, err)
+				h.handleAccountFailure(&account, err, model)
 			}
 			if isRequestShapeErrorMessage(err.Error()) {
 				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
@@ -2528,7 +2528,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			h.handleAccountFailure(&account, err, model)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -2914,7 +2914,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			excluded[account.ID] = true
 			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(&account, err)
+				h.handleAccountFailure(&account, err, model)
 			}
 			// 护栏用 streamCommitted(200 已 flush)而非首个 chunk:
 			// 二者间存在窗口,commit 后换号重跑会让第二轮内容续在同一个流里 →"答两遍"。
@@ -3073,7 +3073,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			h.handleAccountFailure(&account, err, model)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -3143,7 +3143,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			excluded[account.ID] = true
 			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(&account, err)
+				h.handleAccountFailure(&account, err, model)
 			}
 			if isRequestShapeErrorMessage(err.Error()) {
 				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败

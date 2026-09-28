@@ -44,6 +44,15 @@ const (
 	rateLimitBackoffMax  = 60 * time.Second
 	authDisableThreshold = 3
 	quotaCooldown        = 10 * time.Minute
+
+	// Model-scoped restriction handling: three consecutive failures on the same
+	// (account, model) cool THAT PAIR for modelRestrictedCooldown. The account
+	// itself stays fully eligible for every other model. Measured in production
+	// 2026-09-28: an upstream per-model risk-control on opus-5.5 (empty streams)
+	// put both healthy accounts into rolling 1-minute cooldowns via the transient
+	// path, 503ing even opus-4.8 traffic that was serving fine.
+	modelRestrictedStrikes  = 3
+	modelRestrictedCooldown = time.Minute
 )
 
 var (
@@ -63,6 +72,7 @@ const (
 	OutcomeAuthError                     // 401/403: disable after N consecutive
 	OutcomeQuotaExhausted                // 402 / monthly quota: cooldown until it likely resets
 	OutcomeTransient                     // 5xx / network: brief cooldown after repeats
+	OutcomeModelRestricted               // model-scoped risk control (empty stream etc.): cool (account, model), never the account
 )
 
 // snapAcct is an eligible account value copy plus its priority tier.
@@ -88,6 +98,7 @@ type snapshotStats struct {
 	retried    int // already tried and failed during this request's failover
 	noModel    int // does not serve the requested model
 	cooling    int // inside an error/rate-limit cooldown
+	modelCool  int // (account, model) pair inside a model-scoped restriction cooldown
 	nearExpiry int // inside the token refresh skew window
 	quota      int // over usage quota / overage-blocked
 }
@@ -143,6 +154,12 @@ func (p *AccountPool) eligibleSnapshot(model string, excluded map[string]bool, b
 		if cd, ok := p.cooldowns[a.ID]; ok && now.Before(cd) {
 			stats.cooling++
 			continue
+		}
+		if model != "" {
+			if cd, ok := p.modelCooldowns[modelScopeKey(a.ID, model)]; ok && now.Before(cd) {
+				stats.modelCool++
+				continue
+			}
 		}
 		if a.ExpiresAt > 0 && now.Unix() > a.ExpiresAt-tokenRefreshSkewSeconds {
 			stats.nearExpiry++
@@ -229,9 +246,9 @@ func (p *AccountPool) logNoAccount(model string, stats snapshotStats, boundAccou
 	// Reported even when a count is zero: which filters did NOT fire is as
 	// diagnostic as which did.
 	logger.Warnf("[Pool] no eligible account -> HTTP 503: model=%q key=%s pooled=%d "+
-		"notBound=%d alreadyTried=%d noModel=%d cooling=%d nearTokenExpiry=%d quotaBlocked=%d%s",
+		"notBound=%d alreadyTried=%d noModel=%d cooling=%d modelCooling=%d nearTokenExpiry=%d quotaBlocked=%d%s",
 		model, bound, stats.pooled, stats.notBound, stats.retried, stats.noModel,
-		stats.cooling, stats.nearExpiry, stats.quota, extra)
+		stats.cooling, stats.modelCool, stats.nearExpiry, stats.quota, extra)
 }
 
 // Acquire admits the request (per-key fairness), selects an account
@@ -458,13 +475,19 @@ func (p *AccountPool) selectLocked(snap []snapAcct, conversationID string) confi
 
 // ReportOutcome feeds the result of a dispatched request back into the pool so
 // selection adapts: 429 → short exponential backoff, 401/403 → disable after N
-// consecutive, 402/quota → longer cooldown, success → clear error/cooldown.
-func (p *AccountPool) ReportOutcome(accountID, conversationID string, outcome Outcome) {
+// consecutive, 402/quota → longer cooldown, model-scoped restriction → cool the
+// (account, model) pair only, success → clear error/cooldown.
+func (p *AccountPool) ReportOutcome(accountID, conversationID, model string, outcome Outcome) {
 	switch outcome {
 	case OutcomeSuccess:
 		p.mu.Lock()
 		delete(p.cooldowns, accountID)
 		p.errorCounts[accountID] = 0
+		if model != "" {
+			key := modelScopeKey(accountID, model)
+			delete(p.modelCooldowns, key)
+			delete(p.modelErrorCounts, key)
+		}
 		p.mu.Unlock()
 
 	case OutcomeRateLimited:
@@ -508,6 +531,25 @@ func (p *AccountPool) ReportOutcome(accountID, conversationID string, outcome Ou
 		p.errorCounts[accountID]++
 		if p.errorCounts[accountID] >= 3 {
 			p.cooldowns[accountID] = time.Now().Add(time.Minute)
+		}
+		p.mu.Unlock()
+
+	case OutcomeModelRestricted:
+		// The upstream failure is scoped to this MODEL on this account (per-model
+		// risk control, empty streams). Freezing the account here punished healthy
+		// models sharing it — measured 2026-09-28 as rolling whole-pool 503s while
+		// opus-4.8 kept serving on the same accounts. Cool the pair only; a success
+		// on the same pair clears it, expiry doubles as the periodic probe.
+		// Without a model there is no pair to scope to and the message names no
+		// account property — unattributable failures never penalise the account.
+		if model == "" {
+			return
+		}
+		key := modelScopeKey(accountID, model)
+		p.mu.Lock()
+		p.modelErrorCounts[key]++
+		if p.modelErrorCounts[key] >= modelRestrictedStrikes {
+			p.modelCooldowns[key] = time.Now().Add(modelRestrictedCooldown)
 		}
 		p.mu.Unlock()
 	}

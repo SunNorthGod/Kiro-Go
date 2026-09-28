@@ -275,6 +275,25 @@ func isAuthErrorMessage(msg string) bool {
 		strings.Contains(msg, "refresh token expired")
 }
 
+// isModelRestrictedFailureMessage matches upstream failures scoped to the MODEL,
+// not to the account. Production evidence 2026-09-27/28: opus-5.5 returned empty
+// streams on BOTH accounts while every other model on the same accounts kept
+// serving — an upstream per-model risk-control restriction. Falling through to
+// the transient branch made each account's error counter climb, three strikes
+// cooled it for a minute, and the retry storm kept both accounts in rolling
+// cooldowns: whole-pool 503s (cooling=2) while opus-4.8 traffic was perfectly
+// healthy. These failures must cool the (account, model) pair only.
+//
+// "temporarily restricted" covers the native-IDE wording for the same restriction
+// ("temporarily restricted due to excessive content refusals", observed 2026-09-27).
+func isModelRestrictedFailureMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "stream ended before any output") ||
+		strings.Contains(lower, "stream died before any output") ||
+		strings.Contains(lower, "excessive content refusals") ||
+		strings.Contains(lower, "temporarily restricted")
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
@@ -330,7 +349,7 @@ func (h *Handler) disableAccountOverage(account *config.Account) {
 	h.pool.Reload()
 }
 
-func (h *Handler) handleAccountFailure(account *config.Account, err error) {
+func (h *Handler) handleAccountFailure(account *config.Account, err error, model string) {
 	if account == nil || err == nil {
 		return
 	}
@@ -349,7 +368,7 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// authoritative upstream overage status in the BACKGROUND. Previously the
 		// blocking getUsageLimits round-trip ran inline in the request's failover
 		// loop, adding upstream latency to every 402.
-		h.pool.ReportOutcome(account.ID, "", pool.OutcomeQuotaExhausted)
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeQuotaExhausted)
 		h.refreshOverageAsync(account)
 	case isSuspensionErrorMessage(errMsg):
 		// Suspension is a definitive upstream ban → disable immediately.
@@ -358,15 +377,15 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// 429 = Kiro rate-limiting (transient), NOT monthly quota (that is handled
 		// by usage tracking / isQuotaBlocked). Apply a short exponential backoff and
 		// rotate — never a 1h cooldown.
-		h.pool.ReportOutcome(account.ID, "", pool.OutcomeRateLimited)
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeRateLimited)
 	case isProfileUnavailableErrorMessage(errMsg):
 		// Profile ARN may be transiently unresolvable; soft transient, never auto-disable.
-		h.pool.ReportOutcome(account.ID, "", pool.OutcomeTransient)
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeTransient)
 	case isAuthErrorMessage(errMsg):
 		// A single 401/403 no longer hard-bans (could be a transient blip or, before
 		// the pool race fix, a torn-read Bearer). Disable only after N consecutive
 		// auth failures with no success in between (see pool.ReportOutcome).
-		h.pool.ReportOutcome(account.ID, "", pool.OutcomeAuthError)
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeAuthError)
 	case isRequestShapeErrorMessage(errMsg):
 		// The request we sent is at fault, not the account. Reporting a transient
 		// outcome here punished innocent accounts: every account tried during the
@@ -384,7 +403,18 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// ReportOutcome. CallKiroAPI retries the endpoint cycle after a short
 		// backoff, which is what the upstream asks for.
 		logger.Warnf("[AccountFailover] upstream capacity error (account not blamed) for %s: %v", account.Email, err)
+	case isModelRestrictedFailureMessage(errMsg):
+		// Model-scoped restriction: cool the (account, model) pair, never the
+		// account. Same healthy-models-share-the-account reasoning as the overload
+		// case, with a per-model cooldown on top so subsequent requests for THIS
+		// model fast-fail at the pool instead of re-hammering a restricted upstream
+		// through all three endpoints. Other models on the account keep serving, and
+		// the one-minute expiry acts as the periodic probe for the restriction
+		// lifting. ReportOutcome resets the account-level counter here would be
+		// wrong — this branch simply must not touch it.
+		logger.Warnf("[AccountFailover] model-scoped restriction (cooling %s on %s, account not blamed): %v", model, account.Email, err)
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeModelRestricted)
 	default:
-		h.pool.ReportOutcome(account.ID, "", pool.OutcomeTransient)
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeTransient)
 	}
 }

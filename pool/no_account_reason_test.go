@@ -63,6 +63,17 @@ func TestSnapshotStatsAttributeEachExclusion(t *testing.T) {
 			},
 		},
 		{
+			name: "model-scoped restriction cooling",
+			build: func(p *AccountPool) {
+				p.modelCooldowns[modelScopeKey("a", "claude-opus-5.5")] = now.Add(time.Minute)
+				p.modelCooldowns[modelScopeKey("b", "claude-opus-5.5")] = now.Add(time.Minute)
+			},
+			model: "claude-opus-5.5",
+			want: func(s snapshotStats) (bool, string) {
+				return s.modelCool == 2, "modelCooling"
+			},
+		},
+		{
 			name: "inside the token refresh skew window",
 			build: func(p *AccountPool) {
 				// Expiring in 30s: inside the 120s skew, so invisible to the
@@ -106,7 +117,7 @@ func TestSnapshotStatsAreZeroForAHealthyPool(t *testing.T) {
 	if stats.pooled != 2 {
 		t.Fatalf("pooled = %d, want 2", stats.pooled)
 	}
-	if stats.notBound|stats.retried|stats.noModel|stats.cooling|stats.nearExpiry|stats.quota != 0 {
+	if stats.notBound|stats.retried|stats.noModel|stats.cooling|stats.modelCool|stats.nearExpiry|stats.quota != 0 {
 		t.Fatalf("a healthy pool reported exclusions: %+v", stats)
 	}
 }

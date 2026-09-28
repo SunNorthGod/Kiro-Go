@@ -158,7 +158,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(account, err, req.Model)
 			continue
 		}
 
@@ -206,7 +206,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 			}
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailure(account, err, req.Model)
 			continue
 		}
 
