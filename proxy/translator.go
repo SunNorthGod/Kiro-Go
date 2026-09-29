@@ -322,6 +322,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
+	// A deformed tool call replayed by the client (stringified argument values)
+	// must not reach the model as an example to imitate — coerce against the
+	// tool schemas first (see tool_input_coerce.go).
+	coerceToolUseInputsInRequest(req)
+
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
 

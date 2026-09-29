@@ -399,6 +399,11 @@ type KiroStreamCallback struct {
 	OnToolUse     func(toolUse KiroToolUse)
 	OnComplete    func(inputTokens, outputTokens int)
 	OnError       func(err error)
+	// ToolSchemas maps the WIRE tool name (post ToolNameMap) to its declared
+	// input schema. Populated by CallKiroAPI from the payload; finishToolUse
+	// uses it to coerce stringified argument values back to their declared
+	// types before they reach the client (see tool_input_coerce.go).
+	ToolSchemas map[string]map[string]interface{}
 	// OnException fires on a mid-stream `exception` frame that is NOT a hard
 	// failure — specifically the model hitting its output-token cap
 	// (ContentLengthExceededException). The content streamed so far is valid but
@@ -505,6 +510,24 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if callback != nil && callback.ToolSchemas == nil && payload != nil {
+		var kiroTools []KiroToolWrapper
+		if ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext; ctx != nil {
+			kiroTools = ctx.Tools
+		}
+		if len(kiroTools) > 0 {
+			m := make(map[string]map[string]interface{}, len(kiroTools))
+			for i := range kiroTools {
+				spec := &kiroTools[i].ToolSpecification
+				if m[spec.Name] == nil {
+					if sm, ok := spec.InputSchema.JSON.(map[string]interface{}); ok {
+						m[spec.Name] = sm
+					}
+				}
+			}
+			callback.ToolSchemas = m
+		}
 	}
 	originalProfileArn := ""
 	if payload != nil {
@@ -1393,6 +1416,22 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) error {
 	}
 	if input == nil {
 		input = make(map[string]interface{})
+	}
+	// Schema-aware coercion: a model occasionally emits a non-string argument
+	// as a JSON-encoded string ({"todos": "[...]"}, "limit": "25" — buyer
+	// ticket 2026-09-30). Unwrap when the declared schema types the field as
+	// that non-string kind; fields the schema types as string are never
+	// touched. Also breaks the imitation loop: the coerced call is what the
+	// client validates, replays and the model next sees.
+	if callback != nil && len(callback.ToolSchemas) > 0 {
+		if ps := callback.ToolSchemas[state.Name]; ps != nil {
+			before, _ := json.Marshal(input)
+			input = coerceInputToSchema(input, ps, 0)
+			after, _ := json.Marshal(input)
+			if string(before) != string(after) {
+				logger.Warnf("[ToolInput] coerced stringified arguments for tool %q", state.Name)
+			}
+		}
 	}
 	if callback == nil || callback.OnToolUse == nil {
 		return nil
