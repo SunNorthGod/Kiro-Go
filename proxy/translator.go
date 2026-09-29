@@ -53,6 +53,22 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
+
+// nativeToolRoundContent is what currentMessage.content carries when the round's
+// tool results are attached structurally via UserInputMessageContext.ToolResults.
+// Native Kiro IDE sends an EMPTY string here (kiro.kiro-agent bundle:
+// userInputMessage:{content:"",origin:"AI_EDITOR",userInputMessageContext:{toolResults:...}}),
+// and the upstream accepts that shape and answers normally — verified live on
+// 2026-09-30 against generateAssistantResponse. The previous "." placeholder was
+// our own invention: the backend renders it into the model's context as a bare
+// user turn containing a single period, which an agentic client's model then
+// reports receiving (buyer ticket 2026-09-30).
+const nativeToolRoundContent = ""
+
+// emptyToolResultNotice replaces the fold-path placeholder when every tool
+// result in the round carries no text (and no images). Honest about the
+// emptiness instead of a bare ".", which the model reads as a user nudge.
+const emptyToolResultNotice = "[The tool returned no text output.]"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
@@ -435,8 +451,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		finalContent = normalizeUserContent("", true)
 	default:
 		// keepCurrentToolResults==true:结构化 ToolResults 已挂到 UserInputMessageContext,
-		// 若再用 buildToolResultsContinuation 塞进文本会重复同一份工具输出。用 "." 占位。
-		finalContent = minimalFallbackUserContent
+		// 若再用 buildToolResultsContinuation 塞进文本会重复同一份工具输出。content 置空,
+		// 与原生 Kiro IDE 的工具回执轮一致(见 nativeToolRoundContent 注释)。
+		finalContent = nativeToolRoundContent
 	}
 
 	// 转换工具
@@ -2008,8 +2025,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	case len(currentImages) > 0:
 		finalContent = normalizeUserContent("", true)
 	default:
-		// keepCurrentToolResults==true:结构化 ToolResults 已挂载,不重复塞文本;或纯占位。
-		finalContent = minimalFallbackUserContent
+		// keepCurrentToolResults==true:结构化 ToolResults 已挂载,不重复塞文本;content
+		// 置空与原生一致(见 nativeToolRoundContent)。
+		finalContent = nativeToolRoundContent
 	}
 
 	// 转换工具
@@ -3074,7 +3092,7 @@ func jsonEscapedLen(s string) int {
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 	if len(toolResults) == 0 {
-		return minimalFallbackUserContent
+		return emptyToolResultNotice
 	}
 
 	parts := make([]string, 0, len(toolResults))
@@ -3090,7 +3108,7 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 	}
 
 	if len(parts) == 0 {
-		return minimalFallbackUserContent
+		return emptyToolResultNotice
 	}
 
 	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
