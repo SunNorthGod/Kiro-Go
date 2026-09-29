@@ -92,3 +92,56 @@ func TestFoldPathTextlessResultsUseHonestNotice(t *testing.T) {
 	}
 	_ = json.Marshal // keep encoding/json import stable if assertions above change
 }
+
+// System-role turns inside the messages array (OpenAI-style clients) must be
+// translated, not dropped. First measured in production 2026-09-28; a client
+// whose LAST message was role:"system" produced an empty current turn, which
+// the upstream rejects with REQUEST_BODY_INVALID (replayed 2026-09-30) and
+// which used to be asked "." before that.
+func TestSystemRoleMessagesAreTranslatedNotDropped(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8", MaxTokens: 256,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "start the task"},
+			{Role: "system", Content: "mid-stream context note"},
+			{Role: "assistant", Content: "working on it"},
+			{Role: "system", Content: "continue the task now"},
+		},
+	}
+	payload := ClaudeToKiro(req, true)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.Content != "continue the task now" {
+		t.Fatalf("last system turn lost: current content = %q", cur.Content)
+	}
+
+	// The mid-stream system note must survive inside the preceding user history
+	// turn, not vanish.
+	found := false
+	for i := range payload.ConversationState.History {
+		u := payload.ConversationState.History[i].UserInputMessage
+		if u != nil && strings.Contains(u.Content, "mid-stream context note") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mid-stream system turn was dropped from history")
+	}
+}
+
+// A current turn with no content, no tool results and no images must never go
+// out as an empty string — the upstream answers REQUEST_BODY_INVALID. The
+// minimal literal is the tolerated fallback.
+func TestEmptyCurrentTurnFallsBackToMinimalLiteral(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8", MaxTokens: 256,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hi"},
+			{Role: "user", Content: ""},
+		},
+	}
+	payload := ClaudeToKiro(req, true)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if strings.TrimSpace(cur.Content) == "" {
+		t.Fatalf("empty current turn sent upstream: %q", cur.Content)
+	}
+}

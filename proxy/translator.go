@@ -385,6 +385,33 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			history = append(history, KiroHistoryMessage{
 				AssistantResponseMessage: asst,
 			})
+		} else if msg.Role == "system" {
+			// OpenAI 风格客户端会把 role:"system" 混进 messages 数组——Anthropic
+			// schema 不允许,但生产流量真实存在(首测 2026-09-28)。此前这些消息被
+			// 静默丢弃:中段的丢内容;若末条是 system,当前回合直接变空,网关要么
+			// 拿 "." 问模型,要么(nativeToolRoundContent 改空串后)发出被上游以
+			// REQUEST_BODY_INVALID 拒绝的请求。处置:Kiro 历史没有中途 system 的
+			// 位置且必须保持 user/assistant 交替,故中段 system 文本并入相邻的
+			// 前一个 user 历史回合;处于末位的 system 等价 user,作为当前回合内容。
+			text, _, _ := extractClaudeUserContent(msg.Content)
+			text = strings.TrimSpace(text)
+			if text == "" {
+				continue
+			}
+			if isLast {
+				currentContent = text
+			} else if len(history) > 0 && history[len(history)-1].UserInputMessage != nil {
+				tail := history[len(history)-1].UserInputMessage
+				tail.Content = joinHistoryText(tail.Content, text)
+			} else {
+				history = append(history, KiroHistoryMessage{
+					UserInputMessage: &KiroUserInputMessage{
+						Content: text,
+						ModelID: modelID,
+						Origin:  origin,
+					},
+				})
+			}
 		}
 	}
 
@@ -453,7 +480,13 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		// keepCurrentToolResults==true:结构化 ToolResults 已挂到 UserInputMessageContext,
 		// 若再用 buildToolResultsContinuation 塞进文本会重复同一份工具输出。content 置空,
 		// 与原生 Kiro IDE 的工具回执轮一致(见 nativeToolRoundContent 注释)。
-		finalContent = nativeToolRoundContent
+		// 彻底空的当前回合(无内容/无工具结果/无图)绝不能发空串:上游 400
+		// REQUEST_BODY_INVALID(2026-09-30 原样回放实锤),兜底为最小字面量。
+		if keepCurrentToolResults {
+			finalContent = nativeToolRoundContent
+		} else {
+			finalContent = minimalFallbackUserContent
+		}
 	}
 
 	// 转换工具
@@ -2025,9 +2058,15 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	case len(currentImages) > 0:
 		finalContent = normalizeUserContent("", true)
 	default:
-		// keepCurrentToolResults==true:结构化 ToolResults 已挂载,不重复塞文本;content
-		// 置空与原生一致(见 nativeToolRoundContent)。
-		finalContent = nativeToolRoundContent
+		// keepCurrentToolResults==true:结构化 ToolResults 已挂载,不重复塞文本;
+		// content 置空与原生一致(见 nativeToolRoundContent)。
+		// 彻底空的当前回合(无内容/无工具结果/无图)绝不能发空串:上游 400
+		// REQUEST_BODY_INVALID(2026-09-30 原样回放实锤),兜底为最小字面量。
+		if keepCurrentToolResults {
+			finalContent = nativeToolRoundContent
+		} else {
+			finalContent = minimalFallbackUserContent
+		}
 	}
 
 	// 转换工具
