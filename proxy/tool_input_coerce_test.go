@@ -151,3 +151,59 @@ func TestFinishToolUseWithoutSchemaRelaysVerbatim(t *testing.T) {
 		t.Fatalf("relay altered: %v (%T)", got.Input["stuff"], got.Input["stuff"])
 	}
 }
+
+// The upstream echoes its own name normalization: we send "todoWrite", the
+// model answers "todo_write" — measured in production 2026-09-30, where the
+// exact-key lookup missed and output-side coercion never fired for such tools.
+// Both map indexing and lookup go through the canonical form.
+func TestCanonicalToolKeyResolvesUpstreamNameVariants(t *testing.T) {
+	cases := []struct{ wire, echoed string }{
+		{"todoWrite", "todo_write"},
+		{"Read", "read"},
+		{"Read", "Read"},
+		{"mcpIdaDecompile", "mcp_ida_decompile"},
+		{"mcp__ida__decompile", "mcpIdaDecompile"},
+	}
+	for _, c := range cases {
+		if canonicalToolKey(c.wire) != canonicalToolKey(c.echoed) {
+			t.Errorf("canonical(%q) != canonical(%q)", c.wire, c.echoed)
+		}
+	}
+}
+
+func TestFinishToolUseCoercesUnderCanonicalName(t *testing.T) {
+	state := &toolUseState{ToolUseID: "toolu_c", Name: "todo_write"}
+	state.InputBuffer.WriteString(`{"todos": "[{\"content\":\"a\",\"status\":\"in_progress\",\"priority\":\"high\"}]"}`)
+
+	schema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"todos": map[string]interface{}{
+				"type": "array",
+				"items": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"content":  map[string]interface{}{"type": "string"},
+						"status":   map[string]interface{}{"type": "string"},
+						"priority": map[string]interface{}{"type": "string"},
+					},
+				},
+			},
+		},
+	}
+	var got KiroToolUse
+	cb := &KiroStreamCallback{
+		OnToolUse: func(tu KiroToolUse) { got = tu },
+		// keyed the way CallKiroAPI now indexes: wire name + canonical form
+		ToolSchemas: map[string]map[string]interface{}{
+			"todoWrite":                       schema,
+			canonicalToolKey("todoWrite"): schema,
+		},
+	}
+	if err := finishToolUse(state, cb); err != nil {
+		t.Fatalf("finishToolUse: %v", err)
+	}
+	if _, ok := got.Input["todos"].([]interface{}); !ok {
+		t.Fatalf("todos still %T under upstream-normalized name", got.Input["todos"])
+	}
+}

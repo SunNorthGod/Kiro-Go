@@ -23,6 +23,28 @@ import (
 
 const coerceMaxDepth = 4
 
+// canonicalToolKey collapses the name variants that exist across the tool
+// round-trip. The gateway sends a sanitized name ("todoWrite"), the upstream
+// model echoes back its own normalization ("todo_write"), and the client's
+// original may differ again ("TodoWrite"). Measured 2026-09-30 in production:
+// a finishToolUse lookup for "todo_write" missed a map keyed "todoWrite",
+// silently disabling all output-side coercion. Lowercasing and stripping
+// non-alphanumerics maps all three onto one key; first writer wins on the
+// (theoretical) collision.
+func canonicalToolKey(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		}
+	}
+	return b.String()
+}
+
 // coerceToolUseInputsInRequest rewrites assistant tool_use inputs in a captured
 // request so a deformed call already replayed by the client no longer teaches
 // the model the wrong shape.

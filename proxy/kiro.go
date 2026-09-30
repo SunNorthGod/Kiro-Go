@@ -517,16 +517,24 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 			kiroTools = ctx.Tools
 		}
 		if len(kiroTools) > 0 {
-			m := make(map[string]map[string]interface{}, len(kiroTools))
+			m := make(map[string]map[string]interface{}, len(kiroTools)*2)
 			for i := range kiroTools {
 				spec := &kiroTools[i].ToolSpecification
-				if m[spec.Name] == nil {
-					if sm, ok := spec.InputSchema.JSON.(map[string]interface{}); ok {
+				if sm, ok := spec.InputSchema.JSON.(map[string]interface{}); ok {
+					// Index under BOTH the wire name and its canonical form: the
+					// upstream echoes its own name normalization ("todo_write" for
+					// our "todoWrite"), so exact-key lookups missed in production.
+					if m[spec.Name] == nil {
 						m[spec.Name] = sm
+					}
+					ck := canonicalToolKey(spec.Name)
+					if ck != "" && m[ck] == nil {
+						m[ck] = sm
 					}
 				}
 			}
 			callback.ToolSchemas = m
+			logger.Debugf("[ToolSchemas] populated %d entries", len(m))
 		}
 	}
 	originalProfileArn := ""
@@ -1424,13 +1432,19 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) error {
 	// touched. Also breaks the imitation loop: the coerced call is what the
 	// client validates, replays and the model next sees.
 	if callback != nil && len(callback.ToolSchemas) > 0 {
-		if ps := callback.ToolSchemas[state.Name]; ps != nil {
+		ps := callback.ToolSchemas[state.Name]
+		if ps == nil {
+			ps = callback.ToolSchemas[canonicalToolKey(state.Name)]
+		}
+		if ps != nil {
 			before, _ := json.Marshal(input)
 			input = coerceInputToSchema(input, ps, 0)
 			after, _ := json.Marshal(input)
 			if string(before) != string(after) {
 				logger.Warnf("[ToolInput] coerced stringified arguments for tool %q", state.Name)
 			}
+		} else {
+			logger.Debugf("[ToolSchemas] no schema declared for tool %q; relaying input verbatim", state.Name)
 		}
 	}
 	if callback == nil || callback.OnToolUse == nil {
