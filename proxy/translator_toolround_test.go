@@ -145,3 +145,58 @@ func TestEmptyCurrentTurnFallsBackToMinimalLiteral(t *testing.T) {
 		t.Fatalf("empty current turn sent upstream: %q", cur.Content)
 	}
 }
+
+// Consecutive assistant messages (a client splitting one round's parallel tool
+// calls across two assistant turns) must merge into a single history entry, so
+// the following user turn's tool_results all pair against it. Production
+// 2026-10-26: an unmerged replay hit the upstream's strict pairing validation
+// (TOOL_USE_RESULT_MISMATCH, 32x3 endpoint 400s, 21 client-visible failures).
+func TestConsecutiveAssistantMessagesMerge(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-5.5", MaxTokens: 256,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "run the tool and rename the chat"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "running"},
+				map[string]interface{}{"type": "tool_use", "id": "toolu_A", "name": "powershell", "input": map[string]interface{}{"cmd": "dir"}},
+			}},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "renaming"},
+				map[string]interface{}{"type": "tool_use", "id": "toolu_B", "name": "rename_chat", "input": map[string]interface{}{"title": "x"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_A", "content": "out-a"},
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_B", "content": "ok"},
+			}},
+		},
+	}
+	payload := ClaudeToKiro(req, true)
+	cs := payload.ConversationState
+
+	// both tool_uses survive under one assistant entry
+	seen := map[string]bool{}
+	assistantEntries := 0
+	for i := range cs.History {
+		a := cs.History[i].AssistantResponseMessage
+		if a == nil {
+			continue
+		}
+		assistantEntries++
+		for _, tu := range a.ToolUses {
+			seen[tu.ToolUseID] = true
+		}
+	}
+	if !seen["toolu_A"] || !seen["toolu_B"] {
+		t.Fatalf("merged assistant lost a tool_use: %v", seen)
+	}
+
+	// the current round keeps both results structured (native tool-round shape)
+	cm := cs.CurrentMessage.UserInputMessage
+	if cm.Content != nativeToolRoundContent {
+		t.Fatalf("current content = %q, want the native empty tool-round shape", cm.Content)
+	}
+	ctx := cm.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) != 2 {
+		t.Fatalf("tool results not attached: %+v", ctx)
+	}
+}

@@ -387,9 +387,25 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 					asst.ReasoningProducer = producer // tagged→产出账号 token;foreign→""(来源未知)
 				}
 			}
-			history = append(history, KiroHistoryMessage{
-				AssistantResponseMessage: asst,
-			})
+			// 相邻 assistant 合并(Out-of-spec 容错):部分客户端会把一轮的多个工具
+			// 调用拆成连发的两条 assistant 消息(实测 2026-10-26,TOOL_USE_RESULT_
+			// MISMATCH 工单)——随后的一条 user 携带全部 tool_result 时,跨消息的
+			// 配对被上游严格校验拒绝(每个 tool_result 必须配对紧邻 assistant 里的
+			// tool_use)。合并成一条:文本拼接、toolUses 并集,拆散的配对即复原。
+			if len(history) > 0 && history[len(history)-1].AssistantResponseMessage != nil {
+				tail := history[len(history)-1].AssistantResponseMessage
+				tail.Content = joinHistoryText(tail.Content, content)
+				tail.ToolUses = append(tail.ToolUses, toolUses...)
+				if tail.ReasoningCandidate == nil && asst.ReasoningCandidate != nil {
+					tail.ReasoningCandidate = asst.ReasoningCandidate
+					tail.ReasoningProducer = asst.ReasoningProducer
+				}
+				// 合并进已有条目后,本消息处理完毕
+			} else {
+				history = append(history, KiroHistoryMessage{
+					AssistantResponseMessage: asst,
+				})
+			}
 		} else if msg.Role == "system" {
 			// OpenAI 风格客户端会把 role:"system" 混进 messages 数组——Anthropic
 			// schema 不允许,但生产流量真实存在(首测 2026-09-28)。此前这些消息被
