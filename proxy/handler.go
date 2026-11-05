@@ -540,6 +540,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	// API 端点（需要验证 API Key）
 	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
+		// 协议自愈(2026-11-06):body 带强 OpenAI 特征时改道 OpenAI handler,
+		// NewAPI 透传错位不再炸 REQUEST_BODY_INVALID(见 protocol_detect.go)。
+		if h.routeProtocolBody(w, r, "anthropic") == "openai" {
+			ar := h.authenticateForOpenAI(w, r)
+			if ar == nil {
+				return
+			}
+			h.handleOpenAIChat(w, ar)
+			return
+		}
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
@@ -552,6 +562,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleCountTokens(w, ar)
 	case path == "/v1/chat/completions" || path == "/chat/completions":
+		// 协议自愈(2026-11-06):body 带强 Anthropic 特征时改道 Claude handler。
+		if h.routeProtocolBody(w, r, "openai") == "anthropic" {
+			ar := h.authenticateForClaude(w, r)
+			if ar == nil {
+				return
+			}
+			h.handleClaudeMessages(w, ar)
+			return
+		}
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
