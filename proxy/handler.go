@@ -805,6 +805,29 @@ func fallbackAnthropicModels() []map[string]interface{} {
 		info["context_window"] = window
 		info["max_input_tokens"] = window
 		info["max_output_tokens"] = modelMaxOutputTokens(id)
+		// 2026-11-06: 兜底行补 effort 元数据(官方 Claude 五档,1.4.86 选择器
+		// 从 additionalModelRequestFieldsSchema 渲染档位条)。回源失败时客户端
+		// 不再看到空档位;判定规则与 fallbackSchemaPath 一致——仅 opus/sonnet
+		// >= 4.6 走 output_config 五档,旧模型 schema 为空,发即 400。
+		if fallbackSchemaPath(strings.ToLower(id)) == "output_config" {
+			info["effort_levels"] = []string{"low", "medium", "high", "xhigh", "max"}
+			info["effort_schema_path"] = "output_config"
+			info["default_effort_level"] = "xhigh"
+			info["additionalModelRequestFieldsSchema"] = map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"output_config": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"effort": map[string]interface{}{
+								"type": "string",
+								"enum": []string{"low", "medium", "high", "xhigh", "max"},
+							},
+						},
+					},
+				},
+			}
+		}
 	}
 	return models
 }
