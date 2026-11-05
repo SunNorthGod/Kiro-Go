@@ -799,9 +799,11 @@ func enrichModelInfo(info map[string]interface{}, m *ModelInfo, includeEffort bo
 }
 
 // fallbackAnthropicModels 是 ListAvailableModels 回源失败时的兜底目录,
-// 按 Kiro 官方模型选择器的新旧顺序排列(2026-07:opus-5 / sonnet-5 / opus-4.8 为最新)。
+// 按 Kiro 官方模型选择器的新旧顺序排列(2026-11:opus-5.5 / opus-5 / sonnet-5 /
+// opus-4.8 为最新;5.5 曾漏在这里,直连用户在回源失败期选不到它)。
 func fallbackAnthropicModels() []map[string]interface{} {
 	models := []map[string]interface{}{
+		buildModelInfo("claude-opus-5.5", "anthropic", true),
 		buildModelInfo("claude-opus-5", "anthropic", true),
 		buildModelInfo("claude-sonnet-5", "anthropic", true),
 		buildModelInfo("claude-opus-4.8", "anthropic", true),
