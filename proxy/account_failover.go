@@ -8,6 +8,7 @@ import (
 	"kiro-go/pool"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxAccountRetryAttempts = 3
@@ -84,6 +85,22 @@ func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string,
 	return nil
 }
 
+// isRateThrottleFailureText reports whether the last upstream failure was a
+// RATE-limit 429 ("HTTP 429 rate throttled on ...", see the 429 split in
+// kiro.go and isUsageQuota429Body). The handler failover loops use this to
+// distinguish "the pool is empty because every account is inside a seconds-long
+// throttle cooldown" — worth waiting out — from a genuinely unavailable pool.
+func isRateThrottleFailureText(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "usage quota exhausted") {
+		return false // usage exhaustion: waiting cannot help until reset
+	}
+	return strings.Contains(lower, "rate throttled")
+}
+
 // isStreamIntegrityError reports whether err is a soft integrity failure.
 // Callers may rotate accounts on these, but must not run them through
 // handleAccountFailure: an upstream blip should not mark an account unhealthy.
@@ -94,6 +111,80 @@ func isStreamIntegrityError(err error) bool {
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+}
+
+// AWS calls two very different things "quota": a RATE quota (requests-per-window
+// throttling, wording like ThrottlingException / rate exceeded) and a USAGE
+// quota (the account's monthly credits / plan allowance). Only the usage kind
+// is meaningfully "exhausted" — the rate kind clears itself within seconds to
+// minutes, which is exactly what the 2026-11-05 incident showed: 2072 429s in
+// one morning on a single-account pool, volume tracking the request rate and
+// vanishing the moment traffic paused.
+//
+// isUsageQuota429Body classifies a 429 RESPONSE BODY; anything without strong
+// usage wording defaults to rate, because a rate 429 is retryable and a
+// mistaken usage classification would freeze a healthy account until reset.
+func isUsageQuota429Body(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "throttl") ||
+		strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "rate exceeded") ||
+		strings.Contains(lower, "slow down") {
+		return false
+	}
+	return strings.Contains(lower, "monthly limit") ||
+		strings.Contains(lower, "credits") ||
+		strings.Contains(lower, "usage limit") ||
+		strings.Contains(lower, "plan limit") ||
+		strings.Contains(lower, "subscription limit") ||
+		strings.Contains(lower, "allowance")
+}
+
+// isUsageQuotaErrorMessage matches the error kiro.go builds from a usage-class
+// 429 body ("HTTP 429 from <endpoint>: usage quota exhausted: ...").
+func isUsageQuotaErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "429") && strings.Contains(lower, "usage quota exhausted")
+}
+
+// maxThrottleRetriesPerEndpoint bounds same-endpoint retries of a RATE 429.
+// Two retries at 1s/2.5s cover the common short throttle window; three
+// endpoints then at most ~10s of waiting before the handler-level rotation,
+// which in turn backs off again rather than surfacing a 503 to the client.
+const maxThrottleRetriesPerEndpoint = 2
+
+func throttleRetryBackoff(n int) time.Duration {
+	if n <= 1 {
+		return time.Second
+	}
+	return 2500 * time.Millisecond
+}
+
+// throttleRetryWait waits out a rate-limit window, honouring client
+// cancellation: a client that has gone away must not hold an account slot for
+// a backoff it will never see.
+func throttleRetryWait(ctx context.Context, d time.Duration) error {
+	if ctx == nil {
+		time.Sleep(d)
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// truncateForLog flattens an upstream body to one log-safe line.
+func truncateForLog(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 160 {
+		s = s[:160] + "..."
+	}
+	return s
 }
 
 func isOverageErrorMessage(msg string) bool {
@@ -373,6 +464,14 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error, model
 	case isSuspensionErrorMessage(errMsg):
 		// Suspension is a definitive upstream ban → disable immediately.
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
+	case isUsageQuotaErrorMessage(errMsg):
+		// 429 whose upstream body showed an ALLOWANCE problem (monthly limit /
+		// credits / plan wording, see isUsageQuota429Body) rather than rate
+		// wording. A short rate-limit backoff would just re-429 until reset, so
+		// the account takes the long quota cooldown instead. Checked before
+		// isQuotaErrorMessage, whose "429" arm would otherwise swallow it into
+		// the short-backoff path.
+		h.pool.ReportOutcome(account.ID, "", model, pool.OutcomeQuotaExhausted)
 	case isQuotaErrorMessage(errMsg):
 		// 429 = Kiro rate-limiting (transient), NOT monthly quota (that is handled
 		// by usage tracking / isQuotaBlocked). Apply a short exponential backoff and

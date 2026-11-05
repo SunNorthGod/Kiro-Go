@@ -638,59 +638,98 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 			// A stream that died before any output reached the client (#143) is
 			// retried on the SAME endpoint, bounded by maxStreamAttemptsPerEndpoint,
 			// before the loop falls back to the next endpoint.
-		var terminal, retrySame bool
-		var err error
-		for streamAttempt := 1; ; streamAttempt++ {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			terminal, retrySame, err = func() (terminal, retrySame bool, err error) {
-				reqCtx, cancel := context.WithCancel(ctx)
-				defer cancel()
+			var terminal, retrySame bool
+			var err error
+			for streamAttempt := 1; ; streamAttempt++ {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				terminal, retrySame, err = func() (terminal, retrySame bool, err error) {
+					reqCtx, cancel := context.WithCancel(ctx)
+					defer cancel()
 
-				// Requests and bodies cannot be reused after an HTTP attempt.
-				req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
-				if err != nil {
-					return false, false, err
-				}
+					// attemptOnce performs one full request against this endpoint on the
+					// shared reqCtx. Requests and bodies cannot be reused after an HTTP
+					// attempt, so every retry rebuilds them.
+					attemptOnce := func() (*http.Response, error) {
+						req, err := http.NewRequestWithContext(reqCtx, "POST", epURL, bytes.NewReader(reqBody))
+						if err != nil {
+							return nil, err
+						}
 
-				req.Header.Set("Content-Type", "application/json")
-				if isAPIKey {
-					req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-				}
-				req.Header.Set("Accept", "*/*")
-				if ep.AmzTarget != "" {
-					req.Header.Set("X-Amz-Target", ep.AmzTarget)
-				}
-				applyKiroBaseHeaders(req, account, headerValues)
-				if !isAPIKey {
-					req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-				}
-				// CLI captures use optout=false; IDE path keeps true.
-				if isAPIKey {
-					req.Header.Set("x-amzn-codewhisperer-optout", "false")
-				} else {
-					req.Header.Set("x-amzn-codewhisperer-optout", "true")
-				}
-				req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", streamAttempt, maxStreamAttemptsPerEndpoint))
-				req.Header.Set("Amz-Sdk-Invocation-Id", invocationID)
-
-				resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-				if err != nil {
-					logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-					// A deadline that expired before the request could complete is
-					// terminal: the caller's budget is gone, falling back to another
-					// endpoint cannot help.
-					if !isRetryableStreamError(err) {
-						return true, false, err
+						req.Header.Set("Content-Type", "application/json")
+						if isAPIKey {
+							req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+						}
+						req.Header.Set("Accept", "*/*")
+						if ep.AmzTarget != "" {
+							req.Header.Set("X-Amz-Target", ep.AmzTarget)
+						}
+						applyKiroBaseHeaders(req, account, headerValues)
+						if !isAPIKey {
+							req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+						}
+						// CLI captures use optout=false; IDE path keeps true.
+						if isAPIKey {
+							req.Header.Set("x-amzn-codewhisperer-optout", "false")
+						} else {
+							req.Header.Set("x-amzn-codewhisperer-optout", "true")
+						}
+						req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", streamAttempt, maxStreamAttemptsPerEndpoint))
+						req.Header.Set("Amz-Sdk-Invocation-Id", invocationID)
+						return GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 					}
-					return false, false, err
-				}
 
-					if resp.StatusCode == 429 {
+					resp, err := attemptOnce()
+					if err != nil {
+						logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+						// A deadline that expired before the request could complete is
+						// terminal: the caller's budget is gone, falling back to another
+						// endpoint cannot help.
+						if !isRetryableStreamError(err) {
+							return true, false, err
+						}
+						return false, false, err
+					}
+
+					// AWS 429: split RATE throttling (time-windowed; retryable after a
+					// real wait on the SAME endpoint) from USAGE-quota exhaustion
+					// (retrying until reset is pure waste). 2026-11-05 production:
+					// 2072 of these in one morning on a single-account pool because
+					// the old code answered a 429 by instantly rotating endpoints —
+					// millisecond-apart attempts on three endpoints of the SAME
+					// account all land in the same rate window and all 429.
+					throttleRetries := 0
+					for resp.StatusCode == 429 {
+						bodyBytes, _ := io.ReadAll(resp.Body)
 						resp.Body.Close()
-						logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-						return false, false, fmt.Errorf("quota exhausted on %s", ep.Name)
+						body := string(bodyBytes)
+						if isUsageQuota429Body(body) {
+							logger.Warnf("[KiroAPI] Endpoint %s usage quota exhausted (429, no endpoint fallback): %s",
+								ep.Name, truncateForLog(body))
+							return true, false, fmt.Errorf("HTTP 429 from %s: usage quota exhausted: %s",
+								ep.Name, truncateForLog(body))
+						}
+						if throttleRetries >= maxThrottleRetriesPerEndpoint {
+							logger.Warnf("[KiroAPI] Endpoint %s throttled (429 rate) after %d backoff retries; trying next endpoint",
+								ep.Name, throttleRetries)
+							return false, false, fmt.Errorf("HTTP 429 rate throttled on %s", ep.Name)
+						}
+						throttleRetries++
+						wait := throttleRetryBackoff(throttleRetries)
+						logger.Warnf("[KiroAPI] Endpoint %s throttled (429 rate); backing off %s then retrying same endpoint (%d/%d): %s",
+							ep.Name, wait, throttleRetries, maxThrottleRetriesPerEndpoint, truncateForLog(body))
+						if waitErr := throttleRetryWait(ctx, wait); waitErr != nil {
+							return false, false, waitErr
+						}
+						resp, err = attemptOnce()
+						if err != nil {
+							logger.Warnf("[KiroAPI] Endpoint %s failed during throttle backoff retry: %v", ep.Name, err)
+							if !isRetryableStreamError(err) {
+								return true, false, err
+							}
+							return false, false, err
+						}
 					}
 
 					if resp.StatusCode != 200 {
@@ -740,37 +779,37 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 						return true, false, perr
 					}
 					return false, true, perr
-			}()
+				}()
 
-			if terminal {
-				return err
+				if terminal {
+					return err
+				}
+				if !retrySame {
+					// This endpoint failed the ordinary way (transport, quota, non-200):
+					// no dead-stream wait, just fall back to the next endpoint.
+					break
+				}
+				// A cancelled client must not trigger another wait or retry.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				hasSameEndpointRetry := streamAttempt < maxStreamAttemptsPerEndpoint
+				hasEndpointFallback := epIndex+1 < len(endpoints)
+				if !hasSameEndpointRetry && !hasEndpointFallback {
+					return err
+				}
+				logger.Warnf("[KiroAPI] Endpoint %s stream died before any output (attempt %d/%d); retrying in %s: %v",
+					ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, streamRetryBackoff, err)
+				// Honours cancellation while waiting: a client that has already
+				// gone away must not hold an account slot for another backoff.
+				if waitErr := streamRetryWait(ctx, streamRetryBackoff); waitErr != nil {
+					return waitErr
+				}
+				if !hasSameEndpointRetry {
+					break // same-endpoint attempts exhausted: try the next endpoint
+				}
 			}
-			if !retrySame {
-				// This endpoint failed the ordinary way (transport, quota, non-200):
-				// no dead-stream wait, just fall back to the next endpoint.
-				break
-			}
-			// A cancelled client must not trigger another wait or retry.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			hasSameEndpointRetry := streamAttempt < maxStreamAttemptsPerEndpoint
-			hasEndpointFallback := epIndex+1 < len(endpoints)
-			if !hasSameEndpointRetry && !hasEndpointFallback {
-				return err
-			}
-			logger.Warnf("[KiroAPI] Endpoint %s stream died before any output (attempt %d/%d); retrying in %s: %v",
-				ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, streamRetryBackoff, err)
-			// Honours cancellation while waiting: a client that has already
-			// gone away must not hold an account slot for another backoff.
-			if waitErr := streamRetryWait(ctx, streamRetryBackoff); waitErr != nil {
-				return waitErr
-			}
-			if !hasSameEndpointRetry {
-				break // same-endpoint attempts exhausted: try the next endpoint
-			}
-		}
-		lastErr = err
+			lastErr = err
 		}
 
 		if lastErr == nil || cycle >= upstreamOverloadRetries || !isUpstreamOverloadErrorMessage(lastErr.Error()) {
@@ -1058,6 +1097,7 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 	}
 	return emitted, nil
 }
+
 // extractCacheMeteringFromEvent looks for prompt-cache token fields on a
 // meteringEvent payload (flat or inside any nested usage map). ok is true when
 // at least one of the fields is present; an absent field reads as 0.

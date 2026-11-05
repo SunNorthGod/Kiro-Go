@@ -171,6 +171,23 @@ func (h *Handler) handleResponsesNonStream(
 			return
 		}
 		if aerr != nil {
+			// Same rate-limit re-acquire as the Claude/OpenAI handlers: a
+			// single-account pool whose only account is inside a seconds-long
+			// throttle cooldown must wait it out, not 503 the client.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
+				isRateThrottleFailureText(lastErr) {
+				wait := time.Duration(attempt+1) * 2 * time.Second
+				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
+					wait, attempt+2, maxAccountRetryAttempts)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			break
 		}
 		fulllogNoteAccount(ctx, account.ID)
@@ -178,7 +195,7 @@ func (h *Handler) handleResponsesNonStream(
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			h.handleAccountFailure(&account, err, model)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -248,7 +265,7 @@ func (h *Handler) handleResponsesNonStream(
 			excluded[account.ID] = true
 			// #146(上游): 完整性错误(截断/空流)是上游抖动,不记账号故障,仅换号。
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(&account, err)
+				h.handleAccountFailure(&account, err, model)
 			}
 			if isRequestShapeErrorMessage(err.Error()) {
 				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
@@ -482,6 +499,23 @@ func (h *Handler) handleResponsesStream(
 			return
 		}
 		if aerr != nil {
+			// Same rate-limit re-acquire as the Claude/OpenAI handlers: a
+			// single-account pool whose only account is inside a seconds-long
+			// throttle cooldown must wait it out, not 503 the client.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
+				isRateThrottleFailureText(lastErr) {
+				wait := time.Duration(attempt+1) * 2 * time.Second
+				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
+					wait, attempt+2, maxAccountRetryAttempts)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			break
 		}
 		fulllogNoteAccount(ctx, account.ID)
@@ -489,7 +523,7 @@ func (h *Handler) handleResponsesStream(
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(&account, err)
+			h.handleAccountFailure(&account, err, model)
 			continue
 		}
 
@@ -677,7 +711,7 @@ func (h *Handler) handleResponsesStream(
 			excluded[account.ID] = true
 			// #146(上游): 截断流是上游抖动,不记账号故障;仅传输类错误才拉黑账号。
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(&account, err)
+				h.handleAccountFailure(&account, err, model)
 			}
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",

@@ -691,8 +691,6 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		h.modelsCacheMu.RUnlock()
 	}
 
-
-
 	models := buildAnthropicModelsResponse(cached)
 	if len(models) == 0 {
 		models = fallbackAnthropicModels()
@@ -1277,6 +1275,26 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 		if aerr != nil {
+			// 2026-11-05: a single-account pool rate-throttled upstream puts the
+			// only account into a 1.5s+ cooldown, so Acquire comes back empty
+			// within milliseconds and the client got a 503 for an outage a short
+			// wait absorbs (2072 upstream 429s that morning). When the last
+			// upstream failure was rate throttling, wait out the cooldown window
+			// and re-acquire; the client connection stays open and unbothered.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
+				isRateThrottleFailureText(lastErr) {
+				wait := time.Duration(attempt+1) * 2 * time.Second
+				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
+					wait, attempt+2, maxAccountRetryAttempts)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			break // ErrNoAccount → 无可用账号
 		}
 		fulllogNoteAccount(ctx, account.ID)
@@ -2190,6 +2208,26 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			return
 		}
 		if aerr != nil {
+			// 2026-11-05: a single-account pool rate-throttled upstream puts the
+			// only account into a 1.5s+ cooldown, so Acquire comes back empty
+			// within milliseconds and the client got a 503 for an outage a short
+			// wait absorbs (2072 upstream 429s that morning). When the last
+			// upstream failure was rate throttling, wait out the cooldown window
+			// and re-acquire; the client connection stays open and unbothered.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
+				isRateThrottleFailureText(lastErr) {
+				wait := time.Duration(attempt+1) * 2 * time.Second
+				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
+					wait, attempt+2, maxAccountRetryAttempts)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			break // ErrNoAccount → 无可用账号
 		}
 		fulllogNoteAccount(ctx, account.ID)
@@ -2521,6 +2559,26 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 		if aerr != nil {
+			// 2026-11-05: a single-account pool rate-throttled upstream puts the
+			// only account into a 1.5s+ cooldown, so Acquire comes back empty
+			// within milliseconds and the client got a 503 for an outage a short
+			// wait absorbs (2072 upstream 429s that morning). When the last
+			// upstream failure was rate throttling, wait out the cooldown window
+			// and re-acquire; the client connection stays open and unbothered.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
+				isRateThrottleFailureText(lastErr) {
+				wait := time.Duration(attempt+1) * 2 * time.Second
+				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
+					wait, attempt+2, maxAccountRetryAttempts)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			break // ErrNoAccount → 无可用账号
 		}
 		fulllogNoteAccount(ctx, account.ID)
@@ -3066,6 +3124,26 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			return
 		}
 		if aerr != nil {
+			// 2026-11-05: a single-account pool rate-throttled upstream puts the
+			// only account into a 1.5s+ cooldown, so Acquire comes back empty
+			// within milliseconds and the client got a 503 for an outage a short
+			// wait absorbs (2072 upstream 429s that morning). When the last
+			// upstream failure was rate throttling, wait out the cooldown window
+			// and re-acquire; the client connection stays open and unbothered.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
+				isRateThrottleFailureText(lastErr) {
+				wait := time.Duration(attempt+1) * 2 * time.Second
+				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
+					wait, attempt+2, maxAccountRetryAttempts)
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			break // ErrNoAccount → 无可用账号
 		}
 		fulllogNoteAccount(ctx, account.ID)
