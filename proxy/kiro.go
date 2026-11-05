@@ -1183,6 +1183,9 @@ func getContextWindowSize(model string) int {
 	if meta, ok := lookupModelMeta(model); ok && meta.maxInputTokens > 0 {
 		return meta.maxInputTokens
 	}
+	if w, ok := fixedContextWindows[strings.ToLower(strings.TrimSpace(model))]; ok {
+		return w
+	}
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}
@@ -1216,11 +1219,23 @@ func parseClaudeVersion(model string) (major int, minor int, ok bool) {
 	return major, minor, true
 }
 
+// fixedContextWindows 是官方选择器透出的、家族规则覆盖不到的精确窗口
+// (2026-11-06 对照 Kiro 1.4.86 官方选择器逐项校准)。
+var fixedContextWindows = map[string]int{
+	"gpt-5.6-terra":    986_000,
+	"gpt-5.6-luna":     986_000,
+	"deepseek-3.2":     164_000,
+	"minimax-m2.5":     196_000,
+	"minimax-m2.1":     196_000,
+	"qwen3-coder-next": 256_000,
+}
+
 // isLargeContextModel 判断模型是否为 1M 上下文窗口。
 //
 // 对齐 Kiro ListAvailableModels:Claude 4.6 及更新(sonnet-4.6、opus-4.6/4.7/4.8)
-// 以及 5 代及以后(claude-opus-5、claude-sonnet-5 等,无小版本号)为 1M;
-// 4.5 及更早(opus-4.5、sonnet-4.5、sonnet-4、haiku-4.5)为 200K。
+// 以及 5 代及以后(claude-opus-5、claude-sonnet-5、-5.5 等)为 1M;
+// 4.5 及更早(opus-4.5、sonnet-4.5、sonnet-4、haiku-4.5)为 200K;
+// gpt-5.6-sol 与 kimi-k3 官方亦为 1M(terra/luna 是 986K,见 fixedContextWindows)。
 func isLargeContextModel(model string) bool {
 	if major, minor, ok := parseClaudeVersion(model); ok {
 		if major > 4 {
@@ -1230,6 +1245,9 @@ func isLargeContextModel(model string) bool {
 	}
 	// Fallback substring checks for non-standard identifiers.
 	m := strings.ToLower(model)
+	if strings.HasPrefix(m, "gpt-5.6-sol") || strings.HasPrefix(m, "kimi-k3") {
+		return true
+	}
 	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
 		if strings.Contains(m, tag) {
 			return true

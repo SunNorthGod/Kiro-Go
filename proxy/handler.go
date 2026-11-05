@@ -802,18 +802,30 @@ func enrichModelInfo(info map[string]interface{}, m *ModelInfo, includeEffort bo
 // 按 Kiro 官方模型选择器的新旧顺序排列(2026-11:opus-5.5 / opus-5 / sonnet-5 /
 // opus-4.8 为最新;5.5 曾漏在这里,直连用户在回源失败期选不到它)。
 func fallbackAnthropicModels() []map[string]interface{} {
+	// 2026-11-06: 对齐 Kiro 1.4.86 官方选择器全目录(主人截图逐项核对),顺序
+	// 即官方顺序;官方已下架的 sonnet-4 移除。
 	models := []map[string]interface{}{
 		buildModelInfo("claude-opus-5.5", "anthropic", true),
+		buildModelInfo("claude-sonnet-5.5", "anthropic", true),
+		buildModelInfo("claude-haiku-5.5", "anthropic", true),
+		buildModelInfo("gpt-5.6-sol", "openai", true),
+		buildModelInfo("gpt-5.6-terra", "openai", true),
+		buildModelInfo("gpt-5.6-luna", "openai", true),
+		buildModelInfo("kimi-k3", "other", true),
 		buildModelInfo("claude-opus-5", "anthropic", true),
 		buildModelInfo("claude-sonnet-5", "anthropic", true),
 		buildModelInfo("claude-opus-4.8", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
 		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
+		buildModelInfo("claude-opus-4.6", "anthropic", true),
+		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
 		buildModelInfo("claude-opus-4.5", "anthropic", true),
+		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
+		buildModelInfo("claude-haiku-4.5", "anthropic", true),
+		buildModelInfo("deepseek-3.2", "other", false),
+		buildModelInfo("minimax-m2.5", "other", false),
+		buildModelInfo("minimax-m2.1", "other", false),
+		buildModelInfo("glm-5", "other", false),
+		buildModelInfo("qwen3-coder-next", "other", false),
 	}
 	// 兜底目录也带上窗口 / 输出上限(按版本号推断):否则客户端拿不到 context_window,
 	// 只能假定 200K,1M 模型的上下文条与压缩时机都会偏。
@@ -826,18 +838,19 @@ func fallbackAnthropicModels() []map[string]interface{} {
 		info["context_window"] = window
 		info["max_input_tokens"] = window
 		info["max_output_tokens"] = modelMaxOutputTokens(id)
-		// 2026-11-06: 兜底行补 effort 元数据(官方 Claude 五档,1.4.86 选择器
-		// 从 additionalModelRequestFieldsSchema 渲染档位条)。回源失败时客户端
-		// 不再看到空档位;判定规则与 fallbackSchemaPath 一致——仅 opus/sonnet
-		// >= 4.6 走 output_config 五档,旧模型 schema 为空,发即 400。
-		if fallbackSchemaPath(strings.ToLower(id)) == "output_config" {
+		// 2026-11-06: 兜底行补 effort 元数据(1.4.86 选择器从
+		// additionalModelRequestFieldsSchema 渲染档位条)。判定与
+		// fallbackSchemaPath 一致:Claude opus/sonnet >= 4.6 走 output_config,
+		// gpt 家族走 reasoning,均挂官方五档;其余家族 schema 为空,发即 400。
+		schemaPath := fallbackSchemaPath(strings.ToLower(id))
+		if schemaPath == "output_config" || schemaPath == "reasoning" {
 			info["effort_levels"] = []string{"low", "medium", "high", "xhigh", "max"}
-			info["effort_schema_path"] = "output_config"
+			info["effort_schema_path"] = schemaPath
 			info["default_effort_level"] = "xhigh"
 			info["additionalModelRequestFieldsSchema"] = map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"output_config": map[string]interface{}{
+					schemaPath: map[string]interface{}{
 						"type": "object",
 						"properties": map[string]interface{}{
 							"effort": map[string]interface{}{
