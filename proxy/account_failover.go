@@ -22,18 +22,20 @@ var overageRefreshInflight sync.Map // accountID -> struct{}
 // but that budget was set for a single-credential client. This proxy also
 // rotates accounts, and the two recover different failures: a same-account
 // retry helps when the upstream hiccupped, rotation helps when that account's
-// backend is unhealthy. Two is therefore not a copy of the IDE.
+// backend is unhealthy.
+//
+// Three retries (2026-11-05, owner decision): since the post-flush barrier was
+// lifted, a truncated stream that already delivered thinking to the client is
+// retried on the same account up to this budget before the handler rotates
+// accounts, and the client sees the retry's output continue on the same
+// committed stream. Repeated upstream credits burn per attempt are an accepted
+// cost; a surfaced error mid-answer is not.
 //
 // Cost of the extra attempt is bounded and small. Truncation returns nil from
 // CallKiroAPIContext, so it never reaches the endpoint fallback or
 // maxStreamAttemptsPerEndpoint - those fire only on transport errors. Worst
-// case across maxAccountRetryAttempts accounts is 3*(1+budget) requests: 9 at
-// two retries versus 6 at one.
-//
-// The payoff lands mostly on the three fully buffered paths, whose canRetry is
-// nil: a non-stream client gets a 500 with nothing usable, so one more chance
-// is worth more there than on a stream that has already flushed partial text.
-const maxSameAccountStreamRetries = 2
+// case across maxAccountRetryAttempts accounts is 3*(1+budget) requests.
+const maxSameAccountStreamRetries = 3
 
 // errUpstreamTruncatedResponse is a soft failure raised when a transport-clean
 // stream carried content but never a terminal signal. It is retryable on the

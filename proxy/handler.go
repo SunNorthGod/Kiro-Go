@@ -1724,12 +1724,21 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			thinkingSource = thinkingSourceUnknown
 			thinkingStarted = false
 			eventThinkingOpen = false
+			// post-flush retries (2026-11-05): after bytes already reached the
+			// client, the retry's stream continues on the SAME committed SSE
+			// response. Close whatever block is open so the retry's thinking
+			// opens as a NEW block (next index — the interleaved-block path at
+			// the signature handling already supports that shape), and allow a
+			// fresh signature for it. message_start itself never re-fires.
+			closeActiveBlock()
+			signatureSent = false
+			nativeSignature = ""
 		}
 
-		// 同账号完整性重试仅在未向客户端发出任何内容事件前进行(messageStarted 为栅栏);
-		// commitStream 已提交 200 头的窗口不重试,保持本地既有护栏语义。
-		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset,
-			func() bool { return !messageStarted })
+		// 同账号完整性重试不再设 messageStarted 栅栏(2026-11-05 主人拍板):思考
+		// 已吐给客户端后上游断流,重试的新思考按新 index 块续在同一已提交流上,
+		// 客户端看到多段接续而非错误弹窗——内容重复是接受的成本,断流不是。
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset, nil)
 		if err != nil {
 			// Client disconnected: the error is just our own cancellation, not an
 			// account fault. Release and return silently — no exclude/retry, no
@@ -1748,24 +1757,15 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			if !isStreamIntegrityError(err) {
 				h.handleAccountFailure(&account, err, model)
 			}
-			// 换号重跑的护栏必须用 streamCommitted(200 头已 flush)而非 messageStarted
-			// (首个内容事件)。二者之间存在窗口:上游已返回 2xx、commitStream 已提交 200
-			// 并启动心跳、但尚未吐首个 delta。此时若换号重跑,第二轮内容会续在同一个已
-			// 提交的流里 → 客户端看到"两份(不同账号)回答"。commit 之后一律发 SSE error
-			// 收尾,只有 commit 之前(真正未提交)才允许静默换号重试。
-			if !streamCommitted {
-				if isRequestShapeErrorMessage(err.Error()) {
-					break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
-				}
-				continue
+			if isRequestShapeErrorMessage(err.Error()) {
+				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
 			}
+			// streamCommitted 后同样换号重跑(2026-11-05 主人拍板):新号内容续在
+			// 同一已提交流上——message_start 只发过一次,thinking/text 块按新 index
+			// 续,客户端看到的是接续而非断流弹窗;每次重跑会再烧一份上游积分,是
+			// 接受的成本。attempt 耗尽后由循环外的 SSE error 收尾兜底。
 			h.recordFailureWithDetails("claude", model, account.ID, err)
-			ensureMessageStart()
-			h.sendSSE(w, flusher, "error", map[string]interface{}{
-				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
-			})
-			return
+			continue
 		}
 
 		// 思考重注入缓存:记住本会话最后一轮的思考+溯源签名。OpenAI 协议线的客户端
@@ -2635,17 +2635,6 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			flusher.Flush()
 		}
 
-		sendStreamError := func(err error) {
-			data, _ := json.Marshal(map[string]interface{}{
-				"error": map[string]string{
-					"message": err.Error(),
-					"type":    "server_error",
-				},
-			})
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
-		}
-
 		sendChunk := func(content string, thinkingState int) {
 			if content == "" && thinkingState == 2 {
 				return
@@ -2955,9 +2944,10 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			eventThinkingOpen = false
 		}
 
-		// 同账号完整性重试仅在 commitStream 之前进行(200 头未 flush;保持本地护栏语义)。
-		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset,
-			func() bool { return !streamCommitted })
+		// 同账号完整性重试不设 commitStream 栅栏(2026-11-05 主人拍板):OpenAI 线
+		// 是 delta chunk 流,重试的新 reasoning/content 直接续在同一响应上,客户端
+		// 看到接续而非断流;内容重复是接受的成本。
+		err := runKiroWithSelfHealAndIntegrity(ctx, &account, payload, callback, measure, reset, nil)
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone).
 			if clientGone(ctx) {
@@ -2974,18 +2964,14 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			if !isStreamIntegrityError(err) {
 				h.handleAccountFailure(&account, err, model)
 			}
-			// 护栏用 streamCommitted(200 已 flush)而非首个 chunk:
-			// 二者间存在窗口,commit 后换号重跑会让第二轮内容续在同一个流里 →"答两遍"。
-			// commit 之后一律收尾,只有 commit 之前才允许静默换号重试。
-			if !streamCommitted {
-				if isRequestShapeErrorMessage(err.Error()) {
-					break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
-				}
-				continue
+			// streamCommitted 后同样换号重跑(2026-11-05 主人拍板):delta chunk 流
+			// 天然可接续,客户端看到接续而非断流;每次重跑再烧一份上游积分,是接受
+			// 的成本。attempt 耗尽后由循环外收尾兜底。
+			if isRequestShapeErrorMessage(err.Error()) {
+				break // 见 isRequestShapeErrorMessage:换号发同一份 payload 必然同样失败
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
-			sendStreamError(err)
-			return
+			continue
 		}
 
 		processText("", false, true)

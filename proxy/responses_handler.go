@@ -679,16 +679,41 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		// #146(上游并入,检测半): responses 流在进入账号循环前就已发 response.created
-		// (200 头已提交),本地设计为不再换号/同账号重跑(见下方错误路径注释),
-		// 故这里只做完整性检测:传输成功但流被截断(有内容/思考、无终止信号、无工具)
-		// → 按 response.failed 收尾,不再伪造 response.completed。
-		// (#143 的同账号重试预算只用于非流式/未提交路径,见 handler.go。)
-		err := callKiroWithSelfHeal(ctx, &account, payload, callback)
-		if err == nil {
-			if ierr := classifyStreamIntegrity(fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0); ierr != nil && ctx.Err() == nil {
-				err = ierr
-				logger.Warnf("[StreamIntegrity] %v on %s; signaling response.failed (stream already committed)", ierr, account.Email)
+		// (200 头已提交)。2026-11-05 起对齐其它流式线(主人拍板):截断(有内容/思考、
+		// 无终止信号、无工具)先同账号有界重试,续在同一已提交流上(事件 index 单调
+		// 递增,多段接续);重试耗尽则换号;全部路径穷尽才 response.failed 收尾——
+		// 内容重复可接受,断流弹窗不可。
+		var err error
+		for integrityAttempt := 0; ; integrityAttempt++ {
+			if integrityAttempt > 0 {
+				fullText.Reset()
+				reasoningText.Reset()
+				toolUses = nil
+				inputTokens, outputTokens, credits, realInputTokens = 0, 0, 0, 0
+				meteringCacheRead, meteringCacheCreation, hasCacheMetering = 0, 0, false
+				upstreamStopReason = ""
+				logger.Warnf("[StreamIntegrity] retrying responses stream on same account (%d/%d)",
+					integrityAttempt, maxSameAccountStreamRetries)
 			}
+			err = callKiroWithSelfHeal(ctx, &account, payload, callback)
+			if err != nil {
+				break // transport/self-heal failures: rotate below as usual
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			ierr := classifyStreamIntegrity(fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0)
+			if ierr == nil {
+				break
+			}
+			if integrityAttempt < maxSameAccountStreamRetries {
+				logger.Warnf("[StreamIntegrity] %v on %s; retrying same account (%d/%d)",
+					ierr, account.Email, integrityAttempt+1, maxSameAccountStreamRetries)
+				continue
+			}
+			logger.Warnf("[StreamIntegrity] %v on %s; same-account retries exhausted; rotating account", ierr, account.Email)
+			err = ierr
+			break
 		}
 		if err != nil {
 			// Client disconnected → release and return silently (see clientGone):
@@ -701,11 +726,6 @@ func (h *Handler) handleResponsesStream(
 					err, kw.WriteFailed())
 				return
 			}
-			// responses 流在进入本循环前就已发 response.created(提交 200 头)。
-			// 因此上游一旦返回错误,任何换号重跑都会把第二轮内容续到同一个已提交的流里
-			// → 客户端看到"两份回答"。这里不再按 responseStarted 决定是否重试(该标志
-			// 只在首个 delta 后才置位,存在提交后未出首字的窗口);200 已提交即收尾。
-			// (CallKiroAPI 之前的 ensureValidToken 失败仍走上面的 continue,不受影响。)
 			releaseSlot()
 			lastErr = err
 			excluded[account.ID] = true
@@ -713,19 +733,26 @@ func (h *Handler) handleResponsesStream(
 			if !isStreamIntegrityError(err) {
 				h.handleAccountFailure(&account, err, model)
 			}
-			send("response.failed", map[string]interface{}{
-				"type": "response.failed",
-				"response": map[string]interface{}{
-					"id":     respID,
-					"status": "failed",
-					"error": map[string]string{
-						"type":    "server_error",
-						"message": err.Error(),
+			if isRequestShapeErrorMessage(err.Error()) {
+				// 换号发同一份 payload 必然同样失败 → 就地 response.failed 收尾。
+				send("response.failed", map[string]interface{}{
+					"type": "response.failed",
+					"response": map[string]interface{}{
+						"id":     respID,
+						"status": "failed",
+						"error": map[string]string{
+							"type":    "server_error",
+							"message": err.Error(),
+						},
 					},
-				},
-			})
+				})
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				return
+			}
+			// 换号重跑:内容续在同一已提交流(response.created 已发),事件 index
+			// 单调递增,多段接续;积分按重跑次数累烧,是接受的成本。
 			h.recordFailureWithDetails("responses", model, account.ID, err)
-			return
+			continue
 		}
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())

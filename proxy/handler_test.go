@@ -583,8 +583,12 @@ func TestOpenAIStreamReportsPostOutputUpstreamFailure(t *testing.T) {
 	if !strings.Contains(body, `"error"`) || !strings.Contains(body, `"message"`) {
 		t.Fatalf("expected an SSE error after partial content, got %s", body)
 	}
-	if strings.Contains(body, "[DONE]") {
-		t.Fatalf("a failed stream must not report completion, got %s", body)
+	// 2026-11-05 semantics: post-output failures now retry (same account, then
+	// rotation) and the exhausted path closes the SSE stream with the normal
+	// [DONE] sentinel so OpenAI clients stop waiting. A failed stream must
+	// still never carry a COMPLETION finish_reason — that is the fake success.
+	if strings.Contains(body, `"finish_reason":"stop"`) || strings.Contains(body, `"finish_reason":"length"`) {
+		t.Fatalf("a failed stream must not report a completion finish_reason, got %s", body)
 	}
 }
 
