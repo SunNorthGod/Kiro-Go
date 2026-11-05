@@ -249,6 +249,17 @@ func isRequestShapeErrorMessage(msg string) bool {
 	if isImageRejectionErrorMessage(msg) {
 		return true
 	}
+	// 2026-11-05 production: NewAPI request-body passthrough fed malformed
+	// bodies through and AWS answered REQUEST_BODY_INVALID on all three faces;
+	// each 400 fell through to the transient branch, three strikes cooled the
+	// only account, and a minute of hard 503s followed for EVERY client. A
+	// malformed body is a property of the request — every face rejects it
+	// identically, so it belongs here, next to the other payload properties.
+	bodyLower := strings.ToLower(msg)
+	if strings.Contains(bodyLower, "request_body_invalid") ||
+		strings.Contains(bodyLower, "improperly formed request") {
+		return true
+	}
 	// An unknown model name is a property of the request, and every account will
 	// reject it identically. This matters more since the pool stopped hard-blocking
 	// models that no account advertises (pool/scheduler.go): such a request now
