@@ -34,7 +34,7 @@ func TestUsageQuota429BodyClassifier(t *testing.T) {
 		`Too many requests, please wait before trying again.`,
 		`Slow down and try again`,
 		`{"message":"quota exhausted on Kiro IDE"}`, // rate-quota wording, no usage words
-		``,                                           // empty body: default to the retryable interpretation
+		``, // empty body: default to the retryable interpretation
 		`{"message":"quota exhausted on AmazonQ"}`,
 	}
 	for _, body := range rate {

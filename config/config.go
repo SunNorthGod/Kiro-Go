@@ -143,18 +143,6 @@ type Account struct {
 	CreatedAt int64 `json:"createdAt,omitempty"`
 }
 
-// PromptFilterRule defines a single custom prompt sanitization rule.
-// Type can be: "regex" (regexp find/replace within prompt) or
-// "lines-containing" (remove lines containing the match substring).
-type PromptFilterRule struct {
-	ID      string `json:"id"`                // Unique rule identifier
-	Name    string `json:"name"`              // Human-readable rule name
-	Type    string `json:"type"`              // "regex" or "lines-containing"
-	Match   string `json:"match"`             // Pattern to match (regex pattern or substring)
-	Replace string `json:"replace,omitempty"` // Replacement string (only for regex; empty = delete match)
-	Enabled bool   `json:"enabled"`           // Whether this rule is active
-}
-
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
@@ -237,7 +225,6 @@ type Config struct {
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
-	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
 	// EndpointFallback controls whether to try other endpoints when the preferred one fails.
 	// Defaults to true. Set to false to only use the preferred endpoint.
@@ -256,21 +243,16 @@ type Config struct {
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
-	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
 
 	// FilterClaudeCode detects the Claude Code CLI built-in system prompt and replaces it
 	// with a compact backend-only prompt, reducing token usage significantly.
-	FilterClaudeCode bool `json:"filterClaudeCode,omitempty"`
 
 	// FilterEnvNoise strips environment metadata lines from system prompts:
 	// git status, recent commits, environment sections, fast_mode_info tags, etc.
-	FilterEnvNoise bool `json:"filterEnvNoise,omitempty"`
 
 	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
-	FilterStripBoundaries bool `json:"filterStripBoundaries,omitempty"`
 
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
-	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -1266,89 +1248,6 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 	return nil
 }
 
-// GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.
-// Also checks the legacy SanitizeClaudeCodePrompt flag for backward compatibility.
-func GetFilterClaudeCode() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt
-}
-
-// GetFilterEnvNoise returns whether environment noise line stripping is enabled.
-func GetFilterEnvNoise() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.FilterEnvNoise
-}
-
-// GetFilterStripBoundaries returns whether boundary marker stripping is enabled.
-func GetFilterStripBoundaries() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.FilterStripBoundaries
-}
-
-// PromptFilterConfig holds all prompt filter settings for API responses.
-type PromptFilterConfig struct {
-	FilterClaudeCode      bool               `json:"filterClaudeCode"`
-	FilterEnvNoise        bool               `json:"filterEnvNoise"`
-	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
-	Rules                 []PromptFilterRule `json:"rules"`
-}
-
-// GetPromptFilterConfig returns all prompt filter settings.
-func GetPromptFilterConfig() PromptFilterConfig {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return PromptFilterConfig{Rules: []PromptFilterRule{}}
-	}
-	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
-	copy(rules, cfg.PromptFilterRules)
-	return PromptFilterConfig{
-		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
-		FilterEnvNoise:        cfg.FilterEnvNoise,
-		FilterStripBoundaries: cfg.FilterStripBoundaries,
-		Rules:                 rules,
-	}
-}
-
-// UpdatePromptFilterConfig saves all prompt filter settings atomically.
-func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.FilterClaudeCode = filterClaudeCode
-	cfg.FilterEnvNoise = filterEnvNoise
-	cfg.FilterStripBoundaries = filterStripBoundaries
-	// Clear legacy flag to avoid double-applying after first save
-	cfg.SanitizeClaudeCodePrompt = false
-	if rules != nil {
-		cfg.PromptFilterRules = rules
-	}
-	return Save()
-}
-
-// GetPromptFilterRules returns the current prompt filter rules.
-func GetPromptFilterRules() []PromptFilterRule {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return nil
-	}
-	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
-	copy(rules, cfg.PromptFilterRules)
-	return rules
-}
-
 // ThinkingConfig holds settings for AI thinking/reasoning mode.
 // When enabled, models output their reasoning process alongside the response.
 type ThinkingConfig struct {
@@ -1390,42 +1289,6 @@ func UpdateThinkingConfig(openaiFormat, claudeFormat string) error {
 	defer cfgLock.Unlock()
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
-	return Save()
-}
-
-// GetPreferredEndpoint 获取首选端点配置
-func GetPreferredEndpoint() string {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg.PreferredEndpoint == "" {
-		return "auto"
-	}
-	return cfg.PreferredEndpoint
-}
-
-// UpdatePreferredEndpoint 更新首选端点配置
-func UpdatePreferredEndpoint(endpoint string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.PreferredEndpoint = endpoint
-	return Save()
-}
-
-// GetEndpointFallback returns whether endpoint fallback is enabled. Defaults to true.
-func GetEndpointFallback() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg.EndpointFallback == nil {
-		return true
-	}
-	return *cfg.EndpointFallback
-}
-
-// UpdateEndpointFallback sets the endpoint fallback switch and persists the change.
-func UpdateEndpointFallback(enabled bool) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.EndpointFallback = &enabled
 	return Save()
 }
 

@@ -65,12 +65,6 @@ func setupIntegrityTestUpstream(t *testing.T, server *httptest.Server) func() {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable fallback: %v", err)
-	}
 
 	oldEndpoints := kiroEndpoints
 	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}

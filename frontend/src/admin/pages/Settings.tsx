@@ -1,17 +1,16 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { AnimatePresence, motion } from 'motion/react'
-import { ChevronDown, Lock, Plus, Regex, Rows3, Trash2 } from 'lucide-react'
+import { motion, AnimatePresence } from 'motion/react'
+import { Lock } from 'lucide-react'
 import { toast } from 'sonner'
-import { api, type PromptFilter, type PromptRule } from '../api'
+import { api } from '../api'
 import { isRemembered, storePassword } from '../auth'
 import { setAdminPassword } from '../api'
 import { Button } from '@/ui/Button'
 import { Field, Input, PasswordInput } from '@/ui/Field'
-import { Badge, Segmented, Select, Switch, SwitchRow } from '@/ui/controls'
+import { Segmented } from '@/ui/controls'
 import { Skeleton } from '@/ui/misc'
 
 export function SettingsPage() {
-  const [advanced, setAdvanced] = useState(false)
   return (
     <div className="stack" style={{ gap: 16 }}>
       <div className="card" style={{ padding: '6px 24px' }}>
@@ -26,45 +25,6 @@ export function SettingsPage() {
         </Section>
       </div>
 
-      <button
-        type="button"
-        className="card row"
-        style={{ padding: '14px 20px', justifyContent: 'space-between', textAlign: 'left' }}
-        onClick={() => setAdvanced((v) => !v)}
-        aria-expanded={advanced}
-      >
-        <span>
-          <span className="strong" style={{ fontSize: 14 }}>
-            高级设置
-          </span>
-          <span className="xs muted" style={{ marginLeft: 10 }}>
-            上游端点、System Prompt 过滤
-          </span>
-        </span>
-        <motion.span animate={{ rotate: advanced ? 180 : 0 }} transition={{ duration: 0.25 }} className="muted">
-          <ChevronDown size={16} />
-        </motion.span>
-      </button>
-      <AnimatePresence initial={false}>
-        {advanced && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.34, ease: [0.16, 1, 0.3, 1] }}
-            style={{ overflow: 'hidden' }}
-          >
-            <div className="card" style={{ padding: '6px 24px' }}>
-              <Section title="上游端点" desc="请求优先发往哪个 Kiro 上游端点。">
-                <EndpointForm />
-              </Section>
-              <Section title="System Prompt 过滤" desc="转发前对系统提示做清理。内置规则覆盖常见客户端，自定义规则按顺序执行。">
-                <PromptFilterForm />
-              </Section>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
     </div>
   )
 }
@@ -282,177 +242,5 @@ function LimitsForm() {
 }
 
 /* ---------------- endpoint ---------------- */
-function EndpointForm() {
-  const [ep, setEp] = useState<string | null>(null)
-  const [fallback, setFallback] = useState(true)
-  const [busy, setBusy] = useState(false)
-  useEffect(() => {
-    api<{ preferredEndpoint: string; endpointFallback: boolean }>('/endpoint')
-      .then((d) => {
-        setEp(d.preferredEndpoint || 'auto')
-        setFallback(d.endpointFallback !== false)
-      })
-      .catch((e) => toast.error('读取端点设置失败：' + (e as Error).message))
-  }, [])
-  const save = async () => {
-    setBusy(true)
-    try {
-      await api('/endpoint', { method: 'POST', body: { preferredEndpoint: ep, endpointFallback: fallback } })
-      toast.success('端点设置已保存')
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
-  if (ep == null) return <Skeleton h={36} w={320} />
-  return (
-    <>
-      <Field label="首选端点" hint="轮询模式：每个请求轮流从不同端点出发，分摊各端点的月度额度">
-        <Select
-          value={ep}
-          onChange={setEp}
-          style={{ width: 260 }}
-          options={[
-            { value: 'auto', label: '自动选择（Kiro IDE 优先）' },
-            { value: 'roundrobin', label: '三端点轮询' },
-            { value: 'kiro', label: 'Kiro IDE' },
-            { value: 'codewhisperer', label: 'CodeWhisperer' },
-            { value: 'amazonq', label: 'Amazon Q' },
-          ]}
-        />
-      </Field>
-      <SwitchRow checked={fallback} onChange={setFallback} title="端点不可用时自动切换" hint="关闭后只使用选定的端点，失败不会换到其他端点。" />
-      <SaveRow busy={busy} onClick={save} />
-    </>
-  )
-}
 
 /* ---------------- prompt filter ---------------- */
-function PromptFilterForm() {
-  const [cfg, setCfg] = useState<PromptFilter | null>(null)
-  const [busy, setBusy] = useState(false)
-  useEffect(() => {
-    api<PromptFilter>('/prompt-filter')
-      .then((d) => setCfg({ ...d, rules: d.rules || [] }))
-      .catch((e) => toast.error('读取过滤设置失败：' + (e as Error).message))
-  }, [])
-  if (!cfg) return <Skeleton h={120} />
-  const rules = cfg.rules || []
-  const patch = (p: Partial<PromptFilter>) => setCfg({ ...cfg, ...p })
-  const patchRule = (i: number, p: Partial<PromptRule>) => patch({ rules: rules.map((r, j) => (j === i ? { ...r, ...p } : r)) })
-  const addRule = (type: PromptRule['type']) =>
-    patch({ rules: [...rules, { id: 'rule-' + Date.now(), name: '', type, match: '', replace: '', enabled: true }] })
-
-  const save = async () => {
-    setBusy(true)
-    try {
-      await api('/prompt-filter', {
-        method: 'POST',
-        body: {
-          filterClaudeCode: cfg.filterClaudeCode,
-          filterEnvNoise: cfg.filterEnvNoise,
-          filterStripBoundaries: cfg.filterStripBoundaries,
-          rules,
-        },
-      })
-      toast.success('过滤设置已保存')
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <>
-      <div className="stack" style={{ gap: 14 }}>
-        <SwitchRow
-          checked={cfg.filterClaudeCode}
-          onChange={(v) => patch({ filterClaudeCode: v })}
-          title="替换 Claude Code CLI 系统提示"
-          hint="识别到 Claude Code 内置系统提示时换成精简版本，避免把大段 CLI 指令塞进请求。"
-        />
-        <SwitchRow
-          checked={cfg.filterEnvNoise}
-          onChange={(v) => patch({ filterEnvNoise: v })}
-          title="过滤环境噪音"
-          hint="去掉系统提示里注入的环境变量、Git 状态、最近提交等内容。"
-        />
-        <SwitchRow
-          checked={cfg.filterStripBoundaries}
-          onChange={(v) => patch({ filterStripBoundaries: v })}
-          title="移除边界标记"
-          hint="删除 --- SYSTEM PROMPT --- 这类边界标记行。"
-        />
-      </div>
-
-      <div className="divider" style={{ margin: '4px 0' }} />
-      <div className="row row-between">
-        <span className="field-label">自定义规则</span>
-        <div className="row" style={{ gap: 6 }}>
-          <Button size="sm" icon={<Regex />} onClick={() => addRule('regex')}>
-            正则替换
-          </Button>
-          <Button size="sm" icon={<Rows3 />} onClick={() => addRule('lines-containing')}>
-            按行删除
-          </Button>
-        </div>
-      </div>
-      {rules.length === 0 ? (
-        <div className="callout">
-          <Plus />
-          还没有自定义规则。正则替换会改写匹配到的内容；按行删除会去掉包含指定文本的整行。
-        </div>
-      ) : (
-        <div className="stack" style={{ gap: 10 }}>
-          <AnimatePresence initial={false}>
-            {rules.map((r, i) => (
-              <motion.div
-                key={r.id}
-                layout
-                initial={{ opacity: 0, y: -6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, height: 0, marginTop: -10 }}
-                transition={{ duration: 0.24 }}
-              >
-                <div className="rule-card" data-disabled={!r.enabled}>
-                  <div className="rule-head">
-                    <Switch checked={r.enabled} onChange={(v) => patchRule(i, { enabled: v })} accent label="启用规则" />
-                    <input className="rule-name" value={r.name} placeholder="未命名规则" onChange={(e) => patchRule(i, { name: e.target.value })} />
-                    <Badge tone={r.type === 'regex' ? 'accent' : 'teal'}>{r.type === 'regex' ? '正则替换' : '按行删除'}</Badge>
-                    <Button
-                      size="sm"
-                      variant="danger-soft"
-                      iconOnly
-                      icon={<Trash2 />}
-                      onClick={() => patch({ rules: rules.filter((_, j) => j !== i) })}
-                    >
-                      删除规则
-                    </Button>
-                  </div>
-                  <div className="rule-body" style={r.type !== 'regex' ? { gridTemplateColumns: '1fr' } : undefined}>
-                    <Field label="匹配">
-                      <Input
-                        mono
-                        value={r.match}
-                        onChange={(e) => patchRule(i, { match: e.target.value })}
-                        placeholder={r.type === 'regex' ? '例如 \\bsecret\\b' : '要删除的行里包含的文本'}
-                      />
-                    </Field>
-                    {r.type === 'regex' && (
-                      <Field label="替换为">
-                        <Input mono value={r.replace || ''} onChange={(e) => patchRule(i, { replace: e.target.value })} placeholder="留空表示删除匹配内容" />
-                      </Field>
-                    )}
-                  </div>
-                </div>
-              </motion.div>
-            ))}
-          </AnimatePresence>
-        </div>
-      )}
-      <SaveRow busy={busy} onClick={save} />
-    </>
-  )
-}

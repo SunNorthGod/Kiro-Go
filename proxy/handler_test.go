@@ -49,12 +49,6 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("add second account: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
-	}
 
 	requestTokens := make([]string, 0, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -541,12 +535,6 @@ func TestOpenAIStreamReportsPostOutputUpstreamFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
-	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -605,12 +593,6 @@ func TestClaudeResponsePreservesUpstreamMaxTokensStopReason(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
-	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -663,12 +645,6 @@ func TestOpenAIStreamPreservesUpstreamMaxTokensFinishReason(t *testing.T) {
 		ProfileArn:  "arn:aws:codewhisperer:profile/test",
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
-	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

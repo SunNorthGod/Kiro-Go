@@ -340,4 +340,3 @@ func base64ImageCodec(data string) (string, *base64.Encoding) {
 func decodeBase64Image(normalized string, enc *base64.Encoding) ([]byte, error) {
 	return enc.DecodeString(normalized)
 }
-

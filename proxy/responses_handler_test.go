@@ -343,12 +343,6 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable fallback: %v", err)
-	}
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{

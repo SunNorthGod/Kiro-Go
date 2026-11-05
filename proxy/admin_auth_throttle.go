@@ -13,10 +13,10 @@ import (
 // grows with each further miss (capped), while a correct password clears it.
 
 const (
-	adminAuthFreeAttempts = 5                // misses allowed before backoff starts
-	adminAuthBaseBackoff  = 1 * time.Second  // first backoff step
-	adminAuthMaxBackoff   = 5 * time.Minute  // cap on a single block window
-	adminAuthEntryTTL     = 1 * time.Hour    // idle entries pruned after this
+	adminAuthFreeAttempts = 5               // misses allowed before backoff starts
+	adminAuthBaseBackoff  = 1 * time.Second // first backoff step
+	adminAuthMaxBackoff   = 5 * time.Minute // cap on a single block window
+	adminAuthEntryTTL     = 1 * time.Hour   // idle entries pruned after this
 )
 
 type adminAuthState struct {
@@ -26,9 +26,9 @@ type adminAuthState struct {
 }
 
 var (
-	adminAuthMu      sync.Mutex
-	adminAuthByIP    = map[string]*adminAuthState{}
-	adminAuthLastGC  time.Time
+	adminAuthMu     sync.Mutex
+	adminAuthByIP   = map[string]*adminAuthState{}
+	adminAuthLastGC time.Time
 )
 
 // adminAuthAllowed reports whether ip may attempt an admin auth right now. When

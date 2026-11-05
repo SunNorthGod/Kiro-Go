@@ -158,9 +158,9 @@ func TestKeepaliveConcurrentWrites(t *testing.T) {
 // pinging and never panic.
 type failingWriter struct{ writes int64 }
 
-func (f *failingWriter) Header() http.Header       { return http.Header{} }
-func (f *failingWriter) WriteHeader(int)           {}
-func (f *failingWriter) Flush()                    {}
+func (f *failingWriter) Header() http.Header { return http.Header{} }
+func (f *failingWriter) WriteHeader(int)     {}
+func (f *failingWriter) Flush()              {}
 func (f *failingWriter) Write(p []byte) (int, error) {
 	atomic.AddInt64(&f.writes, 1)
 	return 0, errors.New("client gone")
@@ -198,12 +198,6 @@ func TestClaudeStreamEarlyHeadersAndKeepalive(t *testing.T) {
 		ProfileArn:  "arn:aws:codewhisperer:profile/only",
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
-	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

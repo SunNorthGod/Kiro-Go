@@ -16,7 +16,7 @@ func TestIdentityNeutralityClauseAppendedOnce(t *testing.T) {
 	for _, thinking := range []bool{true, false} {
 		req := &ClaudeRequest{
 			Model: "claude-opus-4.8", MaxTokens: 64,
-			System:  "You are a coding helper.",
+			System:   "You are a coding helper.",
 			Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
 		}
 		payload := ClaudeToKiro(req, thinking)

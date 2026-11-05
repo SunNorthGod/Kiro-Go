@@ -448,13 +448,14 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 }
 
 // endpointsForAccount returns the upstream endpoint list for a credential.
-// API Key accounts always use the CLI runtime protocol; OAuth accounts keep
-// the configured preferred-endpoint fallback chain.
+// API Key accounts always use the CLI runtime protocol; OAuth accounts get
+// the roundrobin rotation (2026-11-05: the preferred/fallback selector was
+// removed — every request just starts at the next surface).
 func endpointsForAccount(account *config.Account) []kiroEndpoint {
 	if config.IsAPIKeyAccount(account) {
 		return []kiroEndpoint{kiroCLIEndpoint}
 	}
-	return getSortedEndpoints(config.GetPreferredEndpoint())
+	return roundrobinEndpoints()
 }
 
 // cliRuntimeURL builds the regional Kiro CLI runtime URL.
@@ -475,41 +476,14 @@ func cliRuntimeURL(account *config.Account) string {
 // across faces and may dodge per-face sub-limits when they exist).
 var endpointRR atomic.Uint64
 
-// getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
-func getSortedEndpoints(preferred string) []kiroEndpoint {
-	fallback := config.GetEndpointFallback()
-
-	var primary int
-	switch preferred {
-	case "kiro":
-		primary = 0
-	case "codewhisperer":
-		primary = 1
-	case "amazonq":
-		primary = 2
-	case "roundrobin":
-		start := int(endpointRR.Add(1)-1) % len(kiroEndpoints)
-		result := make([]kiroEndpoint, 0, len(kiroEndpoints))
-		for i := 0; i < len(kiroEndpoints); i++ {
-			result = append(result, kiroEndpoints[(start+i)%len(kiroEndpoints)])
-		}
-		return result
-	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
-	}
-
-	if !fallback {
-		// No fallback: only use the selected endpoint
-		return []kiroEndpoint{kiroEndpoints[primary]}
-	}
-
-	// With fallback: selected first, then others in order
-	result := []kiroEndpoint{kiroEndpoints[primary]}
-	for i, ep := range kiroEndpoints {
-		if i != primary {
-			result = append(result, ep)
-		}
+// roundrobinEndpoints returns the three OAuth service faces starting at the
+// per-call rotating offset: successive requests start at successive surfaces,
+// spreading load (and monthly-allowance burn) across all three.
+func roundrobinEndpoints() []kiroEndpoint {
+	start := int(endpointRR.Add(1)-1) % len(kiroEndpoints)
+	result := make([]kiroEndpoint, 0, len(kiroEndpoints))
+	for i := 0; i < len(kiroEndpoints); i++ {
+		result = append(result, kiroEndpoints[(start+i)%len(kiroEndpoints)])
 	}
 	return result
 }

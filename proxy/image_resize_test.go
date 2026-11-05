@@ -64,10 +64,13 @@ func decodedDimensions(t *testing.T, data string) (int, int, string) {
 // re-encoding (and degrading) every image that flows through the proxy. Only
 // images that actually breach the upstream pixel ceiling may be touched.
 func TestShrinkLeavesFittingImagesByteIdentical(t *testing.T) {
-	for _, tc := range []struct{ w, h int; format string }{
+	for _, tc := range []struct {
+		w, h   int
+		format string
+	}{
 		{64, 64, "png"},
-		{8000, 120, "png"},   // exactly at the limit
-		{120, 8000, "png"},   // exactly at the limit, other axis
+		{8000, 120, "png"}, // exactly at the limit
+		{120, 8000, "png"}, // exactly at the limit, other axis
 		{300, 200, "jpeg"},
 		{200, 150, "gif"},
 	} {
@@ -86,11 +89,11 @@ func TestShrinkLeavesFittingImagesByteIdentical(t *testing.T) {
 
 func TestShrinkDownscalesOversizedImages(t *testing.T) {
 	cases := []struct {
-		name           string
-		w, h           int
-		format         string
-		wantW, wantH   int
-		wantFormat     string
+		name         string
+		w, h         int
+		format       string
+		wantW, wantH int
+		wantFormat   string
 	}{
 		// 9000x200 -> width capped, height scaled by the same ratio (200*8000/9000).
 		{"wide png", 9000, 200, "png", 8000, 177, "png"},

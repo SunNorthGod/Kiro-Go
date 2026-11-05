@@ -196,7 +196,7 @@ func TestFinishToolUseCoercesUnderCanonicalName(t *testing.T) {
 		OnToolUse: func(tu KiroToolUse) { got = tu },
 		// keyed the way CallKiroAPI now indexes: wire name + canonical form
 		ToolSchemas: map[string]map[string]interface{}{
-			"todoWrite":                       schema,
+			"todoWrite":                   schema,
 			canonicalToolKey("todoWrite"): schema,
 		},
 	}

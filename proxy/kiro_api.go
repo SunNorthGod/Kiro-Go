@@ -683,9 +683,9 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 //
 // RefreshAccountInfo 过去对单次 401/403/invalid/expired 立即 BANNED+禁用。定时刷新
 // 间隔收紧(30min→5min)后,一次上游抖动就可能把健康账号刷成 banned。改为:
-//   1. 先尝试用 refreshToken 换新 token 再重试一次(被动过期/瞬时失效自愈);
-//   2. 仍失败则累计连续失败次数,达到 authFailureBanThreshold 才封禁;
-//   3. 任意一次成功清零计数。TEMPORARILY_SUSPENDED 是上游明确封禁,仍立即禁用。
+//  1. 先尝试用 refreshToken 换新 token 再重试一次(被动过期/瞬时失效自愈);
+//  2. 仍失败则累计连续失败次数,达到 authFailureBanThreshold 才封禁;
+//  3. 任意一次成功清零计数。TEMPORARILY_SUSPENDED 是上游明确封禁,仍立即禁用。
 const authFailureBanThreshold = 3
 
 // authFailureStreaks: accountID → 连续认证失败次数(进程内,重启清零即可)。

@@ -116,12 +116,6 @@ func newTestStreamHandler(t *testing.T, frames ...[]byte) (*Handler, func()) {
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("endpoint fallback: %v", err)
-	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -26,12 +26,6 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
-	}
 	t.Cleanup(swapKiroEndpointsForTest(t, server))
 
 	p := accountpool.GetPool()

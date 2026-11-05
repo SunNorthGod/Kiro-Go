@@ -524,7 +524,6 @@ func TestExtractOverageSnapshotReturnsNilWithoutOverageInfo(t *testing.T) {
 	}
 }
 
-
 func TestListKiroProfilesFollowsNextTokenPagination(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)

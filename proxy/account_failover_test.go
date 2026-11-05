@@ -33,7 +33,7 @@ func TestRequestShapeErrorClassifier(t *testing.T) {
 		`HTTP 400 from AmazonQ: {"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"..."}`,
 		`HTTP 400 from Kiro IDE: {"message":"THINKING_SIGNATURE_INVALID"}`,
 		`HTTP 400: additionalModelRequestFields is not supported for this model`,
-		`HTTP 400: The `+"`signature` in `thinking`"+` block is invalid`,
+		`HTTP 400: The ` + "`signature` in `thinking`" + ` block is invalid`,
 	}
 	for _, msg := range shape {
 		if !isRequestShapeErrorMessage(msg) {

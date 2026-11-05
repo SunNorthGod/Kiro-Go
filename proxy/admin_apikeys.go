@@ -44,10 +44,10 @@ type apiKeyView struct {
 	RequestsCount int64   `json:"requestsCount"`
 
 	// Unified-ledger + card-key fields.
-	CreditsGranted  float64  `json:"creditsGranted"`
-	Balance         float64  `json:"balance"`
-	ExpiresAt int64 `json:"expiresAt,omitempty"`
-	Expired   bool  `json:"expired"`
+	CreditsGranted float64 `json:"creditsGranted"`
+	Balance        float64 `json:"balance"`
+	ExpiresAt      int64   `json:"expiresAt,omitempty"`
+	Expired        bool    `json:"expired"`
 	// Per-key limit overrides, nullable with unified semantics: absent (null) ==
 	// inherit system default; 0 == unlimited; N == that value. Pointers so the
 	// "inherit" state is a distinct absent field rather than an ambiguous 0.
