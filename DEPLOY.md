@@ -43,7 +43,9 @@
    ```bash
    GOPROXY=https://goproxy.cn,direct CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o kiro-go .
    ```
-   `web/`(含 `web/vendor/`)已通过 go:embed 打进二进制,无需单独部署静态资源。
+   `web/`(面板静态资源)通过磁盘相对路径 `web/` 由 `http.ServeFile` 提供(见
+   `proxy/handler.go` 的 `serveAdminPage`),**不是** go:embed——必须把整个 `web/`
+   目录随二进制一起部署到工作目录下,否则 `/admin` 面板加载不到 JS/CSS。
 2. 运行(systemd 示例):
    ```ini
    [Service]

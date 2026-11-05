@@ -308,13 +308,14 @@ function EndpointForm() {
   if (ep == null) return <Skeleton h={36} w={320} />
   return (
     <>
-      <Field label="首选端点" hint="自动模式会按可用性挑选端点">
+      <Field label="首选端点" hint="轮询模式：每个请求轮流从不同端点出发，分摊各端点的月度额度">
         <Select
           value={ep}
           onChange={setEp}
           style={{ width: 260 }}
           options={[
-            { value: 'auto', label: '自动选择' },
+            { value: 'auto', label: '自动选择（Kiro IDE 优先）' },
+            { value: 'roundrobin', label: '三端点轮询' },
             { value: 'kiro', label: 'Kiro IDE' },
             { value: 'codewhisperer', label: 'CodeWhisperer' },
             { value: 'amazonq', label: 'Amazon Q' },
