@@ -468,6 +468,13 @@ func cliRuntimeURL(account *config.Account) string {
 	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
+// endpointRR drives the "roundrobin" preferred-endpoint strategy: successive
+// calls start at successive surfaces, spreading DIFFERENT requests across the
+// three AWS service faces (single-request fan-out was rejected — see the
+// usage-quota notes — but per-request spreading shares the monthly allowance
+// across faces and may dodge per-face sub-limits when they exist).
+var endpointRR atomic.Uint64
+
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
@@ -480,6 +487,13 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 		primary = 1
 	case "amazonq":
 		primary = 2
+	case "roundrobin":
+		start := int(endpointRR.Add(1)-1) % len(kiroEndpoints)
+		result := make([]kiroEndpoint, 0, len(kiroEndpoints))
+		for i := 0; i < len(kiroEndpoints); i++ {
+			result = append(result, kiroEndpoints[(start+i)%len(kiroEndpoints)])
+		}
+		return result
 	default:
 		// "auto": Kiro first, then fallback to others
 		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
@@ -746,10 +760,20 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 						// serialized request size, which is the one number needed to tell an
 						// oversized-input 400 apart from a malformed-payload 400.
 						if isRequestShapeErrorMessage(e.Error()) {
-							logger.Warnf("[KiroAPI] Endpoint %s rejected the request itself (no endpoint fallback): reqBytes=%d history=%d model=%s err=%v",
-								ep.Name, len(reqBody), len(payload.ConversationState.History),
-								payload.ConversationState.CurrentMessage.UserInputMessage.ModelID, e)
-							return true, false, e
+							// Unknown-model rejections ARE surface-dependent: the three
+							// faces expose different model catalogs (measured prod:
+							// models served on one face rejected as invalid on another),
+							// so those keep falling back to the next endpoint. Every
+							// other payload property is endpoint-invariant and stays
+							// terminal — rotating cannot fix the bytes we sent.
+							if !isUnknownModelErrorMessage(e.Error()) {
+								logger.Warnf("[KiroAPI] Endpoint %s rejected the request itself (no endpoint fallback): reqBytes=%d history=%d model=%s err=%v",
+									ep.Name, len(reqBody), len(payload.ConversationState.History),
+									payload.ConversationState.CurrentMessage.UserInputMessage.ModelID, e)
+								return true, false, e
+							}
+							logger.Warnf("[KiroAPI] Endpoint %s does not serve model %s; trying next endpoint",
+								ep.Name, payload.ConversationState.CurrentMessage.UserInputMessage.ModelID)
 						}
 						logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, e)
 						return false, false, e
