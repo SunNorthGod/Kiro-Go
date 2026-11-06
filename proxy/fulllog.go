@@ -56,8 +56,13 @@ const (
 	fulllogMaxResponseBytes = 2 << 20
 	// fulllogMaxFileBytes rotates the current hourly file at 50 MiB.
 	fulllogMaxFileBytes = int64(50) << 20
-	// fulllogRetention deletes capture files older than 7 days.
-	fulllogRetention = 7 * 24 * time.Hour
+	// fulllogRetention deletes capture files older than 2 days. The kirogo box
+	// has a 29G root and fulllog grows ~4G/day under load: 7 days of captures
+	// (~28G) structurally outran the disk and filled the root on 2026-11-06,
+	// which crashed PostgreSQL into recovery and failed every token persist
+	// with SQLSTATE 57P03. 48h of captures (~8.6G) leaves comfortable headroom,
+	// and is still ample for investigating yesterday's incidents.
+	fulllogRetention = 2 * 24 * time.Hour
 )
 
 // fulllogDir returns the capture directory: <config dir>/fulllog. The config
