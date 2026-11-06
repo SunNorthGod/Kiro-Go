@@ -37,6 +37,13 @@ var overageRefreshInflight sync.Map // accountID -> struct{}
 // case across maxAccountRetryAttempts accounts is 3*(1+budget) requests.
 const maxSameAccountStreamRetries = 3
 
+// maxPoolParkTotal caps how long a handler may PARK a request while the whole
+// pool sits inside cooldowns before giving up with 503. 45s keeps the wait
+// inside the client's ~60s idle budget (no keepalive has been sent yet at this
+// stage). Each park lasts until the earliest cooldown expiry plus a small
+// margin, so a request lands the moment a account revives.
+const maxPoolParkTotal = 45 * time.Second
+
 // errUpstreamTruncatedResponse is a soft failure raised when a transport-clean
 // stream carried content but never a terminal signal. It is retryable on the
 // same account and must not mark the account unhealthy.
@@ -85,22 +92,6 @@ func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string,
 		return errUpstreamTruncatedResponse
 	}
 	return nil
-}
-
-// isRateThrottleFailureText reports whether the last upstream failure was a
-// RATE-limit 429 ("HTTP 429 rate throttled on ...", see the 429 split in
-// kiro.go and isUsageQuota429Body). The handler failover loops use this to
-// distinguish "the pool is empty because every account is inside a seconds-long
-// throttle cooldown" — worth waiting out — from a genuinely unavailable pool.
-func isRateThrottleFailureText(err error) bool {
-	if err == nil {
-		return false
-	}
-	lower := strings.ToLower(err.Error())
-	if strings.Contains(lower, "usage quota exhausted") {
-		return false // usage exhaustion: waiting cannot help until reset
-	}
-	return strings.Contains(lower, "rate throttled")
 }
 
 // isStreamIntegrityError reports whether err is a soft integrity failure.

@@ -1268,6 +1268,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
+	var parked time.Duration
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
@@ -1332,25 +1333,34 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 		if aerr != nil {
-			// 2026-11-05: a single-account pool rate-throttled upstream puts the
-			// only account into a 1.5s+ cooldown, so Acquire comes back empty
-			// within milliseconds and the client got a 503 for an outage a short
-			// wait absorbs (2072 upstream 429s that morning). When the last
-			// upstream failure was rate throttling, wait out the cooldown window
-			// and re-acquire; the client connection stays open and unbothered.
-			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
-				isRateThrottleFailureText(lastErr) {
-				wait := time.Duration(attempt+1) * 2 * time.Second
-				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
-					wait, attempt+2, maxAccountRetryAttempts)
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			// 2026-11-06: when Acquire comes back empty because every eligible
+			// account is inside a cooldown window (rate 429 backoff being the
+			// common case), PARK the request until the earliest cooldown expires
+			// instead of failing the client instantly — a single-account pool
+			// turned millisecond-apart retries into 503s for outages a short
+			// wait absorbs (2072 upstream 429s on 2026-11-05). Capped at
+			// maxPoolParkTotal so quota-length cooldowns stay a bounded wait.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 {
+				if hint, ok := h.pool.CooldownWaitHint(excluded); ok {
+					remain := maxPoolParkTotal - parked
+					wait := hint + 750*time.Millisecond
+					if wait > remain {
+						wait = remain
+					}
+					if wait > 0 {
+						logger.Warnf("[Failover] pool cooling; parking request %s before re-acquire (attempt %d/%d, parked %s total)",
+							wait, attempt+2, maxAccountRetryAttempts, parked+wait)
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+						parked += wait
+						continue
+					}
 				}
-				continue
 			}
 			break // ErrNoAccount → 无可用账号
 		}
@@ -2236,6 +2246,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var parked time.Duration
 	reqStart := time.Now()
 
 	conversationID := payload.ConversationState.AgentContinuationId
@@ -2265,25 +2276,34 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			return
 		}
 		if aerr != nil {
-			// 2026-11-05: a single-account pool rate-throttled upstream puts the
-			// only account into a 1.5s+ cooldown, so Acquire comes back empty
-			// within milliseconds and the client got a 503 for an outage a short
-			// wait absorbs (2072 upstream 429s that morning). When the last
-			// upstream failure was rate throttling, wait out the cooldown window
-			// and re-acquire; the client connection stays open and unbothered.
-			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
-				isRateThrottleFailureText(lastErr) {
-				wait := time.Duration(attempt+1) * 2 * time.Second
-				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
-					wait, attempt+2, maxAccountRetryAttempts)
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			// 2026-11-06: when Acquire comes back empty because every eligible
+			// account is inside a cooldown window (rate 429 backoff being the
+			// common case), PARK the request until the earliest cooldown expires
+			// instead of failing the client instantly — a single-account pool
+			// turned millisecond-apart retries into 503s for outages a short
+			// wait absorbs (2072 upstream 429s on 2026-11-05). Capped at
+			// maxPoolParkTotal so quota-length cooldowns stay a bounded wait.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 {
+				if hint, ok := h.pool.CooldownWaitHint(excluded); ok {
+					remain := maxPoolParkTotal - parked
+					wait := hint + 750*time.Millisecond
+					if wait > remain {
+						wait = remain
+					}
+					if wait > 0 {
+						logger.Warnf("[Failover] pool cooling; parking request %s before re-acquire (attempt %d/%d, parked %s total)",
+							wait, attempt+2, maxAccountRetryAttempts, parked+wait)
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+						parked += wait
+						continue
+					}
 				}
-				continue
 			}
 			break // ErrNoAccount → 无可用账号
 		}
@@ -2582,6 +2602,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var parked time.Duration
 	reqStart := time.Now()
 
 	conversationID := payload.ConversationState.AgentContinuationId
@@ -2616,25 +2637,34 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			return
 		}
 		if aerr != nil {
-			// 2026-11-05: a single-account pool rate-throttled upstream puts the
-			// only account into a 1.5s+ cooldown, so Acquire comes back empty
-			// within milliseconds and the client got a 503 for an outage a short
-			// wait absorbs (2072 upstream 429s that morning). When the last
-			// upstream failure was rate throttling, wait out the cooldown window
-			// and re-acquire; the client connection stays open and unbothered.
-			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
-				isRateThrottleFailureText(lastErr) {
-				wait := time.Duration(attempt+1) * 2 * time.Second
-				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
-					wait, attempt+2, maxAccountRetryAttempts)
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			// 2026-11-06: when Acquire comes back empty because every eligible
+			// account is inside a cooldown window (rate 429 backoff being the
+			// common case), PARK the request until the earliest cooldown expires
+			// instead of failing the client instantly — a single-account pool
+			// turned millisecond-apart retries into 503s for outages a short
+			// wait absorbs (2072 upstream 429s on 2026-11-05). Capped at
+			// maxPoolParkTotal so quota-length cooldowns stay a bounded wait.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 {
+				if hint, ok := h.pool.CooldownWaitHint(excluded); ok {
+					remain := maxPoolParkTotal - parked
+					wait := hint + 750*time.Millisecond
+					if wait > remain {
+						wait = remain
+					}
+					if wait > 0 {
+						logger.Warnf("[Failover] pool cooling; parking request %s before re-acquire (attempt %d/%d, parked %s total)",
+							wait, attempt+2, maxAccountRetryAttempts, parked+wait)
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+						parked += wait
+						continue
+					}
 				}
-				continue
 			}
 			break // ErrNoAccount → 无可用账号
 		}
@@ -3138,6 +3168,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var parked time.Duration
 	reqStart := time.Now()
 
 	conversationID := payload.ConversationState.AgentContinuationId
@@ -3167,25 +3198,34 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			return
 		}
 		if aerr != nil {
-			// 2026-11-05: a single-account pool rate-throttled upstream puts the
-			// only account into a 1.5s+ cooldown, so Acquire comes back empty
-			// within milliseconds and the client got a 503 for an outage a short
-			// wait absorbs (2072 upstream 429s that morning). When the last
-			// upstream failure was rate throttling, wait out the cooldown window
-			// and re-acquire; the client connection stays open and unbothered.
-			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
-				isRateThrottleFailureText(lastErr) {
-				wait := time.Duration(attempt+1) * 2 * time.Second
-				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
-					wait, attempt+2, maxAccountRetryAttempts)
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			// 2026-11-06: when Acquire comes back empty because every eligible
+			// account is inside a cooldown window (rate 429 backoff being the
+			// common case), PARK the request until the earliest cooldown expires
+			// instead of failing the client instantly — a single-account pool
+			// turned millisecond-apart retries into 503s for outages a short
+			// wait absorbs (2072 upstream 429s on 2026-11-05). Capped at
+			// maxPoolParkTotal so quota-length cooldowns stay a bounded wait.
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 {
+				if hint, ok := h.pool.CooldownWaitHint(excluded); ok {
+					remain := maxPoolParkTotal - parked
+					wait := hint + 750*time.Millisecond
+					if wait > remain {
+						wait = remain
+					}
+					if wait > 0 {
+						logger.Warnf("[Failover] pool cooling; parking request %s before re-acquire (attempt %d/%d, parked %s total)",
+							wait, attempt+2, maxAccountRetryAttempts, parked+wait)
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+						parked += wait
+						continue
+					}
 				}
-				continue
 			}
 			break // ErrNoAccount → 无可用账号
 		}

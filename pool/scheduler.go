@@ -56,6 +56,7 @@ const (
 )
 
 var (
+
 	// ErrNoAccount means no eligible account serves the request right now.
 	ErrNoAccount = errors.New("no available account")
 	// ErrTooBusy means the caller's key exceeded its fair share while the pool was
@@ -67,12 +68,12 @@ var (
 type Outcome int
 
 const (
-	OutcomeSuccess        Outcome = iota // 2xx
-	OutcomeRateLimited                   // 429: transient, short backoff
-	OutcomeAuthError                     // 401/403: disable after N consecutive
-	OutcomeQuotaExhausted                // 402 / monthly quota: cooldown until it likely resets
-	OutcomeTransient                     // 5xx / network: brief cooldown after repeats
-	OutcomeModelRestricted               // model-scoped risk control (empty stream etc.): cool (account, model), never the account
+	OutcomeSuccess         Outcome = iota // 2xx
+	OutcomeRateLimited                    // 429: transient, short backoff
+	OutcomeAuthError                      // 401/403: disable after N consecutive
+	OutcomeQuotaExhausted                 // 402 / monthly quota: cooldown until it likely resets
+	OutcomeTransient                      // 5xx / network: brief cooldown after repeats
+	OutcomeModelRestricted                // model-scoped risk control (empty stream etc.): cool (account, model), never the account
 )
 
 // snapAcct is an eligible account value copy plus its priority tier.
@@ -798,4 +799,49 @@ func (p *AccountPool) RPMSnapshot() (byAccount map[string]int, byKey map[string]
 	}
 	total = p.rpmAll.sum(now)
 	return
+}
+
+// CooldownWaitHint tells a handler whose Acquire came back empty whether the
+// emptiness is TRANSIENT (accounts exist and are enabled, but every one of them
+// is inside a cooldown that will expire on its own) and how long until the
+// first cooldown lifts. The handler can then park the request for that window
+// instead of surfacing a 503 for an outage a short wait absorbs.
+//
+// Returns (0, false) when waiting cannot help: no enabled accounts at all
+// (genuinely empty / banned pool), or no cooldowns pending (the account was
+// excluded for a non-cooldown reason such as request-shape rejection).
+//
+// modelCooldowns are deliberately excluded — a model-scoped restriction lifts
+// on its own schedule too, but the caller already knows the model; keeping the
+// hint account-scoped keeps the semantics simple.
+func (p *AccountPool) CooldownWaitHint(excluded map[string]bool) (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	earliest := time.Time{}
+	anyEnabled := false
+	for i := range p.accounts {
+		a := &p.accounts[i]
+		if !a.Enabled {
+			continue
+		}
+		anyEnabled = true
+		if excluded[a.ID] {
+			continue
+		}
+		if cd, ok := p.cooldowns[a.ID]; ok && cd.After(now) {
+			if earliest.IsZero() || cd.Before(earliest) {
+				earliest = cd
+			}
+		} else {
+			// An enabled, non-excluded account with NO pending cooldown exists —
+			// the emptiness is not cooldown-shaped (bindings, model filter, fair
+			// gate); waiting changes nothing.
+			return 0, false
+		}
+	}
+	if !anyEnabled || earliest.IsZero() {
+		return 0, false
+	}
+	return earliest.Sub(now), true
 }

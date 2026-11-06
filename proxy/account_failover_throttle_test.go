@@ -61,22 +61,6 @@ func TestUsageQuotaErrorMessageSplit(t *testing.T) {
 	}
 }
 
-func TestRateThrottleFailureTextForFailoverLoop(t *testing.T) {
-	if !isRateThrottleFailureText(errors.New(`HTTP 429 rate throttled on Kiro IDE`)) {
-		t.Error("rate-throttle failure text not recognized")
-	}
-	// Waiting cannot heal a usage exhaustion, so it must not count as throttle.
-	if isRateThrottleFailureText(errors.New(`HTTP 429 from Kiro IDE: usage quota exhausted: {"message":"Monthly limit reached"}`)) {
-		t.Error("usage exhaustion misclassified as waitable rate throttling")
-	}
-	if isRateThrottleFailureText(errors.New(`HTTP 401 from Kiro IDE: token expired`)) {
-		t.Error("auth failure misclassified as rate throttling")
-	}
-	if isRateThrottleFailureText(nil) {
-		t.Error("nil error must not classify as throttling")
-	}
-}
-
 // Branch-order guard, same spirit as TestModelRestrictedDoesNotOverlapEarlierClassifiers:
 // the usage-quota branch sits BEFORE the generic quota branch in
 // handleAccountFailure, so a usage message reaching only the generic branch

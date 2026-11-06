@@ -145,6 +145,7 @@ func (h *Handler) handleResponsesNonStream(
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var parked time.Duration
 	reqStart := time.Now()
 
 	conversationID := payload.ConversationState.AgentContinuationId
@@ -171,22 +172,30 @@ func (h *Handler) handleResponsesNonStream(
 			return
 		}
 		if aerr != nil {
-			// Same rate-limit re-acquire as the Claude/OpenAI handlers: a
-			// single-account pool whose only account is inside a seconds-long
-			// throttle cooldown must wait it out, not 503 the client.
-			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
-				isRateThrottleFailureText(lastErr) {
-				wait := time.Duration(attempt+1) * 2 * time.Second
-				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
-					wait, attempt+2, maxAccountRetryAttempts)
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			// Same park-on-cooling as the Claude/OpenAI handlers: when every
+			// eligible account is inside a cooldown window, wait it out instead
+			// of 503ing the client (see maxPoolParkTotal for the cap).
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 {
+				if hint, ok := h.pool.CooldownWaitHint(excluded); ok {
+					remain := maxPoolParkTotal - parked
+					wait := hint + 750*time.Millisecond
+					if wait > remain {
+						wait = remain
+					}
+					if wait > 0 {
+						logger.Warnf("[Failover] pool cooling; parking request %s before re-acquire (attempt %d/%d, parked %s total)",
+							wait, attempt+2, maxAccountRetryAttempts, parked+wait)
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+						parked += wait
+						continue
+					}
 				}
-				continue
 			}
 			break
 		}
@@ -461,6 +470,7 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
+	var parked time.Duration
 	reqStart := time.Now()
 
 	conversationID := payload.ConversationState.AgentContinuationId
@@ -499,22 +509,30 @@ func (h *Handler) handleResponsesStream(
 			return
 		}
 		if aerr != nil {
-			// Same rate-limit re-acquire as the Claude/OpenAI handlers: a
-			// single-account pool whose only account is inside a seconds-long
-			// throttle cooldown must wait it out, not 503 the client.
-			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 &&
-				isRateThrottleFailureText(lastErr) {
-				wait := time.Duration(attempt+1) * 2 * time.Second
-				logger.Warnf("[Failover] pool empty on rate-limit cooldown; backing off %s before re-acquire (attempt %d/%d)",
-					wait, attempt+2, maxAccountRetryAttempts)
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
+			// Same park-on-cooling as the Claude/OpenAI handlers: when every
+			// eligible account is inside a cooldown window, wait it out instead
+			// of 503ing the client (see maxPoolParkTotal for the cap).
+			if aerr == pool.ErrNoAccount && attempt < maxAccountRetryAttempts-1 {
+				if hint, ok := h.pool.CooldownWaitHint(excluded); ok {
+					remain := maxPoolParkTotal - parked
+					wait := hint + 750*time.Millisecond
+					if wait > remain {
+						wait = remain
+					}
+					if wait > 0 {
+						logger.Warnf("[Failover] pool cooling; parking request %s before re-acquire (attempt %d/%d, parked %s total)",
+							wait, attempt+2, maxAccountRetryAttempts, parked+wait)
+						timer := time.NewTimer(wait)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+						parked += wait
+						continue
+					}
 				}
-				continue
 			}
 			break
 		}
